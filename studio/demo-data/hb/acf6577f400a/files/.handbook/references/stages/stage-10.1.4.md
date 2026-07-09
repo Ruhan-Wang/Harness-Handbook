@@ -1,10 +1,12 @@
 # Specialized interactive flows and auxiliary TUI handlers  `stage-10.1.4`
 
-This stage sits beside the main TUI event loop as a collection of focused interactive flows and reusable overlays that the core app invokes when the user enters a specialized mode. Several pieces provide self-contained UI subsystems: the cloud-tasks files define task-page state, new-task composition state, and ratatui rendering for task lists, overlays, diffs, and modals. Transcript-oriented navigation is handled by app_backtrack.rs for rollback/backtracking and pager_overlay.rs for full-screen history browsing with scrolling and live-tail synchronization.
+This stage covers special side flows in the terminal interface. These are not the main chat loop, but popups, pickers, previews, and helpers that users open while working. The cloud-tasks files form a small app inside the app: one file stores the task list, selected row, popups, and loaded details; another stores the “new task” form; the UI file draws the list, editor, overlays, confirmations, and spinners.
 
-A second cluster supports guided configuration and selection flows. keymap_setup.rs, its picker, actions catalog, debug inspector, and chatwidget integration implement the /keymap remapping workflow from action selection through key capture and live application. theme_picker.rs and pets/picker.rs build similar chooser dialogs, while app/pets.rs, pets/ambient.rs, and pets/preview.rs manage pet persistence, preview loading, animation timing, and on-screen rendering.
+Several files support navigation through complex conversations. Agent navigation and multi-agent display keep agent threads in a stable order, show readable status rows, and let users switch agents. Backtrack lets a user return to an earlier prompt and roll the conversation back. Pager overlays show long transcripts or help pages.
 
-The remaining files bridge external or cross-cutting interactions: agent_navigation.rs and multi_agents.rs maintain multi-agent picker state and labels; clipboard_paste.rs normalizes pasted text and imports clipboard images; external_agent_config_migration_flow.rs runs Claude Code import prompting; and platform_actions.rs isolates OS-specific shortcuts and helpers.
+Other files customize the interface. The keymap files provide the shortcut editor, action catalog, searchable picker, and keypress inspector. Theme picker previews and saves color themes. Pet files handle selecting, previewing, drawing, disabling, and cleaning up the companion pet.
+
+Finally, platform actions, clipboard paste, and external import flows connect the app to the outside world: operating-system checks, pasted images or paths, and importing settings from Claude Code.
 
 ## Files in this stage
 
@@ -13,13 +15,15 @@ These files define the cloud-tasks TUI state, initialize the new-task composer, 
 
 ### `cloud-tasks/src/app.rs`
 
-`data_model` · `main loop`
+`orchestration` · `main loop`
 
-This file is the state container for the cloud-tasks terminal UI. It defines plain structs for environment rows and modal state, the main `App` struct that tracks task list contents, selection, status text, spinner flags, environment filter state, new-task page state, apply/preflight state, and some background coordination fields, plus `AppEvent`, the message enum used by background tasks to feed results back into the main event loop.
+This file is the app’s shared notebook. A terminal user interface has to remember many small things at once: which task is selected, whether a refresh is running, which environment is filtered, whether a modal window is open, and what detail text is being shown. Without this file, the rest of the app would have no single, consistent place to read or update that state.
 
-It also defines the detail-overlay model. `DiffOverlay` owns the currently viewed task title/ID, a `ScrollableDiff`, duplicated display fields (`diff_lines`, `text_lines`, `prompt`) for the selected attempt, and a vector of `AttemptView` entries representing the base attempt plus any siblings. The overlay can switch between `DetailView::Diff` and `DetailView::Prompt`, cycle attempts circularly, and project the selected attempt into the scrollable widget content. The invariant is that attempt 0 is always the base attempt; `base_attempt_mut` ensures it exists.
+The `App` type holds the top-level screen state. It tracks the list of cloud tasks, status text, loading spinners, environment selection, new-task form state, and apply-patch progress. The `load_tasks` helper asks the cloud backend for recent tasks, times out after five seconds, and hides review-only tasks so the main list stays focused.
 
-`load_tasks` is the only backend-facing function here: it wraps `backend.list_tasks` in a 5-second timeout, requests up to 20 tasks, and filters out review-only tasks before returning them. The test module uses a small fake backend to verify that environment filtering is passed through correctly.
+The `DiffOverlay` type is the detail pane shown for one task. It can show either the task’s prompt/output or its code diff, and it can switch between multiple attempts. Think of it like a folder with several drafts inside: the overlay remembers which draft is open and updates the visible page when the user switches views or attempts.
+
+`AppEvent` describes messages sent back from background work, such as “tasks loaded,” “details failed,” or “apply finished.” This lets slow network work happen without freezing the terminal interface.
 
 #### Function details
 
@@ -29,11 +33,11 @@ It also defines the detail-overlay model. `DiffOverlay` owns the currently viewe
 fn new() -> Self
 ```
 
-**Purpose**: Constructs the initial TUI state with empty task data, no overlays or modals, default status text, and all inflight flags cleared.
+**Purpose**: Creates a fresh app state before the terminal interface starts. It fills in sensible defaults, such as an empty task list, the first selected row, no open pop-ups, and a status message telling the user how to refresh.
 
-**Data flow**: It allocates fresh empty vectors and a fresh `HashSet`, sets `selected` to 0, `status` to `"Press r to refresh"`, all optional modal/overlay fields to `None`, `best_of_n` to 1, and all loading/apply flags to `false`. It returns the fully initialized `App`.
+**Data flow**: Nothing comes in. The function builds an `App` value with empty collections, false loading flags, no selected environment, no active detail overlay, and `best_of_n` set to 1. The completed `App` state comes out ready for the main program to use.
 
-**Call relations**: This is called at TUI startup before the event loop begins. Subsequent event handling mutates the fields initialized here.
+**Call relations**: The main runner calls this during startup. It also creates empty helper collections, such as the set used to remember background work already in flight.
 
 *Call graph*: called by 1 (run_main); 2 external calls (new, new).
 
@@ -44,11 +48,11 @@ fn new() -> Self
 fn next(&mut self)
 ```
 
-**Purpose**: Moves the selected task index down by one without exceeding the last task.
+**Purpose**: Moves the task-list selection down by one row. It stops at the bottom so the selection never points outside the task list.
 
-**Data flow**: It reads `self.tasks.len()`, returns immediately if the list is empty, otherwise increments `self.selected` and clamps it to `len - 1` using `min` and `saturating_sub`.
+**Data flow**: It reads the current task list and selected index. If there are no tasks, nothing changes. Otherwise it increases the selected index, but clamps it to the last valid row.
 
-**Call relations**: Used by list-view key handling to navigate downward through tasks.
+**Call relations**: No direct caller is shown in the graph, but this is the kind of method the keyboard input loop uses when the user presses a down key. It only changes `App.selected`; drawing code can then show the new selected row.
 
 
 ##### `App::prev`  (lines 111–118)
@@ -57,11 +61,11 @@ fn next(&mut self)
 fn prev(&mut self)
 ```
 
-**Purpose**: Moves the selected task index up by one without going below zero.
+**Purpose**: Moves the task-list selection up by one row. It stops at the top so the selection cannot become negative.
 
-**Data flow**: It returns immediately if there are no tasks; otherwise, if `self.selected > 0`, it decrements `self.selected` by one.
+**Data flow**: It reads the current task list and selected index. If the list is empty or the selection is already at the first row, nothing changes. Otherwise it subtracts one from the selected index.
 
-**Call relations**: Used by list-view key handling to navigate upward through tasks.
+**Call relations**: No direct caller is shown in the graph, but it exists for navigation from the UI input loop. After it runs, the rest of the app can redraw using the updated selection.
 
 
 ##### `load_tasks`  (lines 121–134)
@@ -73,11 +77,11 @@ async fn load_tasks(
 ) -> anyhow::Result<Vec<TaskSummary>>
 ```
 
-**Purpose**: Fetches the current task page from the backend with a timeout and removes review-only tasks before handing results to the UI.
+**Purpose**: Fetches a short page of cloud tasks, optionally limited to one environment. It protects the interface from hanging forever by giving the backend five seconds to answer.
 
-**Data flow**: It takes a `CloudBackend` reference and optional environment string, wraps `backend.list_tasks(env, Some(20), None)` in `tokio::time::timeout(Duration::from_secs(5), ...)`, awaits both timeout and backend result, filters `tasks.tasks` to keep only entries where `!t.is_review`, and returns the filtered `Vec<TaskSummary>`.
+**Data flow**: It receives a cloud backend and an optional environment id. It asks the backend for up to 20 tasks, waits with a five-second timeout, then removes tasks marked as review-only. It returns the filtered list or an error if the backend fails or takes too long.
 
-**Call relations**: This is the shared background-load primitive used by the TUI startup refresh flow and tested by `tests::load_tasks_uses_env_parameter`.
+**Call relations**: The main runner calls this when it needs to refresh the visible task list. The test `tests::load_tasks_uses_env_parameter` also calls it to prove that the environment filter is passed through correctly.
 
 *Call graph*: called by 2 (load_tasks_uses_env_parameter, run_main); 3 external calls (from_secs, list_tasks, timeout).
 
@@ -88,11 +92,11 @@ async fn load_tasks(
 fn has_diff(&self) -> bool
 ```
 
-**Purpose**: Reports whether an attempt currently has any diff lines loaded for display.
+**Purpose**: Answers whether this attempt has any diff lines to show. A diff is the text form of code changes.
 
-**Data flow**: It reads `self.diff_lines` and returns `true` when the vector is non-empty.
+**Data flow**: It reads the attempt’s stored diff lines. If that list is not empty, it returns `true`; otherwise it returns `false`. It does not change the attempt.
 
-**Call relations**: Used by overlay key handling to decide whether switching to diff view is meaningful.
+**Call relations**: No direct caller is shown in the graph. It is a small convenience check for UI code that needs to decide whether a diff tab or action should be available.
 
 
 ##### `AttemptView::has_text`  (lines 168–170)
@@ -101,11 +105,11 @@ fn has_diff(&self) -> bool
 fn has_text(&self) -> bool
 ```
 
-**Purpose**: Reports whether an attempt has any prompt or assistant text content available.
+**Purpose**: Answers whether this attempt has prompt or message text to show. This helps the UI know whether the non-diff view has useful content.
 
-**Data flow**: It checks whether `self.text_lines` is non-empty or `self.prompt` is `Some`, and returns that boolean.
+**Data flow**: It reads the attempt’s text lines and optional prompt. It returns `true` if there are message lines or a prompt, and `false` if both are missing. It does not modify anything.
 
-**Call relations**: Used by overlay key handling to decide whether switching to prompt/text view is meaningful.
+**Call relations**: No direct caller is shown in the graph. It is intended as a simple readiness check for display code.
 
 
 ##### `DiffOverlay::new`  (lines 174–192)
@@ -114,11 +118,11 @@ fn has_text(&self) -> bool
 fn new(task_id: TaskId, title: String, attempt_total_hint: Option<usize>) -> Self
 ```
 
-**Purpose**: Creates an empty detail overlay for a task with a blank scrollable widget and one default base attempt slot.
+**Purpose**: Creates the detail overlay for a selected task. The overlay starts empty, ready to be filled by background detail-loading work.
 
-**Data flow**: It takes a `TaskId`, title, and optional attempt-total hint; creates a new `ScrollableDiff`, seeds it with empty content, initializes display fields and sibling metadata to empty values, inserts `vec![AttemptView::default()]` as the attempts list, sets `selected_attempt` to 0 and `current_view` to `Prompt`, and returns the overlay.
+**Data flow**: It receives a task id, a title, and an optional hint for how many attempts exist. It creates an empty scrollable diff viewer, stores the task identity, starts with one blank attempt, selects the prompt view, and returns the new overlay.
 
-**Call relations**: The TUI opens this immediately when entering task details, then later fills in diff/text data as background events arrive.
+**Call relations**: Code that opens task details uses this as the starting container. It calls `ScrollableDiff::new` and then gives that viewer empty content so the UI has a valid display object immediately.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (new, vec!).
 
@@ -129,11 +133,11 @@ fn new(task_id: TaskId, title: String, attempt_total_hint: Option<usize>) -> Sel
 fn current_attempt(&self) -> Option<&AttemptView>
 ```
 
-**Purpose**: Returns the currently selected attempt view if the selection index is valid.
+**Purpose**: Returns the attempt that is currently selected in the overlay. If the selected index does not point to an existing attempt, it returns nothing.
 
-**Data flow**: It reads `self.selected_attempt` and returns `self.attempts.get(index)`, yielding `Option<&AttemptView>`.
+**Data flow**: It reads `selected_attempt` and looks up that position in the attempts list. The result is either a shared reference to the attempt or `None`. No state changes.
 
-**Call relations**: This is a small accessor used by `apply_selection_to_fields` and `current_can_apply` to avoid indexing directly.
+**Call relations**: `DiffOverlay::apply_selection_to_fields` uses this when copying the selected attempt into the visible fields. `DiffOverlay::current_can_apply` uses it to check whether the selected attempt has an applyable raw diff.
 
 *Call graph*: called by 2 (apply_selection_to_fields, current_can_apply).
 
@@ -144,11 +148,11 @@ fn current_attempt(&self) -> Option<&AttemptView>
 fn base_attempt_mut(&mut self) -> &mut AttemptView
 ```
 
-**Purpose**: Returns a mutable reference to the base attempt, creating a default one if the attempts vector is unexpectedly empty.
+**Purpose**: Gives mutable access to the first attempt, creating a blank one if the list is empty. This protects callers from having to check for a missing base attempt themselves.
 
-**Data flow**: It checks `self.attempts.is_empty()`, pushes `AttemptView::default()` if needed, and then returns `&mut self.attempts[0]`.
+**Data flow**: It looks at the attempts list. If the list is empty, it inserts a default blank `AttemptView`. It then returns a mutable reference to the first attempt so the caller can fill in details.
 
-**Call relations**: Used when background detail events populate the primary attempt’s diff/text fields. It preserves the invariant that attempt 0 always exists.
+**Call relations**: No direct caller is shown in the graph. It is meant for detail-loading code that receives the first, or base, attempt’s data and needs a guaranteed place to store it.
 
 *Call graph*: 1 external calls (default).
 
@@ -159,11 +163,11 @@ fn base_attempt_mut(&mut self) -> &mut AttemptView
 fn set_view(&mut self, view: DetailView)
 ```
 
-**Purpose**: Switches the overlay between prompt and diff modes and refreshes the projected display fields accordingly.
+**Purpose**: Switches the overlay between the diff view and the prompt/output view. It immediately refreshes the visible scroll content to match the new view.
 
-**Data flow**: It writes the provided `DetailView` into `self.current_view` and then calls `apply_selection_to_fields()` to update `diff_lines`, `text_lines`, `prompt`, and scrollable content.
+**Data flow**: It receives the desired `DetailView`. It stores that view on the overlay, then calls `apply_selection_to_fields` to copy the selected attempt’s relevant text into the display area.
 
-**Call relations**: Invoked by left/right navigation in the detail overlay.
+**Call relations**: When UI code changes tabs, this method is the bridge between the user’s choice and the data shown on screen. It hands off to `DiffOverlay::apply_selection_to_fields` so the scrollable viewer is updated consistently.
 
 *Call graph*: calls 1 internal fn (apply_selection_to_fields).
 
@@ -174,11 +178,11 @@ fn set_view(&mut self, view: DetailView)
 fn expected_attempts(&self) -> Option<usize>
 ```
 
-**Purpose**: Returns the backend-provided attempt-total hint when available, otherwise infers a count from the loaded attempts vector.
+**Purpose**: Reports how many attempts the overlay expects to exist. It prefers a backend-provided total, but can fall back to the number of attempts already loaded.
 
-**Data flow**: It reads `self.attempt_total_hint`; if present, returns it. Otherwise it returns `None` when `self.attempts` is empty or `Some(self.attempts.len())` when attempts exist.
+**Data flow**: It reads `attempt_total_hint` first. If that hint is present, it returns it. If not, it returns the current attempts length when at least one attempt exists, otherwise it returns nothing.
 
-**Call relations**: Used by `attempt_display_total` to decide what total count to show in the UI.
+**Call relations**: `DiffOverlay::attempt_display_total` calls this when deciding what total number to show in the UI, such as “attempt 1 of 3.”
 
 *Call graph*: called by 1 (attempt_display_total).
 
@@ -189,11 +193,11 @@ fn expected_attempts(&self) -> Option<usize>
 fn attempt_count(&self) -> usize
 ```
 
-**Purpose**: Returns the number of attempt entries currently loaded into the overlay.
+**Purpose**: Returns how many attempt records are currently stored in the overlay. This is the loaded count, not necessarily the final total from the backend.
 
-**Data flow**: It reads `self.attempts.len()` and returns that `usize`.
+**Data flow**: It reads the attempts list length and returns that number. It does not change the overlay.
 
-**Call relations**: Used by overlay navigation logic to decide whether attempt cycling is possible.
+**Call relations**: No direct caller is shown in the graph. It is a simple information method for UI or loading code that needs to know how many attempts are already present.
 
 
 ##### `DiffOverlay::attempt_display_total`  (lines 224–227)
@@ -202,11 +206,11 @@ fn attempt_count(&self) -> usize
 fn attempt_display_total(&self) -> usize
 ```
 
-**Purpose**: Computes the total attempt count to display, guaranteeing at least one.
+**Purpose**: Returns the total attempt count that should be displayed to the user. It always gives at least one so the UI does not show an empty or confusing total.
 
-**Data flow**: It calls `expected_attempts()` and returns that value when present; otherwise it returns `self.attempts.len().max(1)`.
+**Data flow**: It asks `expected_attempts` for the best known total. If no total is known, it uses the current number of stored attempts, with a minimum of one. The chosen number is returned.
 
-**Call relations**: Used by the UI when reporting which attempt is currently selected.
+**Call relations**: It builds directly on `DiffOverlay::expected_attempts`. Display code can use this when rendering attempt navigation text.
 
 *Call graph*: calls 1 internal fn (expected_attempts).
 
@@ -217,11 +221,11 @@ fn attempt_display_total(&self) -> usize
 fn step_attempt(&mut self, delta: isize) -> bool
 ```
 
-**Purpose**: Cycles the selected attempt forward or backward with wraparound and refreshes the visible content.
+**Purpose**: Moves the selected attempt forward or backward, wrapping around at the ends. This lets the user cycle through attempts like turning a carousel.
 
-**Data flow**: It reads the current attempt count, returns `false` if there is only one or zero attempts, otherwise computes a wrapped next index using modular arithmetic on `delta`, writes it to `self.selected_attempt`, calls `apply_selection_to_fields()`, and returns `true`.
+**Data flow**: It receives a signed step amount, such as `1` for next or `-1` for previous. If there is only one attempt, it returns `false` and changes nothing. Otherwise it calculates the wrapped new index, stores it, refreshes the visible fields, and returns `true`.
 
-**Call relations**: Called by Tab, BackTab, and bracket-key handlers in the detail overlay.
+**Call relations**: User navigation code can call this when the user switches attempts. After changing the index, it calls `DiffOverlay::apply_selection_to_fields` so the screen shows the newly selected attempt.
 
 *Call graph*: calls 1 internal fn (apply_selection_to_fields).
 
@@ -232,11 +236,11 @@ fn step_attempt(&mut self, delta: isize) -> bool
 fn current_can_apply(&self) -> bool
 ```
 
-**Purpose**: Determines whether the currently selected overlay state represents an applyable diff.
+**Purpose**: Checks whether the currently selected attempt can be applied as a patch. Applying is only allowed while viewing a non-empty diff.
 
-**Data flow**: It checks that `self.current_view` is `DetailView::Diff`, then inspects the current attempt’s `diff_raw` and returns true only when a non-empty raw diff string exists.
+**Data flow**: It reads the current view and the selected attempt. It returns `true` only when the view is `Diff` and the selected attempt has a raw diff string that is not empty. Otherwise it returns `false`.
 
-**Call relations**: Used before opening the apply modal so the UI only offers apply/preflight when a real diff is selected.
+**Call relations**: It calls `DiffOverlay::current_attempt` to inspect the selected attempt. UI code can use this to enable or disable an apply action.
 
 *Call graph*: calls 1 internal fn (current_attempt); 1 external calls (matches!).
 
@@ -247,11 +251,11 @@ fn current_can_apply(&self) -> bool
 fn apply_selection_to_fields(&mut self)
 ```
 
-**Purpose**: Projects the currently selected attempt into the overlay’s top-level display fields and updates the scrollable widget content based on the active view.
+**Purpose**: Copies the selected attempt’s content into the overlay fields that the screen actually draws. It also fills in friendly placeholder text when content is missing.
 
-**Data flow**: It reads `current_attempt()`. If no attempt exists, it clears `diff_lines`, `text_lines`, and `prompt`, sets the scrollable content to `"<loading attempt>"`, and returns. Otherwise it clones the selected attempt’s diff lines, text lines, and prompt into the overlay fields, then sets the scrollable content to either the diff lines or `"<no diff available>"` in diff view, or the text lines or `"<no output>"` in prompt view.
+**Data flow**: It reads the currently selected attempt. If no attempt is available, it clears stored lines, clears the prompt, and shows “<loading attempt>”. If an attempt exists, it copies its diff lines, text lines, and prompt into the overlay. Then it updates the scrollable viewer with either the diff, the prompt/output text, or a placeholder such as “<no diff available>” or “<no output>”.
 
-**Call relations**: This is the central synchronization method called after view changes and attempt changes, and after background events mutate attempt data.
+**Call relations**: `DiffOverlay::set_view` calls this after a tab change, and `DiffOverlay::step_attempt` calls it after attempt navigation. It calls `DiffOverlay::current_attempt` to find the source data and `ScrollableDiff::set_content` to update what the user sees.
 
 *Call graph*: calls 2 internal fn (current_attempt, set_content); called by 2 (set_view, step_attempt); 1 external calls (vec!).
 
@@ -267,11 +271,11 @@ fn list_tasks(
         ) -> CloudBackendFuture<'a, codex_cloud_tasks_client
 ```
 
-**Purpose**: Generates deterministic fake task pages keyed by environment for the `load_tasks` unit test.
+**Purpose**: Provides fake task-list data for tests without contacting a real cloud service. It can return different titles for different environment filters.
 
-**Data flow**: It maps the optional environment to a vector of titles from `by_env` or a default pair, builds `TaskSummary` values with generated IDs, `Ready` status, current timestamps, environment IDs, default diff summaries, and `attempt_total: Some(1)`, then applies the requested `limit` capped at 20 and returns a `TaskListPage` preserving the incoming cursor.
+**Data flow**: It receives an optional environment id, a limit, and a cursor. It looks up matching test titles, turns each title into a `TaskSummary`, applies the requested limit up to 20 items, and returns a fake task-list page.
 
-**Call relations**: This fake backend method is used by the test-only `CloudBackend` implementation and reused by `tests::FakeBackend::get_task_summary`.
+**Call relations**: `tests::FakeBackend::get_task_summary` calls this to search the fake list. When `load_tasks` is tested with this fake backend, this method supplies the controlled data that proves filtering works.
 
 *Call graph*: called by 1 (get_task_summary); 7 external calls (pin, now, new, default, new, list_tasks, format!).
 
@@ -282,11 +286,11 @@ fn list_tasks(
 fn get_task_summary(&self, id: TaskId) -> CloudBackendFuture<'_, TaskSummary>
 ```
 
-**Purpose**: Looks up one fake task summary by ID from the generated fake task list.
+**Purpose**: Finds one fake task summary by id for tests. It mimics the backend operation that fetches a single task’s basic information.
 
-**Data flow**: It calls `self.list_tasks(None, None, None).await`, consumes the returned tasks, searches for a matching ID, and returns that summary or a `CloudTaskError::Msg` if absent.
+**Data flow**: It receives a task id. It asks the fake backend for its default task list, searches for a matching id, and returns that task if found. If no match exists, it returns a test error saying the task was not found.
 
-**Call relations**: Used only in the test backend implementation to satisfy the trait.
+**Call relations**: It calls `tests::FakeBackend::list_tasks` rather than duplicating fake task creation. This keeps the fake single-task lookup consistent with the fake list operation.
 
 *Call graph*: calls 1 internal fn (list_tasks); 2 external calls (pin, get_task_summary).
 
@@ -297,11 +301,11 @@ fn get_task_summary(&self, id: TaskId) -> CloudBackendFuture<'_, TaskSummary>
 fn get_task_diff(&self, _id: TaskId) -> CloudBackendFuture<'_, Option<String>>
 ```
 
-**Purpose**: Marks diff retrieval as intentionally unsupported in this test backend.
+**Purpose**: Stubs out diff fetching in the fake backend. The current test does not need diffs, so this deliberately reports that the operation is not implemented.
 
-**Data flow**: It ignores the task ID and returns a boxed async error `CloudTaskError::Unimplemented("not used in test")`.
+**Data flow**: It ignores the incoming task id. It returns an `Unimplemented` error inside the async backend shape expected by the real code.
 
-**Call relations**: Present only to satisfy the `CloudBackend` trait for the `load_tasks` test.
+**Call relations**: No test in this file relies on this result. It exists because the fake backend must implement the full `CloudBackend` interface.
 
 *Call graph*: 2 external calls (pin, Unimplemented).
 
@@ -312,11 +316,11 @@ fn get_task_diff(&self, _id: TaskId) -> CloudBackendFuture<'_, Option<String>>
 fn get_task_messages(&self, _id: TaskId) -> CloudBackendFuture<'_, Vec<String>>
 ```
 
-**Purpose**: Returns an empty assistant-message list in the test backend.
+**Purpose**: Returns an empty message list for tests. This satisfies the backend interface without adding message-related test data.
 
-**Data flow**: It ignores the task ID and returns `Ok(vec![])` from a boxed async block.
+**Data flow**: It ignores the task id and returns an empty vector of messages. Nothing is stored or changed.
 
-**Call relations**: Unused by the current test but required by the trait implementation.
+**Call relations**: It is part of the fake `CloudBackend` implementation. The environment-filter test does not depend on messages, so this method stays minimal.
 
 *Call graph*: 2 external calls (pin, vec!).
 
@@ -330,11 +334,11 @@ fn get_task_text(
         ) -> CloudBackendFuture<'_, codex_cloud_tasks_client::TaskText>
 ```
 
-**Purpose**: Returns a simple fake `TaskText` payload for tests that need the trait method implemented.
+**Purpose**: Returns simple fake text details for a task. This gives tests a complete-looking backend even when they only care about task listing.
 
-**Data flow**: It ignores the task ID and returns `TaskText { prompt: Some("Example prompt"), messages: [], turn_id: Some("fake-turn"), sibling_turn_ids: [], attempt_placement: Some(0), attempt_status: Completed }`.
+**Data flow**: It receives a task id but does not need to inspect it. It returns a `TaskText` value with an example prompt, no messages, a fake turn id, no siblings, placement zero, and a completed status.
 
-**Call relations**: Used only to complete the test backend trait implementation.
+**Call relations**: The trait implementation wraps this fake response so any code asking for task text during a test can get a predictable answer.
 
 *Call graph*: 3 external calls (pin, new, get_task_text).
 
@@ -349,11 +353,11 @@ fn list_sibling_attempts(
         ) -> CloudBackendFuture<'_, Vec<codex_cloud_tasks_client::TurnAttempt>>
 ```
 
-**Purpose**: Returns no sibling attempts in the test backend.
+**Purpose**: Returns no sibling attempts in tests. Sibling attempts are alternative runs for the same task turn.
 
-**Data flow**: It ignores both task ID and turn ID and returns `Ok(Vec::new())` from a boxed async block.
+**Data flow**: It ignores the task id and turn id. It returns an empty list, meaning the fake task has no alternative attempts.
 
-**Call relations**: Unused by the current test but required by the trait.
+**Call relations**: It exists to complete the fake backend interface. Tests focused on task loading do not need attempt navigation data.
 
 *Call graph*: 2 external calls (pin, new).
 
@@ -368,11 +372,11 @@ fn apply_task(
         ) -> CloudBackendFuture<'_, codex_cloud_tasks_client::ApplyOutcome>
 ```
 
-**Purpose**: Marks apply as unsupported in the test backend.
+**Purpose**: Stubs out actually applying a task patch in tests. The task-list test should never perform a real apply operation.
 
-**Data flow**: It ignores inputs and returns `CloudTaskError::Unimplemented("not used in test")` from a boxed async block.
+**Data flow**: It ignores the task id and optional diff override. It returns an `Unimplemented` error instead of producing an apply result.
 
-**Call relations**: Only present to satisfy the trait in tests.
+**Call relations**: It is included because the real backend interface requires an apply method. If a test accidentally tried to apply a patch through this fake backend, the explicit error would make that clear.
 
 *Call graph*: 2 external calls (pin, Unimplemented).
 
@@ -387,11 +391,11 @@ fn apply_task_preflight(
         ) -> CloudBackendFuture<'_, codex_cloud_tasks_client::ApplyOutcome>
 ```
 
-**Purpose**: Marks preflight apply as unsupported in the test backend.
+**Purpose**: Stubs out the preflight check for applying a patch. A preflight is a dry run that checks what would happen before making changes.
 
-**Data flow**: It ignores inputs and returns `CloudTaskError::Unimplemented("not used in test")` from a boxed async block.
+**Data flow**: It ignores the task id and optional diff override. It returns an `Unimplemented` error because the environment-filter test does not need apply checking.
 
-**Call relations**: Only present to satisfy the trait in tests.
+**Call relations**: It fills in the required backend interface. Its explicit failure helps catch accidental use in tests that did not set up apply behavior.
 
 *Call graph*: 2 external calls (pin, Unimplemented).
 
@@ -409,11 +413,11 @@ fn create_task(
         ) ->
 ```
 
-**Purpose**: Marks task creation as unsupported in the test backend.
+**Purpose**: Stubs out cloud task creation in tests. This file’s test is about listing tasks, not making new ones.
 
-**Data flow**: It ignores all creation parameters and returns `CloudTaskError::Unimplemented("not used in test")` from a boxed async block.
+**Data flow**: It receives an environment id, prompt, git reference, QA-mode flag, and best-of count, but ignores them. It returns an `Unimplemented` error rather than a created task.
 
-**Call relations**: Only present to satisfy the trait in tests.
+**Call relations**: It is present so `FakeBackend` can stand in for a full `CloudBackend`. The task-loading test does not call it.
 
 *Call graph*: 2 external calls (pin, Unimplemented).
 
@@ -424,22 +428,24 @@ fn create_task(
 async fn load_tasks_uses_env_parameter()
 ```
 
-**Purpose**: Verifies that `load_tasks` forwards the selected environment to the backend and returns the corresponding task set.
+**Purpose**: Checks that `load_tasks` passes the requested environment filter to the backend. This guards against a bug where the UI might show tasks from the wrong environment.
 
-**Data flow**: It constructs a `FakeBackend` with different title vectors for `None`, `env-A`, and `env-B`, calls `load_tasks` three times with those filters, unwraps the results, and asserts the returned lengths and titles.
+**Data flow**: It builds a fake backend with separate task titles for no environment, `env-A`, and `env-B`. It calls `load_tasks` three times with those filters and checks that the returned lengths and titles match the expected fake data.
 
-**Call relations**: This test exercises the file’s only backend-facing helper, `load_tasks`, using the local fake backend.
+**Call relations**: This test drives `load_tasks` directly. The fake backend supplies controlled responses, and the assertions confirm that the environment argument changes which tasks come back.
 
 *Call graph*: calls 1 internal fn (load_tasks); 3 external calls (assert_eq!, new, vec!).
 
 
 ### `cloud-tasks/src/new_task.rs`
 
-`data_model` · `new-task composition`
+`data_model` · `screen setup`
 
-This file is a small UI-state wrapper around `codex_tui::ComposerInput`. `NewTaskPage` stores the live composer widget, whether submission is currently in progress, the selected environment ID to display and submit against, and the chosen best-of-N attempt count. Its constructor configures the composer with the exact footer hints the TUI expects: Enter to send, Shift+Enter for newline, Ctrl+O to switch environments, Ctrl+N to change attempts, and Ctrl+C to quit.
+This file is a small blueprint for one screen: the page where a user writes and starts a new cloud task. The central type, `NewTaskPage`, keeps together the pieces of information that screen needs. It owns a `ComposerInput`, which is the editable text area where the user types the task. It also remembers whether the task is currently being submitted, which environment is selected, and how many attempts should be requested through `best_of_n`.
 
-The type intentionally contains almost no behavior beyond construction. All editing, paste handling, submission, and modal interactions are driven from the main event loop in `lib.rs`; this file just packages the state needed for that page into one struct and ensures the composer starts with the right affordances. The `Default` implementation delegates to `new(None, 1)`, making the empty page correspond to no selected environment and a single attempt.
+The most important work happens when the page is created. The constructor builds a fresh composer and gives it visible keyboard hints, such as Enter to send, Shift+Enter for a newline, and shortcuts for choosing an environment or changing the number of attempts. This is like putting labels on the controls of a small machine before handing it to the user.
+
+Without this file, the rest of the terminal app would not have a clear, reusable object representing the new-task screen. Other code would have to assemble the text input, defaults, and shortcut labels by hand, which would make the screen easier to break or keep inconsistent.
 
 #### Function details
 
@@ -449,11 +455,11 @@ The type intentionally contains almost no behavior beyond construction. All edit
 fn new(env_id: Option<String>, best_of_n: usize) -> Self
 ```
 
-**Purpose**: Creates a new task-composer page with a fresh composer widget, submission flag cleared, and the provided environment and best-of-N settings.
+**Purpose**: Creates a ready-to-use new-task page. It prepares the text input area, adds helpful keyboard shortcut hints, and stores the chosen environment and attempt count.
 
-**Data flow**: It takes an optional environment ID and a `best_of_n` count, constructs `ComposerInput::new()`, sets its hint items to the fixed key/action pairs used by the TUI, and returns `NewTaskPage { composer, submitting: false, env_id, best_of_n }`.
+**Data flow**: It receives an optional environment ID and a number saying how many task attempts to use. It creates a fresh composer input, adds the shortcut labels that will be shown to the user, then returns a `NewTaskPage` with `submitting` set to false, because nothing has been sent yet.
 
-**Call relations**: Called whenever the TUI opens the new-task page from the base list or environment modal. It delegates text-editing behavior to the embedded `ComposerInput`.
+**Call relations**: This is the main way other parts of the terminal interface build the new-task screen. It relies on the composer input’s own creation function to make the text box, then finishes the page-specific setup itself.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (vec!).
 
@@ -464,24 +470,24 @@ fn new(env_id: Option<String>, best_of_n: usize) -> Self
 fn default() -> Self
 ```
 
-**Purpose**: Builds the default new-task page with no selected environment and a single attempt.
+**Purpose**: Creates the standard new-task page when no special starting options are provided. It uses no preselected environment and defaults to one attempt.
 
-**Data flow**: It calls `Self::new(None, 1)` and returns that value.
+**Data flow**: It takes no input. It calls the page constructor with `None` for the environment and `1` for the attempt count, and returns the fully initialized page that constructor creates.
 
-**Call relations**: Used wherever a generic empty `NewTaskPage` is needed without explicitly specifying environment or attempt count.
+**Call relations**: This is the convenient fallback path for code that just needs a normal new-task screen. Instead of duplicating setup choices, it hands off to `NewTaskPage::new`, keeping the default behavior in sync with the main constructor.
 
 *Call graph*: 1 external calls (new).
 
 
 ### `cloud-tasks/src/ui.rs`
 
-`orchestration` · `main loop`
+`orchestration` · `main loop render frame`
 
-This file is the presentation layer for the TUI. The top-level `draw` function splits the terminal into a main pane and a two-line footer, chooses between the task list and new-task composer, and then conditionally paints overlays and modals on top of the base screen. Shared overlay geometry is centralized in `overlay_outer`, `overlay_block`, and `overlay_content`, with rounded borders controlled once via `OnceLock<bool>` and the `CODEX_TUI_ROUNDED` environment variable.
+This file is the app’s drawing desk. Each time the terminal screen needs repainting, it looks at the current App state and decides what the user should see. Without it, the program might still know about tasks, environments, diffs, and apply results, but none of that would be presented in a usable way.
 
-The list view renders `TaskSummary` entries as four-line `ListItem`s with status color, environment label, relative timestamp, and diff summary. It dims the background whenever a modal or overlay is active and computes a simple selection-based percentage for the title. The footer combines keybinding hints, a right-aligned spinner area for inflight operations, and a sanitized single-line status message.
+The main draw function first divides the terminal into a large content area and a small footer. If the user is writing a new task, it draws the task composer. Otherwise it draws the task list. It always draws the footer, then adds any open pop-up layers on top, such as the diff/details view, environment selector, attempt-count selector, or apply confirmation.
 
-The diff overlay is the most stateful path: it derives title styling from applyability and failure text, optionally shows a status bar for prompt/diff view switching and attempt selection, updates the embedded `ScrollableDiff` width and viewport from the current rectangle, and then renders either syntax-colored diff lines or conversation-style lines. Conversation styling reconstructs semantic structure from wrapped rows using source-line indices, tracking speaker sections, fenced code blocks, and bullet indentation so wrapped continuations stay aligned. Additional modal renderers cover environment selection, parallel-attempt selection, and apply confirmation/results, each with focused layout and spinner behavior.
+Most pop-ups share the same geometry helpers, so they appear centered and styled consistently. The file also contains small styling helpers that make diffs readable, mark added and removed lines with colors, and make conversations easier to scan by labeling User and Assistant sections. Loading states are shown with simple blinking dot spinners. In short, this file is the part that translates “what is happening in the app” into “what the user sees right now.”
 
 #### Function details
 
@@ -491,11 +497,11 @@ The diff overlay is the most stateful path: it derives title styling from applya
 fn draw(frame: &mut Frame, app: &mut App)
 ```
 
-**Purpose**: Composes the entire frame for the current application state, drawing the base page first and then any active overlays or modals. It is the single entry point for per-frame UI rendering.
+**Purpose**: Draws one complete frame of the terminal interface. It decides which main page to show and which pop-up overlays should be layered on top.
 
-**Data flow**: Takes a mutable `Frame` and mutable `App`; reads frame area and multiple `App` flags (`new_task`, `diff_overlay`, `env_modal`, `best_of_modal`, `apply_modal`) to choose layouts and subviews. It writes rendered widgets into the frame and may allow child functions to mutate UI-related app state such as spinner timestamps or embedded scroll geometry.
+**Data flow**: It receives the terminal frame to draw into and the current App state. It reads whether a new task page or any modal overlays are open, draws the matching screen sections, and updates only visual output in the frame.
 
-**Call relations**: The outer event/render loop calls this each frame. It delegates base content to `draw_new_task_page` or `draw_list`, always draws `draw_footer`, and conditionally layers `draw_diff_overlay`, `draw_env_modal`, `draw_best_of_modal`, and `draw_apply_modal` when those states are present.
+**Call relations**: This is the top-level drawing function for the file. During each render pass it calls the page drawers, footer drawer, and overlay drawers in the order needed so background content appears first and pop-ups appear above it.
 
 *Call graph*: calls 8 internal fn (draw_apply_modal, draw_best_of_modal, draw_diff_overlay, draw_env_modal, draw_footer, draw_list, draw_new_task_page, area); 3 external calls (Length, Min, default).
 
@@ -506,11 +512,11 @@ fn draw(frame: &mut Frame, app: &mut App)
 fn rounded_enabled() -> bool
 ```
 
-**Purpose**: Lazily resolves whether overlay borders should use rounded corners, caching the decision for the process lifetime. The default is enabled unless an environment variable explicitly disables it.
+**Purpose**: Decides whether pop-up borders should use rounded corners. It lets an environment variable turn rounded borders on or off.
 
-**Data flow**: Reads `CODEX_TUI_ROUNDED` from the environment through a `OnceLock<bool>` initializer; interprets value `"1"` as enabled and falls back to `true` when unset or unreadable. Returns the cached boolean without mutating UI state after initialization.
+**Data flow**: It reads CODEX_TUI_ROUNDED from the process environment the first time it runs, stores the answer, and returns a true-or-false value on later calls without rereading the environment.
 
-**Call relations**: Only `overlay_block` consults this helper when constructing shared modal/overlay blocks, so all overlays get consistent border styling.
+**Call relations**: overlay_block calls this when building the standard pop-up border style, so all modals share the same rounded-corner setting.
 
 *Call graph*: called by 1 (overlay_block).
 
@@ -521,11 +527,11 @@ fn rounded_enabled() -> bool
 fn overlay_outer(area: Rect) -> Rect
 ```
 
-**Purpose**: Computes the centered outer rectangle used by full-screen overlays and modals. It reserves 10% margins on all sides and returns the middle 80% region.
+**Purpose**: Computes the rectangle where a large overlay should appear. It centers the overlay by leaving margins around the edges of the terminal.
 
-**Data flow**: Takes a `Rect`, applies a vertical `Layout` with 10/80/10 percentage splits, then applies the same horizontal split to the middle band, and returns the center rectangle. It does not mutate external state.
+**Data flow**: It takes the full screen area, cuts off about ten percent on each side, and returns the middle eighty percent as the overlay area.
 
-**Call relations**: All overlay/modal renderers call this first to get a consistent centered canvas before adding their own inner layout.
+**Call relations**: The modal and overlay drawers call this first so the diff view, apply dialog, environment picker, and attempt selector all start from the same centered layout.
 
 *Call graph*: called by 4 (draw_apply_modal, draw_best_of_modal, draw_diff_overlay, draw_env_modal); 2 external calls (Percentage, default).
 
@@ -536,11 +542,11 @@ fn overlay_outer(area: Rect) -> Rect
 fn overlay_block() -> Block<'static>
 ```
 
-**Purpose**: Builds the standard bordered and padded `Block` used by overlays and modals. It encapsulates border style and interior padding in one place.
+**Purpose**: Creates the shared border and padding style for overlays. This keeps pop-up windows visually consistent.
 
-**Data flow**: Creates a default `Block` with all borders, conditionally applies `BorderType::Rounded` based on `rounded_enabled()`, then adds symmetric horizontal padding and top/bottom padding. Returns the configured `Block<'static>`.
+**Data flow**: It builds a bordered block, optionally gives it rounded corners, adds padding inside the border, and returns that reusable block object.
 
-**Call relations**: Used directly by each modal/overlay renderer and indirectly by `overlay_content` to ensure geometry calculations match the actual block styling.
+**Call relations**: All overlay drawers call this when painting their window. overlay_content also uses it to calculate the inner usable area after borders and padding.
 
 *Call graph*: calls 1 internal fn (rounded_enabled); called by 5 (draw_apply_modal, draw_best_of_modal, draw_diff_overlay, draw_env_modal, overlay_content); 2 external calls (default, new).
 
@@ -551,11 +557,11 @@ fn overlay_block() -> Block<'static>
 fn overlay_content(area: Rect) -> Rect
 ```
 
-**Purpose**: Calculates the inner content rectangle inside the shared overlay block chrome. This keeps content layout aligned with the exact padding and borders used for rendering.
+**Purpose**: Finds the usable content area inside an overlay’s border and padding. It answers, “where can the actual text or list go?”
 
-**Data flow**: Takes an outer `Rect`, constructs the standard overlay block via `overlay_block()`, calls `.inner(area)`, and returns the resulting inner `Rect`.
+**Data flow**: It takes an overlay rectangle, applies the standard overlay block’s inner-area calculation, and returns the smaller rectangle for content.
 
-**Call relations**: Called by all overlay/modal renderers after they choose an outer rectangle, so content placement stays synchronized with `overlay_block`.
+**Call relations**: Overlay drawing functions call this after drawing their border so headers, lists, messages, and spinners land inside the padded box.
 
 *Call graph*: calls 1 internal fn (overlay_block); called by 4 (draw_apply_modal, draw_best_of_modal, draw_diff_overlay, draw_env_modal).
 
@@ -566,11 +572,11 @@ fn overlay_content(area: Rect) -> Rect
 fn draw_new_task_page(frame: &mut Frame, area: Rect, app: &mut App)
 ```
 
-**Purpose**: Renders the full-screen new-task composer page, including a dynamic title that reflects selected environment and parallel-attempt count. It also sizes and positions the composer near the bottom and places the terminal cursor where the composer requests.
+**Purpose**: Draws the screen used to compose a new cloud task. It shows the chosen environment, the number of parallel attempts, and the text editor area.
 
-**Data flow**: Reads `app.new_task`, `app.environments`, and frame dimensions to build title spans and compute a desired composer height bounded between 3 rows and terminal height minus 6. It clears and draws the page block, renders the composer into the bottom row allocation via `render_ref`, and writes cursor position into the frame when `cursor_pos` returns coordinates.
+**Data flow**: It reads the new-task state from App, including environment ID, environment labels, attempt count, and the composer widget. It draws a bordered page, sizes the composer based on terminal width and height, renders the composer, and places the terminal cursor where typing should continue.
 
-**Call relations**: Called by `draw` when `app.new_task` is active instead of the task list. It does not render footer hints itself beyond the composer because `draw` still invokes `draw_footer` separately.
+**Call relations**: draw calls this instead of the task list when app.new_task is present. It relies on the composer object in the new-task state to render text and report the cursor position.
 
 *Call graph*: calls 3 internal fn (area, buffer_mut, set_cursor_position); called by 1 (draw); 8 external calls (default, Length, Min, default, from, format!, render_widget, vec!).
 
@@ -581,11 +587,11 @@ fn draw_new_task_page(frame: &mut Frame, area: Rect, app: &mut App)
 fn draw_list(frame: &mut Frame, area: Rect, app: &mut App)
 ```
 
-**Purpose**: Renders the main task list view with selection highlighting, environment-filter title suffix, selection-based percent indicator, and optional dimming when focus belongs to an overlay. It also shows an in-box loading spinner during refreshes.
+**Purpose**: Draws the main cloud task list. It shows task status, titles, metadata, diff summaries, the current environment filter, and scroll position.
 
-**Data flow**: Reads `app.tasks`, `app.selected`, modal/overlay presence flags, `app.env_filter`, `app.environments`, and `app.refresh_inflight`. It maps tasks through `render_task_item`, constructs `ListState` with the selected index, renders the surrounding block and inner list, and may mutate `app.spinner_start` when drawing the centered spinner.
+**Data flow**: It reads App.tasks, App.selected, environment filter information, and overlay/loading flags. It turns each task into a list item, dims the list if a modal has focus, and may draw a centered loading spinner while tasks are refreshing.
 
-**Call relations**: This is the normal base-page renderer when no new-task page is open. `draw` invokes it, and it delegates per-row formatting to `render_task_item` and loading feedback to `draw_centered_spinner`.
+**Call relations**: draw calls this when the user is not composing a new task. It uses render_task_item for each row and draw_centered_spinner when a refresh is in progress.
 
 *Call graph*: calls 1 internal fn (draw_centered_spinner); called by 1 (draw); 12 external calls (default, Length, Min, default, from, new, default, default, format!, render_stateful_widget (+2 more)).
 
@@ -596,11 +602,11 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App)
 fn draw_footer(frame: &mut Frame, area: Rect, app: &mut App)
 ```
 
-**Purpose**: Paints the two-line footer containing keybinding help, a right-aligned activity spinner, and the current status/log message. It adapts the help text to overlay state and apply availability.
+**Purpose**: Draws the two-line footer at the bottom of the terminal. The footer tells the user which keys are useful right now and shows the latest status message.
 
-**Data flow**: Reads many `App` flags (`diff_overlay`, `new_task`, inflight booleans, `best_of_n`, `status`) to assemble help spans and choose whether to render a spinner. It writes widgets into the top and bottom footer rows, clears stale spinner/status regions, truncates overly long status text to 2000 characters, and may mutate `app.spinner_start` through `draw_inline_spinner`.
+**Data flow**: It reads App state such as open overlays, loading flags, new-task mode, attempt count, and status text. It builds a help line, shows or clears a small spinner area, sanitizes the status line, and writes both rows to the frame.
 
-**Call relations**: Always called by `draw` after the main content area. It delegates spinner rendering to `draw_inline_spinner` when any background operation is active.
+**Call relations**: draw calls this every frame after the main page. It calls draw_inline_spinner when any background operation is running, so the footer gives constant feedback.
 
 *Call graph*: calls 1 internal fn (draw_inline_spinner); called by 1 (draw); 8 external calls (Fill, Length, default, from, new, format!, render_widget, vec!).
 
@@ -611,11 +617,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &mut App)
 fn draw_diff_overlay(frame: &mut Frame, area: Rect, app: &mut App)
 ```
 
-**Purpose**: Renders the centered details/diff overlay, including title state, optional prompt/diff status bar, attempt navigation hints, scroll geometry updates, and the final styled text body or loading spinner. It is the main consumer of `ScrollableDiff`.
+**Purpose**: Draws the task details overlay, which can show a conversation, a code diff, failure details, and attempt-switching information. This is the main “open task” view.
 
-**Data flow**: Reads `app.diff_overlay`, `app.details_inflight`, and `app.spinner_start`; derives `ov_can_apply`, failure state from the first wrapped line, title text, current view, attempt counts, and whether prompt/diff text exists. It clears and draws the overlay block, computes content rows, mutates the overlay’s `ScrollableDiff` via `set_width` and `set_viewport`, builds styled lines using either `style_diff_line` or `style_conversation_lines`, and renders a scrolled `Paragraph` or a centered spinner.
+**Data flow**: It reads the current diff overlay from App, decides whether the content is a diff, conversation, or error message, calculates scroll and viewport size, styles the visible lines, and either renders text or a loading spinner.
 
-**Call relations**: Called by `draw` only when a diff overlay exists. It delegates geometry helpers to `overlay_outer`, `overlay_block`, and `overlay_content`, styling to `style_diff_line` or `style_conversation_lines`, and loading feedback to `draw_centered_spinner`.
+**Call relations**: draw calls this when app.diff_overlay is present. It uses the shared overlay helpers for shape, draw_centered_spinner while details load, and the conversation/diff styling helpers to make the content readable.
 
 *Call graph*: calls 4 internal fn (draw_centered_spinner, overlay_block, overlay_content, overlay_outer); called by 1 (draw); 11 external calls (Length, Min, default, from, new, from, new, format!, matches!, render_widget (+1 more)).
 
@@ -626,11 +632,11 @@ fn draw_diff_overlay(frame: &mut Frame, area: Rect, app: &mut App)
 fn draw_apply_modal(frame: &mut Frame, area: Rect, app: &mut App)
 ```
 
-**Purpose**: Displays the apply-confirmation/result modal with a header, body, and footer instructions. Depending on state, the body shows a spinner, a result message, and optional conflict/skipped path lists.
+**Purpose**: Draws the confirmation and result dialog for applying a task’s changes. It tells the user whether they can apply, preflight-check, or cancel.
 
-**Data flow**: Reads `app.apply_modal`, `app.apply_preflight_inflight`, `app.apply_inflight`, and `app.spinner_start`. It computes overlay geometry, renders the titled block, splits content into header/body/footer rows, and either draws centered spinners or constructs colored `Line` values from `result_message`, `result_level`, `conflict_paths`, and `skipped_paths` before rendering them in a wrapped paragraph.
+**Data flow**: It reads App.apply_modal and apply-related loading flags. It draws the title, instructions, a spinner while checking or applying, and then a result message with conflict or skipped file paths when available.
 
-**Call relations**: Invoked by `draw` when the apply modal is active. It uses the shared overlay helpers and delegates transient loading states to `draw_centered_spinner`.
+**Call relations**: draw calls this when an apply modal is open. It shares the overlay layout helpers and uses draw_centered_spinner for preflight, apply, and initial loading states.
 
 *Call graph*: calls 4 internal fn (draw_centered_spinner, overlay_block, overlay_content, overlay_outer); called by 1 (draw); 10 external calls (Length, Min, default, from, new, new, format!, matches!, render_widget, vec!).
 
@@ -644,11 +650,11 @@ fn style_conversation_lines(
 ) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Transforms wrapped conversation text into styled ratatui lines with speaker gutters, section headers, markdown-ish formatting, code-block coloring, and bullet continuation alignment. It reconstructs semantic structure from wrapped rows using source-line indices.
+**Purpose**: Turns raw wrapped conversation text into styled terminal lines. It makes User and Assistant sections visually distinct and improves readability for code blocks, bullets, headings, and markdown-like text.
 
-**Data flow**: Reads wrapped display lines, wrapped source indices, and raw source lines from a `ScrollableDiff`, plus optional `AttemptView` for assistant status. It tracks mutable local state for current speaker, fenced-code mode, previous source index, and bullet indentation; for each wrapped row it may emit speaker header lines, blank gutter lines, or content lines built from `conversation_gutter_span` and `conversation_text_spans`. It returns a `Vec<Line<'static>>`.
+**Data flow**: It reads wrapped display lines, their original source-line indexes, and the current attempt. It tracks who is speaking, whether the text is inside a code block, and whether a bullet list is continuing, then outputs styled lines for display.
 
-**Call relations**: Used by `draw_diff_overlay` when the active detail view is conversation/prompt rather than diff. It delegates header creation to `conversation_header_line`, gutter styling to `conversation_gutter_span`, and per-line text styling to `conversation_text_spans`.
+**Call relations**: The diff/details overlay uses this when the current view is a conversation rather than a diff. It delegates small pieces to conversation_header_line, conversation_gutter_span, conversation_text_spans, and attempt_status_span.
 
 *Call graph*: calls 6 internal fn (raw_line_at, wrapped_lines, wrapped_src_indices, conversation_gutter_span, conversation_header_line, conversation_text_spans); 4 external calls (from, raw, new, new).
 
@@ -662,11 +668,11 @@ fn conversation_header_line(
 ) -> Line<'static>
 ```
 
-**Purpose**: Builds the decorative header line that starts a user or assistant section in conversation view. Assistant headers can include a colored attempt-status badge.
+**Purpose**: Creates the labeled header for a User prompt or Assistant response in the conversation view. For assistant messages, it can also include the attempt’s status.
 
-**Data flow**: Takes a `ConversationSpeaker` and optional `AttemptView`; creates a span vector beginning with a dim `╭ ` marker, appends speaker-specific labels, and for assistants optionally appends the result of `attempt_status_span(attempt.status)`. Returns a styled `Line<'static>`.
+**Data flow**: It receives the speaker and optionally an attempt. It builds styled text spans such as “User prompt” or “Assistant response,” adds a colored status when one is known, and returns one styled line.
 
-**Call relations**: Called from `style_conversation_lines` whenever a raw line exactly matches `user:` or `assistant:`. It delegates status coloring to `attempt_status_span`.
+**Call relations**: style_conversation_lines calls this whenever it sees a raw “user:” or “assistant:” marker. It calls attempt_status_span to translate an attempt status into a human-readable colored label.
 
 *Call graph*: calls 1 internal fn (attempt_status_span); called by 1 (style_conversation_lines); 2 external calls (from, vec!).
 
@@ -677,11 +683,11 @@ fn conversation_header_line(
 fn conversation_gutter_span(speaker: ConversationSpeaker) -> ratatui::text::Span<'static>
 ```
 
-**Purpose**: Returns the colored vertical gutter prefix used on conversation body lines. The gutter color matches the active speaker.
+**Purpose**: Creates the small colored vertical marker shown beside each line of a conversation section. It helps the eye follow whether text belongs to the user or assistant.
 
-**Data flow**: Matches on `ConversationSpeaker` and returns either a cyan-dim or magenta-dim `Span<'static>` containing `"│ "`.
+**Data flow**: It receives the speaker and returns a short styled span, cyan for the user and magenta for the assistant.
 
-**Call relations**: Used by `style_conversation_lines` for both blank and nonblank body rows so speaker sections remain visually grouped.
+**Call relations**: style_conversation_lines calls this for normal and blank lines after a speaker has been detected, so the conversation has a consistent left-side guide.
 
 *Call graph*: called by 1 (style_conversation_lines).
 
@@ -697,11 +703,11 @@ fn conversation_text_spans(
 ) -> Vec<ratatui::text::Span<'static>>
 ```
 
-**Purpose**: Styles one wrapped display fragment of conversation text, with special handling for fenced code blocks, markdown headings, and bullet lists whose wrapped continuations need indentation. For ordinary prose it reuses markdown text rendering.
+**Purpose**: Styles one visible line of conversation text. It gives special treatment to code, bullet lists, headings, and simple markdown formatting.
 
-**Data flow**: Consumes `display`, `in_code`, `is_new_raw`, and `bullet_indent`. If inside code, it returns a single cyan span. If the line begins a bullet item, it rewrites the marker to `• ` and preserves indentation; wrapped continuations get `indent + 2` spaces. If the line begins a markdown heading on a new raw line, it returns a bold magenta span. Otherwise it calls `render_markdown_text(display)`, extracts spans from the first rendered line when available, and falls back to a raw span if rendering yields nothing.
+**Data flow**: It receives the display text plus context flags: whether the line is inside code, whether it starts a new raw line, and whether it belongs to a bullet. It returns one or more styled spans ready to place in a terminal line.
 
-**Call relations**: This is the text-formatting worker used by `style_conversation_lines` after speaker and structural state have been determined. It is intentionally line-local and does not inspect the `ScrollableDiff` directly.
+**Call relations**: style_conversation_lines calls this after adding any speaker gutter. It hands ordinary text to render_markdown_text so lightweight markdown formatting can be reused.
 
 *Call graph*: called by 1 (style_conversation_lines); 5 external calls (raw, new, new, render_markdown_text, vec!).
 
@@ -712,11 +718,11 @@ fn conversation_text_spans(
 fn attempt_status_span(status: AttemptStatus) -> Option<ratatui::text::Span<'static>>
 ```
 
-**Purpose**: Maps an `AttemptStatus` enum to a colored label span suitable for assistant conversation headers. Unknown status intentionally produces no badge.
+**Purpose**: Converts an attempt status into a colored label for the conversation header. Unknown statuses are deliberately hidden.
 
-**Data flow**: Matches the input `AttemptStatus` and returns `Some(Span)` for `Completed`, `Failed`, `InProgress`, `Pending`, and `Cancelled`, or `None` for `Unknown`.
+**Data flow**: It receives an AttemptStatus value and returns either a styled word such as “Completed,” “Failed,” or “Pending,” or no value for Unknown.
 
-**Call relations**: Only `conversation_header_line` calls this, and only for assistant sections where attempt metadata is relevant.
+**Call relations**: conversation_header_line calls this for assistant responses when an attempt is available, so users can see whether that attempt succeeded, failed, or is still running.
 
 *Call graph*: called by 1 (conversation_header_line).
 
@@ -727,11 +733,11 @@ fn attempt_status_span(status: AttemptStatus) -> Option<ratatui::text::Span<'sta
 fn style_diff_line(raw: &str) -> Line<'static>
 ```
 
-**Purpose**: Applies simple unified-diff coloring to a single raw line. It distinguishes hunk headers, file headers, additions, deletions, and unchanged lines by prefix.
+**Purpose**: Styles one line of a code diff so changes are easy to scan. Added lines become green, removed lines red, section headers magenta, and file headers dim.
 
-**Data flow**: Reads `raw: &str`, checks prefixes in order (`@@`, `+++`/`---`, `+`, `-`), and returns a `Line<'static>` containing one styled or raw span. It does not mutate external state.
+**Data flow**: It receives a raw diff line, checks its prefix, and returns a styled terminal line with the appropriate color or emphasis.
 
-**Call relations**: Used by `draw_diff_overlay` when the current detail view is diff mode. It is intentionally stateless because diff styling depends only on each line’s prefix.
+**Call relations**: The diff overlay uses this when the active details view is a diff. It is the small rulebook that turns plain diff text into readable colored output.
 
 *Call graph*: 2 external calls (from, vec!).
 
@@ -742,11 +748,11 @@ fn style_diff_line(raw: &str) -> Line<'static>
 fn render_task_item(_app: &App, t: &codex_cloud_tasks_client::TaskSummary) -> ListItem<'static>
 ```
 
-**Purpose**: Formats one task summary into the four-line list item shown in the main task list: status/title, metadata, diff summary, and a blank spacer row. It encodes task status and summary counts with color.
+**Purpose**: Builds the visible list entry for one cloud task. It summarizes status, title, environment, update time, and size of the change.
 
-**Data flow**: Reads a `TaskSummary`’s `status`, `title`, `environment_label`, `updated_at`, and summary counters. It computes a colored status span, calls `format_relative_time_now` for the timestamp, builds either a `+adds/−dels • files` summary or `no diff`, appends a blank spacer line, and returns a `ListItem<'static>`.
+**Data flow**: It receives a task summary, reads its status, title, environment label, update time, and diff summary. It produces a multi-line ListItem with colored status and change counts, or “no diff” when there are no changes.
 
-**Call relations**: Mapped over `app.tasks` by `draw_list` to produce the visible list contents. The `_app` parameter is currently unused, signaling formatting is task-local.
+**Call relations**: draw_list calls this for every task before rendering the list. It also calls format_relative_time_now so timestamps appear as friendly relative times instead of raw dates.
 
 *Call graph*: calls 1 internal fn (format_relative_time_now); 4 external calls (from, new, new, vec!).
 
@@ -762,11 +768,11 @@ fn draw_inline_spinner(
 )
 ```
 
-**Purpose**: Renders a compact one-line spinner with a blinking dot and cyan label inside a fixed rectangle. The blink phase is derived from elapsed wall-clock time since the first use.
+**Purpose**: Draws a small one-line loading indicator with a blinking dot and label. It is used where space is tight, such as the footer.
 
-**Data flow**: Takes a mutable `spinner_start: &mut Option<Instant>` and inserts `Instant::now()` if absent, computes a 600 ms blink cadence from elapsed milliseconds, chooses either `• ` or dim `◦ `, combines it with the label, and renders a `Paragraph` into `area`.
+**Data flow**: It receives a frame, target area, mutable spinner start time, and label. It initializes the start time if needed, uses elapsed time to choose a filled or hollow dot, and renders the label into the area.
 
-**Call relations**: Called directly by `draw_footer` for the footer’s right-hand activity indicator and indirectly by `draw_centered_spinner` for centered loading states.
+**Call relations**: draw_footer calls this directly for footer loading feedback. draw_centered_spinner also calls it after first choosing a centered position.
 
 *Call graph*: called by 2 (draw_centered_spinner, draw_footer); 4 external calls (from, new, render_widget, vec!).
 
@@ -782,11 +788,11 @@ fn draw_centered_spinner(
 )
 ```
 
-**Purpose**: Centers the inline spinner within a larger rectangle by carving out a one-row, fixed-width middle cell. It is a layout wrapper around `draw_inline_spinner`.
+**Purpose**: Draws the same loading indicator as draw_inline_spinner, but centered inside a larger rectangle. It is used for empty loading panels and modal bodies.
 
-**Data flow**: Splits `area` vertically into 50% / 1 row / 49% and horizontally into 50% / 18 columns / 50%, then forwards the center cell plus `spinner_start` and `label` to `draw_inline_spinner`. It writes only through the delegated render call.
+**Data flow**: It receives a frame, area, spinner timer, and label. It splits the area into rows and columns to find a centered one-line slot, then draws the inline spinner there.
 
-**Call relations**: Used by list, diff overlay, apply modal, and environment modal loading states whenever a spinner should appear centered rather than inline.
+**Call relations**: Task list, detail overlay, apply modal, and environment modal call this when their content is not ready yet. It delegates the actual spinner drawing to draw_inline_spinner.
 
 *Call graph*: calls 1 internal fn (draw_inline_spinner); called by 4 (draw_apply_modal, draw_diff_overlay, draw_env_modal, draw_list); 3 external calls (Length, Percentage, default).
 
@@ -797,11 +803,11 @@ fn draw_centered_spinner(
 fn draw_env_modal(frame: &mut Frame, area: Rect, app: &mut App)
 ```
 
-**Purpose**: Renders the environment-selection modal with a usage subheader, search query line, and filtered result list including a synthetic global option. It also shows a loading spinner while environments are being fetched.
+**Purpose**: Draws the environment selection modal. It lets the user search environments and choose either a specific environment or the global “all environments” option.
 
-**Data flow**: Reads `app.env_loading`, `app.env_modal`, and `app.environments`; computes overlay geometry; if loading, draws a centered spinner and returns early. Otherwise it lowercases the query, filters environments by substring match across label, id, and repo hints, builds `ListItem`s with pinned badges and dim metadata, clamps the selected index to the filtered list length plus the global row, and renders the stateful list.
+**Data flow**: It reads environment loading state, the modal query and selected row, and the known environment list. It shows a loading spinner if needed, filters environments by case-insensitive search text, builds list rows with labels, IDs, pinned marks, and hints, then renders the selectable list.
 
-**Call relations**: Called by `draw` when the environment modal is active. It uses shared overlay helpers and delegates loading feedback to `draw_centered_spinner`.
+**Call relations**: draw calls this when app.env_modal is present. It uses the shared overlay helpers for layout and draw_centered_spinner while environments are loading.
 
 *Call graph*: calls 4 internal fn (draw_centered_spinner, overlay_block, overlay_content, overlay_outer); called by 1 (draw); 15 external calls (default, Length, Min, default, from, new, new, default, new, default (+5 more)).
 
@@ -812,11 +818,11 @@ fn draw_env_modal(frame: &mut Frame, area: Rect, app: &mut App)
 fn draw_best_of_modal(frame: &mut Frame, area: Rect, app: &mut App)
 ```
 
-**Purpose**: Displays a compact centered modal for choosing the number of parallel attempts, with fixed option rows for 1 through 4 and a marker for the current setting. It constrains modal size within min/max bounds before rendering.
+**Purpose**: Draws the small modal for choosing how many parallel attempts a new task should run. The options are one through four attempts.
 
-**Data flow**: Reads `app.best_of_modal` and `app.best_of_n`, computes a centered modal rectangle inside `overlay_outer(area)` with width and height clamped to configured min/max constants, renders the titled block and hint row, builds list items for attempt counts 1..=4 with `Current` tagging when matching `best_of_n`, clamps the selected index, and renders the stateful list.
+**Data flow**: It reads the current and selected attempt count from App, builds a compact centered dialog, marks the current choice, and renders a selectable list of attempt-count options.
 
-**Call relations**: Invoked by `draw` when the best-of modal is active. It shares overlay styling with other modals but has its own tighter geometry logic.
+**Call relations**: draw calls this when app.best_of_modal is present. It uses the same overlay styling helpers as the other modals, but further shrinks and centers the box so this simple choice does not take over the whole screen.
 
 *Call graph*: calls 3 internal fn (overlay_block, overlay_content, overlay_outer); called by 1 (draw); 16 external calls (default, Length, Min, default, from, new, new, default, new, new (+6 more)).
 
@@ -826,13 +832,13 @@ These files provide reusable overlay browsing plus the state and formatting logi
 
 ### `tui/src/app/agent_navigation.rs`
 
-`domain_logic` · `interactive navigation / picker rendering`
+`domain_logic` · `main loop and user interaction`
 
-This module defines `AgentNavigationState`, a compact state container with two coordinated collections: `threads: HashMap<ThreadId, AgentPickerThreadEntry>` for the latest metadata per thread and `order: Vec<ThreadId>` for stable first-seen traversal order. The central invariant is that a thread id is appended to `order` only once, so later metadata updates never reshuffle keyboard next/previous navigation or picker row order.
+This file is the memory and rulebook for navigating multiple agent threads in the terminal user interface. A “thread” is one conversation or agent run, identified by a `ThreadId`. The main app discovers threads and decides which one is currently visible; this file keeps the quieter bookkeeping: what threads are known, what order they first appeared in, whether they are running or closed, and what text should be shown to users.
 
-Mutation methods are intentionally narrow. `upsert` inserts or refreshes nickname/role/closed-state while preserving any previously known `agent_path` and running flag. `record_sub_agent_activity` opportunistically creates or updates entries from activity notifications, `set_running` and `set_agent_path` patch individual fields, `mark_closed` flips closed/running state without removing the thread, `remove` fully deletes ghost entries, and `clear` resets the cache. Query methods expose emptiness, direct lookup, ordered rows, path-backed sub-agent subsets, tracked ids, and whether any non-primary thread exists.
+The important idea is stable spawn order. Once a thread is first seen, its id is placed in an order list and stays in that position. Later updates can change its nickname, role, path, or closed state, but not its place. This matters because keyboard navigation should feel like moving around a fixed carousel, not a list that reshuffles under the user.
 
-Two methods derive user-facing behavior. `adjacent_thread_id` performs wraparound traversal in stable spawn order, returning `None` when there are fewer than two tracked threads or the current thread is unknown. `active_agent_label` produces the footer label for the currently displayed thread, preferring a non-empty `agent_path` for sub-agents and otherwise falling back to `format_agent_picker_item_name`. `picker_subtitle` derives its text from the actual shortcut helpers so the picker copy stays synchronized with key bindings. The included tests lock down ordering, wraparound traversal, shortcut mention text, and active-label formatting.
+The state is split into two parts: a map from thread id to the latest display details, and a list of thread ids in first-seen order. Most functions either update those two structures carefully or read them back as user-facing picker rows, footer labels, or adjacent thread ids. Closed threads are not automatically removed, so users can still inspect them and navigation remains predictable. A few tests at the bottom protect the main promises: updates preserve order, navigation wraps around, shortcut text stays accurate, and labels follow the currently displayed thread.
 
 #### Function details
 
@@ -842,11 +848,11 @@ Two methods derive user-facing behavior. `adjacent_thread_id` performs wraparoun
 fn get(&self, thread_id: &ThreadId) -> Option<&AgentPickerThreadEntry>
 ```
 
-**Purpose**: Returns the latest cached picker metadata for a specific thread id, if present.
+**Purpose**: Looks up the cached display information for one thread. It is useful when another part of the app already knows the thread id and needs the latest nickname, role, path, or status for display.
 
-**Data flow**: Borrows `self` and a `ThreadId`, performs a `HashMap::get` lookup in `threads`, and returns `Option<&AgentPickerThreadEntry>` without mutation.
+**Data flow**: It receives a thread id reference, checks the internal thread map, and returns either the matching saved entry or nothing if that thread is not currently cached. It does not change any state.
 
-**Call relations**: This is a simple query helper used by app code that already knows which thread it wants to inspect and needs the current cached metadata.
+**Call relations**: No internal caller is shown in the provided call facts. It is a read-only doorway for code outside this helper to inspect one known thread without rebuilding the whole picker list.
 
 
 ##### `AgentNavigationState::is_empty`  (lines 71–73)
@@ -855,11 +861,11 @@ fn get(&self, thread_id: &ThreadId) -> Option<&AgentPickerThreadEntry>
 fn is_empty(&self) -> bool
 ```
 
-**Purpose**: Reports whether the navigation cache currently tracks any threads at all.
+**Purpose**: Answers whether the navigation cache currently knows about any agent threads. The app can use this to decide whether to show an empty-picker message instead of a list.
 
-**Data flow**: Borrows `self`, checks `self.threads.is_empty()`, and returns the resulting boolean.
+**Data flow**: It reads the internal map of thread entries and returns true if that map has no entries, otherwise false. Nothing is modified.
 
-**Call relations**: App code uses this as a cheap gate before opening or populating the agent picker.
+**Call relations**: No internal caller is shown in the provided call facts. It serves as a quick check before code tries to show or populate the agent picker.
 
 
 ##### `AgentNavigationState::upsert`  (lines 80–105)
@@ -874,11 +880,11 @@ fn upsert(
     )
 ```
 
-**Purpose**: Inserts or updates a thread's picker entry while preserving its original first-seen position in traversal order.
+**Purpose**: Adds a new thread or refreshes an existing thread’s display details while keeping the original first-seen order. This is the main gatekeeper that prevents the picker order from changing just because metadata changed.
 
-**Data flow**: Consumes a `ThreadId`, optional nickname/role, and `is_closed` flag. If the thread id is not already in `threads`, it appends it to `order`. It then reads any previous `agent_path` and `is_running`, and inserts a fresh `AgentPickerThreadEntry` that preserves the old path, keeps running true only if it was previously running and the thread is not now closed, and stores the new nickname/role/closed state.
+**Data flow**: It receives a thread id, optional nickname, optional role, and a closed/not-closed flag. If the thread is new, it appends the id to the order list. It keeps any previously known agent path and running state where appropriate, then stores a fresh picker entry in the map. The result is updated cached metadata with stable navigation order.
 
-**Call relations**: This is the primary mutation path for picker metadata and is also called by `mark_closed` when a close event arrives for an unknown thread. It enforces the module's stable-order invariant.
+**Call relations**: Most updates can use this as the normal insert-or-update path. `AgentNavigationState::mark_closed` calls it when a thread is being closed but was not already known, so even that late-discovered thread gets a proper cached entry.
 
 *Call graph*: called by 1 (mark_closed).
 
@@ -889,11 +895,11 @@ fn upsert(
 fn record_sub_agent_activity(&mut self, activity: SubAgentActivityDisplay)
 ```
 
-**Purpose**: Updates picker metadata from a `SubAgentActivityDisplay`, creating the thread entry if it has not been seen before.
+**Purpose**: Records activity reported by a sub-agent, especially its file or path information and whether it appears to be running. This lets agents discovered through activity still appear in the picker.
 
-**Data flow**: Consumes an activity record containing thread id, agent path, and running hint. It appends the thread id to `order` if absent, then gets or inserts a default `AgentPickerThreadEntry` and updates `agent_path`, `is_running`, and `is_closed` accordingly.
+**Data flow**: It receives a `SubAgentActivityDisplay`, which includes a thread id, an agent path, and a running hint. If the thread is new, its id is added to the stable order list and a default entry is created. Then the entry’s path, running flag, and closed flag are updated so the picker reflects fresh activity.
 
-**Call relations**: This method is used when the app learns about sub-agent threads from activity notifications rather than explicit picker metadata, allowing the picker to surface them promptly.
+**Call relations**: No internal caller is shown in the provided call facts. It complements `upsert`: instead of updating nickname and role, it updates activity-derived details such as path and running state.
 
 
 ##### `AgentNavigationState::set_running`  (lines 126–130)
@@ -902,11 +908,11 @@ fn record_sub_agent_activity(&mut self, activity: SubAgentActivityDisplay)
 fn set_running(&mut self, thread_id: ThreadId, is_running: bool)
 ```
 
-**Purpose**: Updates only the running-state flag for an already tracked thread.
+**Purpose**: Changes the running/not-running status for a known thread. This gives the user interface a way to reflect that an agent has started or stopped without altering its name or position.
 
-**Data flow**: Looks up the mutable entry for `thread_id` in `threads` and, if found, assigns `entry.is_running = is_running`. Missing threads are ignored.
+**Data flow**: It receives a thread id and a boolean running flag. If that thread exists in the map, it updates only the `is_running` field. If the thread is unknown, it leaves the state unchanged.
 
-**Call relations**: This targeted mutator is used by app lifecycle code when execution state changes but other picker metadata should remain untouched.
+**Call relations**: No internal caller is shown in the provided call facts. It is a small targeted update used when only the activity status changes and the rest of the picker entry should stay as it is.
 
 
 ##### `AgentNavigationState::set_agent_path`  (lines 132–138)
@@ -915,11 +921,11 @@ fn set_running(&mut self, thread_id: ThreadId, is_running: bool)
 fn set_agent_path(&mut self, thread_id: ThreadId, agent_path: Option<String>)
 ```
 
-**Purpose**: Stores a non-empty agent path for an already tracked thread when one becomes known later.
+**Purpose**: Stores a path-like label for a known agent thread when a non-empty path is available. This path can later be used as a clearer label for sub-agents.
 
-**Data flow**: Accepts a `ThreadId` and `Option<String>`. If the option is `Some(agent_path)` and the thread exists in `threads`, it writes that path into `entry.agent_path`; `None` inputs and unknown threads are ignored.
+**Data flow**: It receives a thread id and an optional path string. If the path exists and the thread is already cached, it saves that path in the entry. If there is no path or no matching thread, nothing changes.
 
-**Call relations**: This helper lets app code enrich existing picker entries with path information discovered after initial insertion.
+**Call relations**: No internal caller is shown in the provided call facts. It feeds later display functions, especially labels and filtered lists that care whether a sub-agent has a usable path.
 
 
 ##### `AgentNavigationState::mark_closed`  (lines 146–156)
@@ -928,11 +934,11 @@ fn set_agent_path(&mut self, thread_id: ThreadId, agent_path: Option<String>)
 fn mark_closed(&mut self, thread_id: ThreadId)
 ```
 
-**Purpose**: Marks a thread as closed while keeping it in the stable traversal cache.
+**Purpose**: Marks a thread as closed while keeping it in the picker and navigation order. This preserves the user’s ability to review old agent threads and keeps keyboard cycling stable.
 
-**Data flow**: If the thread exists, it sets `is_closed = true` and `is_running = false`. If it does not exist, it calls `upsert` with no nickname/role and `is_closed = true`, thereby creating a placeholder entry and preserving order semantics.
+**Data flow**: It receives a thread id. If the thread already exists, it sets `is_closed` to true and `is_running` to false. If the thread is not known yet, it creates a closed entry with no nickname or role by calling `AgentNavigationState::upsert`.
 
-**Call relations**: This method is used when threads terminate but should remain inspectable in the picker. It delegates to `upsert` only for the unknown-thread edge case.
+**Call relations**: This function calls `AgentNavigationState::upsert` only for the fallback case where a closing thread was not already cached. It is the safe closing path because it does not remove the thread from the stable order list.
 
 *Call graph*: calls 1 internal fn (upsert).
 
@@ -943,11 +949,11 @@ fn mark_closed(&mut self, thread_id: ThreadId)
 fn clear(&mut self)
 ```
 
-**Purpose**: Resets all cached picker metadata and traversal order.
+**Purpose**: Resets all cached navigation state. This is used when the app needs to return the multi-agent picker to a fresh, empty session state.
 
-**Data flow**: Mutably clears both `threads` and `order`, leaving the state empty.
+**Data flow**: It takes the current map of thread entries and the order list, then empties both. Afterward there are no remembered threads, labels, statuses, or navigation positions.
 
-**Call relations**: App teardown or session-reset code uses this to discard all multi-agent navigation state at once.
+**Call relations**: No internal caller is shown in the provided call facts. It is the teardown-style counterpart to the update functions: instead of preserving order, it deliberately forgets everything.
 
 
 ##### `AgentNavigationState::remove`  (lines 172–175)
@@ -956,11 +962,11 @@ fn clear(&mut self)
 fn remove(&mut self, thread_id: ThreadId)
 ```
 
-**Purpose**: Completely removes a thread from both metadata and traversal order.
+**Purpose**: Completely removes one thread from both display metadata and navigation order. Unlike closing, this is for entries that should no longer appear at all, such as ghost rows discovered opportunistically.
 
-**Data flow**: Deletes the thread id from `threads` and filters `order` to retain only ids not equal to the removed thread.
+**Data flow**: It receives a thread id, deletes that id from the thread map, and filters it out of the order list. The result is that future picker rows and navigation skips no longer include that thread.
 
-**Call relations**: This stronger deletion path is reserved for ghost or opportunistically discovered threads that should not remain visible once confirmed gone.
+**Call relations**: No internal caller is shown in the provided call facts. It is intentionally separate from `mark_closed`, because removing a thread changes the shape of navigation while closing keeps it visible.
 
 
 ##### `AgentNavigationState::has_non_primary_thread`  (lines 182–186)
@@ -969,11 +975,11 @@ fn remove(&mut self, thread_id: ThreadId)
 fn has_non_primary_thread(&self, primary_thread_id: Option<ThreadId>) -> bool
 ```
 
-**Purpose**: Reports whether any tracked thread differs from the current primary thread.
+**Purpose**: Checks whether there is at least one tracked thread besides the main thread. This helps the app decide whether existing sub-agent conversations should remain accessible.
 
-**Data flow**: Iterates over `threads.keys()` and returns true if any key is not equal to `primary_thread_id`.
+**Data flow**: It receives the optional primary thread id, scans the cached thread ids, and returns true if any cached id is different from the primary one. It does not inspect or change the thread entries themselves.
 
-**Call relations**: The app uses this to decide whether multi-agent UI affordances should remain available even when collaboration features are otherwise disabled.
+**Call relations**: No internal caller is shown in the provided call facts. It supports higher-level UI decisions about whether multi-agent navigation is meaningful even when only some features are enabled.
 
 
 ##### `AgentNavigationState::ordered_threads`  (lines 193–198)
@@ -982,11 +988,11 @@ fn has_non_primary_thread(&self, primary_thread_id: Option<ThreadId>) -> bool
 fn ordered_threads(&self) -> Vec<(ThreadId, &AgentPickerThreadEntry)>
 ```
 
-**Purpose**: Returns tracked threads in stable first-seen order, filtering out any ids whose metadata is currently missing.
+**Purpose**: Builds the picker-ready list of known threads in the same stable order used for keyboard cycling. It is the central read path for anything that needs ordered thread entries.
 
-**Data flow**: Iterates over `order`, looks up each id in `threads`, and collects only successful lookups into `Vec<(ThreadId, &AgentPickerThreadEntry)>`.
+**Data flow**: It walks the saved first-seen order list and, for each id, looks up the current metadata in the map. If an id is in the order list but missing from the map, it is skipped. The output is a vector of thread id plus entry references in display order.
 
-**Call relations**: This is the canonical ordered view used by traversal and picker-building methods such as `adjacent_thread_id`, `tracked_thread_ids`, and `ordered_path_backed_subagent_threads`.
+**Call relations**: `AgentNavigationState::adjacent_thread_id`, `AgentNavigationState::ordered_path_backed_subagent_threads`, `AgentNavigationState::tracked_thread_ids`, and the test-only `AgentNavigationState::ordered_thread_ids` all call this function. It acts like the common sorting counter: callers ask for ordered data here instead of each re-creating the ordering rule.
 
 *Call graph*: called by 4 (adjacent_thread_id, ordered_path_backed_subagent_threads, ordered_thread_ids, tracked_thread_ids).
 
@@ -1000,11 +1006,11 @@ fn ordered_path_backed_subagent_threads(
     ) -> Vec<(ThreadId, &AgentPickerThreadEntry)>
 ```
 
-**Purpose**: Returns only non-primary tracked threads that have a nonblank `agent_path`, preserving stable order.
+**Purpose**: Returns only non-primary sub-agent threads that have a meaningful path saved. This is useful when the app needs threads that can be tied back to a concrete agent path.
 
-**Data flow**: Calls `ordered_threads()`, then filters out the primary thread and any entries whose `agent_path` is absent or trims to empty. It returns the remaining ordered `(ThreadId, &AgentPickerThreadEntry)` pairs.
+**Data flow**: It receives the optional primary thread id, asks `AgentNavigationState::ordered_threads` for the stable ordered list, then filters out the primary thread and any entry with no path or a blank path. The result keeps the original order but contains only path-backed sub-agents.
 
-**Call relations**: This helper is used when the app needs a subset of sub-agents suitable for path-based displays or actions while preserving picker order.
+**Call relations**: It depends on `AgentNavigationState::ordered_threads` for the canonical order, then narrows the list for a more specific use. No internal caller is shown in the provided call facts.
 
 *Call graph*: calls 1 internal fn (ordered_threads).
 
@@ -1015,11 +1021,11 @@ fn ordered_path_backed_subagent_threads(
 fn tracked_thread_ids(&self) -> Vec<ThreadId>
 ```
 
-**Purpose**: Returns just the tracked thread ids in stable picker order.
+**Purpose**: Returns just the ids of tracked threads in picker order. This is useful when code needs the identity list but not the full display metadata.
 
-**Data flow**: Calls `ordered_threads()`, maps each pair to its `ThreadId`, and collects the ids into a vector.
+**Data flow**: It calls `AgentNavigationState::ordered_threads`, discards each entry’s metadata, and keeps only the thread ids. The output is a vector of ids in stable first-seen order.
 
-**Call relations**: This is a convenience projection over `ordered_threads` for callers that need ordering but not the associated metadata.
+**Call relations**: It relies on `AgentNavigationState::ordered_threads` so it inherits the same filtering and ordering behavior. No internal caller is shown in the provided call facts.
 
 *Call graph*: calls 1 internal fn (ordered_threads).
 
@@ -1034,11 +1040,11 @@ fn adjacent_thread_id(
     ) -> Option<ThreadId>
 ```
 
-**Purpose**: Computes the next or previous thread id relative to the currently displayed thread, wrapping around in stable spawn order.
+**Purpose**: Finds the next or previous thread to show when the user presses an agent navigation shortcut. It wraps around at the ends, like moving around a circular list.
 
-**Data flow**: Builds `ordered_threads()`, returns `None` if fewer than two threads are tracked or if `current_displayed_thread_id` is absent/unknown, finds the current index, computes the adjacent index according to `AgentNavigationDirection` with wraparound, and returns the corresponding thread id.
+**Data flow**: It receives the currently displayed thread id and a direction. It builds the ordered thread list, refuses to navigate if there are fewer than two threads, finds the current thread’s position, moves one slot forward or backward with wraparound, and returns the neighboring thread id. If the current thread is missing or unknown, it returns nothing.
 
-**Call relations**: This method powers keyboard next/previous agent navigation. It depends on `ordered_threads` so traversal follows first-seen order rather than map iteration or thread-id sort order.
+**Call relations**: It calls `AgentNavigationState::ordered_threads` to use the same order as the picker. The test `tests::adjacent_thread_id_wraps_in_spawn_order` exercises this behavior, checking both forward and backward wraparound.
 
 *Call graph*: calls 1 internal fn (ordered_threads).
 
@@ -1053,11 +1059,11 @@ fn active_agent_label(
     ) -> Option<String>
 ```
 
-**Purpose**: Derives the footer label for the currently displayed thread, suppressing the label entirely in single-thread sessions.
+**Purpose**: Creates the short footer label for the thread currently being watched. It avoids showing a label when there is only one thread, because that would waste space saying something obvious.
 
-**Data flow**: Returns `None` if `threads.len() <= 1` or if no current displayed thread id is provided. Otherwise it determines whether the thread is primary, looks up the entry, and returns either a backticked nonblank `agent_path` for sub-agents or the result of `format_agent_picker_item_name` using nickname/role and primary status. If metadata is missing, it falls back to generic naming rules.
+**Data flow**: It receives the currently displayed thread id and optional primary thread id. If there is only one cached thread or no current thread, it returns nothing. Otherwise it decides whether the thread is primary, prefers a non-blank agent path for non-primary agents, and falls back to the shared picker naming rules using nickname, role, and primary status.
 
-**Call relations**: The app uses this to populate contextual footer text while watching different threads. It intentionally shares naming logic with picker rows via `format_agent_picker_item_name`.
+**Call relations**: No internal caller is shown in the provided call facts. The test `tests::active_agent_label_tracks_current_thread` checks that the label follows the displayed thread and formats both sub-agent and main-thread labels correctly.
 
 
 ##### `AgentNavigationState::picker_subtitle`  (lines 304–311)
@@ -1066,11 +1072,11 @@ fn active_agent_label(
 fn picker_subtitle() -> String
 ```
 
-**Purpose**: Builds the `/agent` picker subtitle text from the actual previous/next shortcut definitions.
+**Purpose**: Builds the help text shown under the `/agent` picker title, including the real keyboard shortcuts for previous and next. This keeps the on-screen instructions matched to the actual key bindings.
 
-**Data flow**: Calls `previous_agent_shortcut()` and `next_agent_shortcut()`, converts them into `Span`s, reads their textual `content`, and interpolates both into a fixed instructional sentence.
+**Data flow**: It asks `previous_agent_shortcut` and `next_agent_shortcut` for the current shortcut labels, converts them into text spans, and formats a sentence such as selecting an agent and using previous/next. It returns that sentence as a string.
 
-**Call relations**: This helper is called by picker-opening code and by a unit test. By deriving text from the shortcut helpers, it prevents the picker subtitle from drifting away from real key bindings.
+**Call relations**: It calls `previous_agent_shortcut`, `next_agent_shortcut`, and formatting. It is called by `open_agent_picker` in the app flow and by the test `tests::picker_subtitle_mentions_shortcuts`, which verifies that the subtitle contains both shortcut labels.
 
 *Call graph*: calls 2 internal fn (next_agent_shortcut, previous_agent_shortcut); called by 2 (picker_subtitle_mentions_shortcuts, open_agent_picker); 1 external calls (format!).
 
@@ -1081,11 +1087,11 @@ fn picker_subtitle() -> String
 fn ordered_thread_ids(&self) -> Vec<ThreadId>
 ```
 
-**Purpose**: Test-only helper that returns ordered thread ids without exposing full picker entries.
+**Purpose**: Provides a test-only shortcut for reading the ordered thread ids without full entry details. It exists to make ordering tests simple and focused.
 
-**Data flow**: Calls `ordered_threads()`, maps each pair to its `ThreadId`, and collects the ids into a vector.
+**Data flow**: It calls `AgentNavigationState::ordered_threads`, drops the metadata, and returns only the thread ids. It does not change the state.
 
-**Call relations**: This helper exists solely for focused tests of ordering invariants and delegates entirely to the production ordering logic.
+**Call relations**: It calls `AgentNavigationState::ordered_threads`, so tests check the same ordering path used by real navigation. It is used by `tests::upsert_preserves_first_seen_order` to confirm that updates do not reshuffle entries.
 
 *Call graph*: calls 1 internal fn (ordered_threads).
 
@@ -1096,11 +1102,11 @@ fn ordered_thread_ids(&self) -> Vec<ThreadId>
 fn populated_state() -> (AgentNavigationState, ThreadId, ThreadId, ThreadId)
 ```
 
-**Purpose**: Creates a representative navigation state with one primary thread and two sub-agent threads for reuse across tests.
+**Purpose**: Creates a small sample navigation state for tests: one main thread and two agent threads. This avoids repeating setup code in each test.
 
-**Data flow**: Constructs a default `AgentNavigationState`, parses three fixed UUID strings into `ThreadId`s, inserts them with `upsert`, and returns the populated state plus the three ids.
+**Data flow**: It starts from a default empty `AgentNavigationState`, creates three fixed thread ids using `from_string`, inserts them with names and roles through `upsert`, and returns the populated state plus the three ids. The output gives tests a predictable mini-world to inspect.
 
-**Call relations**: This fixture helper is called by multiple tests so they all exercise the same baseline ordering and metadata setup.
+**Call relations**: It calls `from_string` and default construction. The tests `tests::upsert_preserves_first_seen_order`, `tests::adjacent_thread_id_wraps_in_spawn_order`, and `tests::active_agent_label_tracks_current_thread` call it when they need consistent starting data.
 
 *Call graph*: calls 1 internal fn (from_string); 1 external calls (default).
 
@@ -1111,11 +1117,11 @@ fn populated_state() -> (AgentNavigationState, ThreadId, ThreadId, ThreadId)
 fn upsert_preserves_first_seen_order()
 ```
 
-**Purpose**: Verifies that updating an existing thread via `upsert` does not move it in traversal order.
+**Purpose**: Checks that updating an existing thread does not move it in the navigation order. This protects the core promise that picker order follows first discovery, not the latest update.
 
-**Data flow**: Obtains a populated state, calls `upsert` again on the first agent with changed metadata and closed status, then asserts that `ordered_thread_ids()` still returns the original insertion order.
+**Data flow**: It gets a prefilled state from `tests::populated_state`, updates the first agent with changed role and closed status, then reads the ordered ids and compares them with the original expected order. The state is allowed to change metadata, but the id order must stay the same.
 
-**Call relations**: This test directly guards the module's core invariant that updates must not reshuffle stable picker order.
+**Call relations**: It calls `tests::populated_state` and uses an assertion macro. It indirectly validates `AgentNavigationState::upsert` and the test-only `AgentNavigationState::ordered_thread_ids` path.
 
 *Call graph*: 2 external calls (assert_eq!, populated_state).
 
@@ -1126,11 +1132,11 @@ fn upsert_preserves_first_seen_order()
 fn adjacent_thread_id_wraps_in_spawn_order()
 ```
 
-**Purpose**: Checks that next/previous navigation wraps correctly at both ends of the stable order.
+**Purpose**: Checks that next and previous navigation move through threads in spawn order and wrap around at the ends. This guards the carousel-like behavior users expect from keyboard shortcuts.
 
-**Data flow**: Builds the populated state and asserts expected outputs from `adjacent_thread_id` for several current-thread/direction combinations, including wraparound from the last thread to the first and from the first to the last.
+**Data flow**: It builds a sample state, asks for the next thread after the last agent, the previous thread before that same agent, and the previous thread before the main thread. Each returned id is compared with the expected neighbor.
 
-**Call relations**: This test validates the traversal logic used by keyboard agent navigation.
+**Call relations**: It calls `tests::populated_state` and assertion macros. It directly exercises `AgentNavigationState::adjacent_thread_id`, which itself uses `AgentNavigationState::ordered_threads`.
 
 *Call graph*: 2 external calls (assert_eq!, populated_state).
 
@@ -1141,11 +1147,11 @@ fn adjacent_thread_id_wraps_in_spawn_order()
 fn picker_subtitle_mentions_shortcuts()
 ```
 
-**Purpose**: Ensures the picker subtitle string includes the actual previous and next shortcut text.
+**Purpose**: Checks that the picker subtitle includes the actual previous and next shortcut text. This helps prevent the help text from drifting away from the real key bindings.
 
-**Data flow**: Builds the expected shortcut spans from `previous_agent_shortcut` and `next_agent_shortcut`, calls `AgentNavigationState::picker_subtitle()`, and asserts the resulting string contains both shortcut contents.
+**Data flow**: It asks the shortcut helpers for the current previous and next labels, builds the subtitle with `AgentNavigationState::picker_subtitle`, and asserts that both labels appear in the returned string.
 
-**Call relations**: This test protects the coupling between picker instructional text and the canonical shortcut helpers.
+**Call relations**: It calls `AgentNavigationState::picker_subtitle`, `previous_agent_shortcut`, `next_agent_shortcut`, and assertion macros. It verifies the same subtitle function that `open_agent_picker` uses in the app.
 
 *Call graph*: calls 3 internal fn (picker_subtitle, next_agent_shortcut, previous_agent_shortcut); 1 external calls (assert!).
 
@@ -1156,20 +1162,24 @@ fn picker_subtitle_mentions_shortcuts()
 fn active_agent_label_tracks_current_thread()
 ```
 
-**Purpose**: Verifies that the active-agent footer label reflects the currently displayed thread and distinguishes primary from sub-agent naming.
+**Purpose**: Checks that the footer label is based on the thread currently displayed, not merely on some other active bookkeeping. This protects users from seeing the wrong agent name in the footer.
 
-**Data flow**: Uses the populated state, calls `active_agent_label` for a sub-agent and for the primary thread, and asserts the returned strings match the expected formatted labels.
+**Data flow**: It creates a sample state, asks for the label of a named sub-agent while the main thread is primary, and then asks for the label of the main thread. It compares both results with the expected display strings.
 
-**Call relations**: This test covers the user-facing label derivation logic that the app uses in the footer while switching watched threads.
+**Call relations**: It calls `tests::populated_state` and assertion macros. It directly validates `AgentNavigationState::active_agent_label` for both sub-agent and primary-thread cases.
 
 *Call graph*: 2 external calls (assert_eq!, populated_state).
 
 
 ### `tui/src/app_backtrack.rs`
 
-`domain_logic` · `interactive transcript navigation and rollback handling`
+`orchestration` · `main loop and request handling`
 
-This module is a small state machine layered onto `App`. `BacktrackState` tracks whether Esc has primed backtrack mode, which thread the selection is anchored to, the selected user-message index since the last session start, whether the transcript overlay is in preview mode, and any `PendingBacktrackRollback` awaiting server confirmation. The main interaction paths are split between the normal view and the transcript overlay: Esc in the main view primes backtrack, opens the overlay, or steps backward through user messages; overlay key handling maps Esc/Left/Right/Enter to stepping or confirming while forwarding all other events to the overlay widget. Confirmation computes a `BacktrackSelection` from the chosen `UserHistoryCell`, immediately prefills the composer and image state, and submits `AppCommand::thread_rollback(num_turns)` while recording a pending rollback guard tied to the current thread id. Actual transcript mutation is deferred until rollback success, at which point either `finish_pending_backtrack` trims to the selected user boundary or `apply_non_pending_thread_rollback` drops the last N user turns for externally initiated rollbacks. Helper functions define rollback semantics over `transcript_cells`: user positions are counted only after the most recent `SessionInfoCell`, and trimming removes the selected user cell and everything newer. The overlay path has special draw handling: on `Draw`/`Resize`, it asks `ChatWidget` for an active-cell cache key and render lines, appends that as a live tail to `TranscriptOverlay`, and schedules animation frames when needed so Ctrl+T reflects streaming output without waiting for transcript flushes.
+This file exists so the chat interface can safely rewind a conversation without the screen and the real agent state drifting apart. The user-facing idea is simple: press Esc to arm backtracking, open the transcript, choose an earlier user message, and press Enter to edit from there. Behind the scenes, this is treated carefully. The app first records which thread is being edited, then sends a rollback request to the core system. It only cuts local transcript history after the core confirms the rollback worked. That is like waiting for the librarian to confirm a page was removed before updating your table of contents.
+
+The file also owns how the transcript overlay behaves while backtracking. It highlights the selected user message, moves the highlight backward or forward, closes the overlay when needed, and restores the prompt text, text elements, and attached images into the composer. It blocks side conversations from editing earlier prompts, because rolling back the main thread from a side thread would be unsafe.
+
+A second important job is rendering. The transcript overlay normally shows committed transcript cells, but the current assistant/tool output may still be “live” and not yet stored as history. During draw events, this file asks the chat widget for that live tail and temporarily appends it for display, so the overlay does not look stale while work is still streaming.
 
 #### Function details
 
@@ -1183,11 +1193,11 @@ async fn handle_backtrack_overlay_event(
     ) -> Result<bool>
 ```
 
-**Purpose**: Routes keyboard and draw events while the transcript overlay is open, with special behavior when backtrack preview mode is active. It turns overlay navigation keys into backtrack selection changes or confirmation.
+**Purpose**: Routes keyboard and draw events while the transcript overlay is open. If backtrack preview mode is active, it turns Esc, Left, Right, and Enter into selection or confirmation actions; otherwise it lets the overlay behave normally, except Esc starts preview mode.
 
-**Data flow**: It takes a mutable `App`, mutable `tui::Tui`, and a `TuiEvent`. If `self.backtrack.overlay_preview_active` is true, Esc/Left call `overlay_step_backtrack`, Right calls `overlay_step_backtrack_forward`, Enter calls `overlay_confirm_backtrack`, and all other events are forwarded to `overlay_forward_event`; each handled branch returns `Ok(true)`. If preview is inactive, a pressed/repeated Esc starts preview via `begin_overlay_backtrack_preview`, otherwise the event is forwarded to the overlay. State changes occur through those delegated helpers.
+**Data flow**: It receives the terminal object and one UI event. It checks whether backtrack preview is active, interprets special keys, and either updates the selected message, confirms the rollback choice, starts preview mode, or forwards the event to the overlay. It returns whether the event was consumed, wrapped in a result in case overlay drawing or event handling fails.
 
-**Call relations**: Called by the app's event loop whenever the transcript overlay is active. It is the top-level dispatcher for overlay-specific backtrack behavior.
+**Call relations**: This is the overlay-side dispatcher. It calls the preview starter, step functions, confirmation function, or normal overlay forwarding function depending on what the user pressed.
 
 *Call graph*: calls 5 internal fn (begin_overlay_backtrack_preview, overlay_confirm_backtrack, overlay_forward_event, overlay_step_backtrack, overlay_step_backtrack_forward).
 
@@ -1198,11 +1208,11 @@ async fn handle_backtrack_overlay_event(
 fn handle_backtrack_esc_key(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Handles Esc presses in the main chat view when no overlay event routing is active. It primes backtrack, opens the preview overlay, or steps the current selection depending on state.
+**Purpose**: Handles Esc presses from the main chat view when no overlay action has already taken over. It primes backtracking on the first Esc and opens or advances the backtrack preview on later Esc presses.
 
-**Data flow**: It first returns if the composer is not empty. If `self.backtrack.primed` is false it calls `prime_backtrack()`. Else if no overlay is open it calls `open_backtrack_preview(tui)`. Else if overlay preview is active it calls `step_backtrack_and_highlight(tui)`. It mutates only backtrack/overlay state through those helpers.
+**Data flow**: It reads whether the composer is empty, whether backtracking is already primed, whether an overlay is open, and whether preview mode is active. If the composer has text, it does nothing. Otherwise it updates backtrack state or opens/steps the transcript preview.
 
-**Call relations**: Used by the main key-handling path for Esc in normal chat mode.
+**Call relations**: This is the main-view entry point for the backtrack key flow. It calls `prime_backtrack`, `open_backtrack_preview`, or `step_backtrack_and_highlight` as the user repeats Esc.
 
 *Call graph*: calls 3 internal fn (open_backtrack_preview, prime_backtrack, step_backtrack_and_highlight).
 
@@ -1213,11 +1223,11 @@ fn handle_backtrack_esc_key(&mut self, tui: &mut tui::Tui)
 fn apply_backtrack_rollback(&mut self, selection: BacktrackSelection)
 ```
 
-**Purpose**: Stages a rollback request from a chosen backtrack selection, prefills the composer with the selected prompt, and submits the rollback command. It refuses side conversations and duplicate in-flight rollbacks.
+**Purpose**: Turns a chosen earlier user message into a rollback request sent to the core conversation engine. It also pre-fills the composer right away so the user can edit the old prompt while waiting for confirmation.
 
-**Data flow**: It takes a `BacktrackSelection`. If `chat_widget.side_conversation_active()` is true, it resets backtrack state and emits `SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE`. It counts user turns with `user_count(&self.transcript_cells)` and returns if there are none. If `pending_rollback` already exists it emits an error and returns. It computes `num_turns = user_total.saturating_sub(selection.nth_user_message)`, converts to `u32` with saturation to `u32::MAX`, and returns if zero. It clones prefill/text/image data, stores `PendingBacktrackRollback { selection, thread_id: self.chat_widget.thread_id() }`, submits `AppCommand::thread_rollback(num_turns)` through the chat widget, sets remote image URLs, and if any prompt content exists sets the composer text and attachments.
+**Data flow**: It receives a `BacktrackSelection` containing the chosen message and attachments. It checks for side conversations, counts user turns, refuses duplicate rollback requests, calculates how many turns must be removed, records a pending rollback guard, sends the rollback command, and restores the selected prompt content into the composer. It changes app state and does not return a value.
 
-**Call relations**: Called from overlay confirmation, explicit backtrack selection application, and cancelled-turn edit handling. It initiates rollback but leaves transcript trimming to later success handlers.
+**Call relations**: This is called after a selection is confirmed from the overlay, from a direct selection helper, or when a cancelled edit needs rollback behavior. It uses `user_count` to compute rollback depth and calls `reset_backtrack_state` when side conversations make rollback unavailable.
 
 *Call graph*: calls 2 internal fn (reset_backtrack_state, user_count); called by 3 (apply_backtrack_selection, apply_cancelled_turn_edit, overlay_confirm_backtrack); 2 external calls (thread_rollback, try_from).
 
@@ -1228,11 +1238,11 @@ fn apply_backtrack_rollback(&mut self, selection: BacktrackSelection)
 fn apply_cancelled_turn_edit(&mut self, prompt: UserMessage)
 ```
 
-**Purpose**: Converts a cancelled user turn into a rollback/edit flow that restores the cancelled prompt into the composer. It handles the special case where there is no committed user history yet.
+**Purpose**: Restores a cancelled user turn into the composer and asks the core to roll back the matching turn. This covers the special case where the edit was cancelled but the user’s prompt should be recovered.
 
-**Data flow**: It derives `user_total` from `user_count`, builds a `BacktrackSelection` from the supplied `UserMessage` by copying text, text elements, local image paths, and remote image URLs, and then branches. If `user_total == 0`, it either emits an in-progress rollback error if `pending_rollback` exists or stores a one-turn `PendingBacktrackRollback`, submits `AppCommand::thread_rollback(1)`, and restores the prompt to the composer. Otherwise it delegates to `apply_backtrack_rollback(selection)` and then restores the prompt to the composer.
+**Data flow**: It receives a `UserMessage` with text and image information. It builds a `BacktrackSelection` for the latest user message, counts existing user turns, and either sends a one-turn rollback directly for an empty transcript or delegates to the normal rollback path. It then restores the original user message to the composer.
 
-**Call relations**: Used when a turn is cancelled and the UI wants to reopen the user's prompt for editing while keeping rollback semantics consistent.
+**Call relations**: This function feeds into `apply_backtrack_rollback` for the usual case. When there are no counted user turns, it sends the rollback command itself and records the same pending rollback guard.
 
 *Call graph*: calls 2 internal fn (apply_backtrack_rollback, user_count); 1 external calls (thread_rollback).
 
@@ -1243,11 +1253,11 @@ fn apply_cancelled_turn_edit(&mut self, prompt: UserMessage)
 fn open_transcript_overlay(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Enters alternate-screen transcript overlay mode and seeds the overlay with the current committed transcript cells. It is the generic overlay-opening helper used by backtrack preview.
+**Purpose**: Opens the full transcript overlay so the user can browse history or choose a backtrack target. It switches the terminal into an alternate screen so the overlay can take over the display.
 
-**Data flow**: It calls `tui.enter_alt_screen()`, sets `self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone(), self.keymap.pager.clone()))`, and schedules a frame through `tui.frame_requester().schedule_frame()`. It ignores alt-screen entry errors.
+**Data flow**: It receives the terminal object, enters alternate-screen mode, creates a transcript overlay from the current transcript cells and pager keymap, stores it on the app, and requests a redraw.
 
-**Call relations**: Called by `open_backtrack_preview` when Esc transitions from primed mode into transcript preview.
+**Call relations**: This is called by `open_backtrack_preview` when the main-view Esc flow needs to show the transcript and begin highlighting messages.
 
 *Call graph*: calls 1 internal fn (new_transcript); called by 1 (open_backtrack_preview); 2 external calls (enter_alt_screen, frame_requester).
 
@@ -1258,11 +1268,11 @@ fn open_transcript_overlay(&mut self, tui: &mut tui::Tui)
 fn close_transcript_overlay(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Closes the transcript overlay, restores normal screen mode, flushes any deferred history lines, and resets backtrack preview state. If the overlay had been used for backtracking, it fully resets backtrack state as well.
+**Purpose**: Closes the transcript overlay and restores the normal chat screen. If the overlay was used for backtracking, it also clears the backtrack state so stale selections do not linger.
 
-**Data flow**: It leaves alt-screen via `tui.leave_alt_screen()`, remembers whether backtrack preview was active, flushes `self.deferred_history_lines` into the terminal with the current wrap policy if non-empty, sets `self.overlay = None`, clears `self.backtrack.overlay_preview_active`, schedules a frame, and if `was_backtrack` calls `reset_backtrack_state()`.
+**Data flow**: It receives the terminal object, leaves alternate-screen mode, flushes any deferred history lines back into the normal history area, clears the overlay, turns off preview mode, schedules a redraw, and optionally resets backtrack state.
 
-**Call relations**: Called when the overlay is dismissed normally, when preview cannot start due to no user messages, and after confirming a backtrack selection.
+**Call relations**: This is used by preview startup when there is no valid target, by confirmation after Enter, and by overlay forwarding when the overlay reports it is done.
 
 *Call graph*: calls 1 internal fn (reset_backtrack_state); called by 3 (begin_overlay_backtrack_preview, overlay_confirm_backtrack, overlay_forward_event); 4 external calls (frame_requester, insert_history_hyperlink_lines_with_wrap_policy, leave_alt_screen, take).
 
@@ -1273,11 +1283,11 @@ fn close_transcript_overlay(&mut self, tui: &mut tui::Tui)
 fn prime_backtrack(&mut self)
 ```
 
-**Purpose**: Arms backtrack mode from the main view and captures the current thread as the rollback base. It also shows the Esc hint when there is at least one eligible user message.
+**Purpose**: Starts the first stage of backtracking from the main view. It records the current thread as the only valid rollback target and shows a hint if there is a previous user message to edit.
 
-**Data flow**: It sets `self.backtrack.primed = true`, `nth_user_message = usize::MAX`, and `base_id = self.chat_widget.thread_id()`. If `has_backtrack_target(&self.transcript_cells)` is true, it calls `chat_widget.show_esc_backtrack_hint()`.
+**Data flow**: It reads the current thread id and transcript cells. It marks backtracking as primed, clears the current selection to “none,” stores the base thread id, and may ask the chat widget to show an Esc-backtrack hint.
 
-**Call relations**: Called by `handle_backtrack_esc_key` on the first Esc press in the main view.
+**Call relations**: This is called by `handle_backtrack_esc_key` on the first Esc press. It uses `has_backtrack_target` to decide whether a useful hint should appear.
 
 *Call graph*: calls 1 internal fn (has_backtrack_target); called by 1 (handle_backtrack_esc_key).
 
@@ -1288,11 +1298,11 @@ fn prime_backtrack(&mut self)
 fn open_backtrack_preview(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Opens the transcript overlay and immediately begins backtrack preview mode. If there is no previous user message to edit, it resets state and shows an informational message instead.
+**Purpose**: Opens the transcript overlay directly into backtrack preview mode. If there is no previous user message, it tells the user that editing is unavailable instead of opening an empty preview.
 
-**Data flow**: It checks `has_backtrack_target(&self.transcript_cells)`. If false, it resets backtrack state, adds `NO_PREVIOUS_MESSAGE_TO_EDIT` as an info message, schedules a frame, and returns. Otherwise it opens the transcript overlay, sets `overlay_preview_active = true`, clears the composer Esc hint, and calls `step_backtrack_and_highlight(tui)`.
+**Data flow**: It checks the transcript for at least one user message. If none exists, it resets backtrack state, shows an informational message, and redraws. If a target exists, it opens the transcript overlay, marks preview mode active, clears the composer hint, selects the latest user message, and requests a redraw.
 
-**Call relations**: Called from `handle_backtrack_esc_key` when backtrack is already primed and no overlay is open.
+**Call relations**: This is called from the main Esc handler after backtracking has already been primed. It relies on `open_transcript_overlay`, `step_backtrack_and_highlight`, `reset_backtrack_state`, and `has_backtrack_target`.
 
 *Call graph*: calls 4 internal fn (open_transcript_overlay, reset_backtrack_state, step_backtrack_and_highlight, has_backtrack_target); called by 1 (handle_backtrack_esc_key); 1 external calls (frame_requester).
 
@@ -1303,11 +1313,11 @@ fn open_backtrack_preview(&mut self, tui: &mut tui::Tui)
 fn begin_overlay_backtrack_preview(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Starts backtrack preview from within an already open transcript overlay. It selects the latest user message as the initial target.
+**Purpose**: Starts backtrack preview while the transcript overlay is already open. This lets a user press Esc inside the transcript overlay to begin selecting an earlier prompt.
 
-**Data flow**: If `has_backtrack_target` is false, it closes the overlay, emits `NO_PREVIOUS_MESSAGE_TO_EDIT`, schedules a frame, and returns. Otherwise it sets `backtrack.primed = true`, captures `base_id` from the current thread, sets `overlay_preview_active = true`, computes the user count, and if there is at least one user message applies the last index via `apply_backtrack_selection_internal(last)`. It then schedules a frame.
+**Data flow**: It checks whether the transcript has a user message. If not, it closes the overlay and shows a no-target message. If yes, it primes backtracking for the current thread, turns on overlay preview mode, selects the latest user message, and schedules a redraw.
 
-**Call relations**: Called by `handle_backtrack_overlay_event` when Esc is pressed in the overlay before preview mode has started.
+**Call relations**: This is called by `handle_backtrack_overlay_event` when Esc is pressed in the overlay before preview mode is active. It uses `user_count` and `apply_backtrack_selection_internal` to highlight the newest selectable prompt.
 
 *Call graph*: calls 4 internal fn (apply_backtrack_selection_internal, close_transcript_overlay, has_backtrack_target, user_count); called by 1 (handle_backtrack_overlay_event); 1 external calls (frame_requester).
 
@@ -1318,11 +1328,11 @@ fn begin_overlay_backtrack_preview(&mut self, tui: &mut tui::Tui)
 fn step_backtrack_and_highlight(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Moves the backtrack selection to the next older user message and updates the overlay highlight. Repeated Esc/Left presses walk backward through user prompts.
+**Purpose**: Moves the backtrack selection to the next older user message and updates the overlay highlight. Repeated Esc or Left presses use this to walk backward through prompts.
 
-**Data flow**: It computes `count = user_count(&self.transcript_cells)` and returns if zero. It derives `last_index = count - 1` and then chooses `next_selection`: latest user if no selection exists yet, zero if already at the oldest, otherwise `nth_user_message - 1` clamped to `last_index`. It applies that selection with `apply_backtrack_selection_internal` and schedules a frame.
+**Data flow**: It counts user messages in the transcript. If there are none, it does nothing. Otherwise it computes the previous selectable index, stores it through the internal selection helper, and asks for a redraw.
 
-**Call relations**: Called from main-view Esc handling, initial preview opening, and overlay backtrack stepping.
+**Call relations**: This is called from the main Esc flow, when opening preview, and from overlay backtracking. It delegates the actual highlight update to `apply_backtrack_selection_internal`.
 
 *Call graph*: calls 2 internal fn (apply_backtrack_selection_internal, user_count); called by 3 (handle_backtrack_esc_key, open_backtrack_preview, overlay_step_backtrack); 1 external calls (frame_requester).
 
@@ -1333,11 +1343,11 @@ fn step_backtrack_and_highlight(&mut self, tui: &mut tui::Tui)
 fn step_forward_backtrack_and_highlight(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Moves the backtrack selection toward newer user messages and updates the overlay highlight. This is the Right-arrow counterpart to backward stepping.
+**Purpose**: Moves the backtrack selection to the next newer user message and updates the overlay highlight. It is the forward counterpart to stepping backward.
 
-**Data flow**: It counts user messages, returns if zero, computes `last_index`, and chooses `next_selection`: latest user if no selection exists yet, otherwise `nth_user_message + 1` clamped to `last_index`. It applies the selection and schedules a frame.
+**Data flow**: It counts user messages, calculates the next newer selection without going past the latest user message, applies that selection internally, and schedules a redraw. With no user messages, it leaves state unchanged.
 
-**Call relations**: Called only from `overlay_step_backtrack_forward` while preview mode is active.
+**Call relations**: This is called by `overlay_step_backtrack_forward` when the user presses Right during preview mode.
 
 *Call graph*: calls 2 internal fn (apply_backtrack_selection_internal, user_count); called by 1 (overlay_step_backtrack_forward); 1 external calls (frame_requester).
 
@@ -1348,11 +1358,11 @@ fn step_forward_backtrack_and_highlight(&mut self, tui: &mut tui::Tui)
 fn apply_backtrack_selection_internal(&mut self, nth_user_message: usize)
 ```
 
-**Purpose**: Commits a computed user-message index into backtrack state and updates the transcript overlay highlight to the corresponding cell. Missing selections clear the highlight.
+**Purpose**: Applies a selected user-message number to the app state and transcript overlay. It converts “the third user message” into the actual transcript cell that should be highlighted.
 
-**Data flow**: It calls `nth_user_position(&self.transcript_cells, nth_user_message)`. On `Some(cell_idx)`, it stores `self.backtrack.nth_user_message = nth_user_message` and, if the overlay is `Overlay::Transcript`, calls `t.set_highlight_cell(Some(cell_idx))`. On `None`, it resets `nth_user_message` to `usize::MAX` and clears the overlay highlight.
+**Data flow**: It receives a user-message index. It looks up the matching cell position in the transcript. If found, it stores that index as the current selection and tells the transcript overlay to highlight the cell. If not found, it clears both the selection and the highlight.
 
-**Call relations**: Used by all selection-stepping paths and by overlay-sync logic after transcript trimming.
+**Call relations**: This helper is used by preview startup, backward and forward stepping, and overlay resynchronization after transcript trimming. It depends on `nth_user_position` for the filtered lookup.
 
 *Call graph*: calls 1 internal fn (nth_user_position); called by 4 (begin_overlay_backtrack_preview, step_backtrack_and_highlight, step_forward_backtrack_and_highlight, sync_overlay_after_transcript_trim).
 
@@ -1363,11 +1373,11 @@ fn apply_backtrack_selection_internal(&mut self, nth_user_message: usize)
 fn overlay_forward_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()>
 ```
 
-**Purpose**: Forwards events to the overlay widget, with special draw-time logic that injects the chat widget's live active cell as a render-only tail into the transcript overlay. It also closes the overlay when the widget reports completion.
+**Purpose**: Passes events to the overlay when backtracking does not need to intercept them, and closes the overlay if it finishes. For draw and resize events, it also adds the currently live chat output to the transcript overlay before rendering.
 
-**Data flow**: For `TuiEvent::Draw` or `Resize`, if the overlay is a transcript overlay it fetches `active_key` from `chat_widget.active_cell_transcript_key()`, then calls `tui.draw(...)` to compute width, sync the overlay's live tail from `chat_widget.active_cell_transcript_hyperlink_lines(width)`, and render the overlay. It checks `t.is_done()` to close the overlay if needed, and if the active key indicates animation and the overlay is scrolled to bottom, schedules another frame in 50 ms. For all other cases, if any overlay exists it forwards the event with `overlay.handle_event(tui, event)` and closes/schedules a frame if `overlay.is_done()`. It returns `Result<()>`.
+**Data flow**: It receives the terminal object and one UI event. For transcript draw or resize events, it asks the chat widget for the active-cell cache key and display lines, syncs that live tail into the overlay, draws it, and schedules animation frames if needed. For other events, it forwards them to the overlay. If the overlay says it is done, it closes it and requests a redraw.
 
-**Call relations**: Called from overlay event routing and from backtrack stepping fallbacks when preview mode is not armed.
+**Call relations**: This is called by the overlay event router and by backtrack step functions when they decide an event should behave like a normal overlay event. It calls `close_transcript_overlay` when the overlay lifecycle ends.
 
 *Call graph*: calls 1 internal fn (close_transcript_overlay); called by 3 (handle_backtrack_overlay_event, overlay_step_backtrack, overlay_step_backtrack_forward); 4 external calls (draw, frame_requester, matches!, from_millis).
 
@@ -1378,11 +1388,11 @@ fn overlay_forward_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Resu
 fn overlay_confirm_backtrack(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Confirms the currently highlighted backtrack selection from the overlay, closes the overlay, and starts the rollback flow if a valid selection exists.
+**Purpose**: Confirms the currently highlighted backtrack choice from the transcript overlay. It closes the overlay and starts the rollback request if the selection is still valid.
 
-**Data flow**: It reads `self.backtrack.nth_user_message`, computes `selection = self.backtrack_selection(nth_user_message)`, closes the transcript overlay, and if `selection` is `Some`, calls `apply_backtrack_rollback(selection)` and schedules a frame.
+**Data flow**: It reads the selected user-message number, turns it into a `BacktrackSelection`, closes the overlay, and, if a valid selection exists, applies the rollback and schedules a redraw.
 
-**Call relations**: Called by `handle_backtrack_overlay_event` when Enter is pressed during overlay preview.
+**Call relations**: This is called by `handle_backtrack_overlay_event` on Enter during preview mode. It uses `backtrack_selection` to build the rollback input and `apply_backtrack_rollback` to send the request.
 
 *Call graph*: calls 3 internal fn (apply_backtrack_rollback, backtrack_selection, close_transcript_overlay); called by 1 (handle_backtrack_overlay_event); 1 external calls (frame_requester).
 
@@ -1393,11 +1403,11 @@ fn overlay_confirm_backtrack(&mut self, tui: &mut tui::Tui)
 fn overlay_step_backtrack(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()>
 ```
 
-**Purpose**: Handles backward stepping keys in overlay preview mode, but falls back to normal overlay event forwarding if preview is not properly armed. This preserves overlay navigation semantics outside backtrack mode.
+**Purpose**: Handles Esc or Left while overlay backtrack preview is active. If backtracking is properly armed, it moves to an older message; otherwise it lets the overlay process the event normally.
 
-**Data flow**: If `self.backtrack.base_id.is_some()`, it calls `step_backtrack_and_highlight(tui)`; otherwise it forwards the original event to `overlay_forward_event(tui, event)`. It returns `Result<()>`.
+**Data flow**: It checks whether a base thread id has been recorded. With one present, it steps the selection backward and highlights it. Without one, it forwards the event to the overlay. It returns a result in case forwarding fails.
 
-**Call relations**: Called from `handle_backtrack_overlay_event` for Esc and Left while preview mode is active.
+**Call relations**: This is called by the overlay event router for Esc and Left. It chooses between `step_backtrack_and_highlight` and `overlay_forward_event`.
 
 *Call graph*: calls 2 internal fn (overlay_forward_event, step_backtrack_and_highlight); called by 1 (handle_backtrack_overlay_event).
 
@@ -1412,11 +1422,11 @@ fn overlay_step_backtrack_forward(
     ) -> Result<()>
 ```
 
-**Purpose**: Handles forward stepping keys in overlay preview mode, with fallback to normal overlay forwarding when preview is not armed. It is the Right-arrow counterpart to `overlay_step_backtrack`.
+**Purpose**: Handles Right while overlay backtrack preview is active. If backtracking is armed, it moves the selection toward newer messages; otherwise it treats Right as a normal overlay event.
 
-**Data flow**: If `self.backtrack.base_id.is_some()`, it calls `step_forward_backtrack_and_highlight(tui)`; otherwise it forwards the event to `overlay_forward_event(tui, event)`. It returns `Result<()>`.
+**Data flow**: It checks for a stored base thread id. If present, it advances the selected user message and redraws. If absent, it forwards the event to the overlay. It returns a result for possible overlay errors.
 
-**Call relations**: Called from `handle_backtrack_overlay_event` for Right-arrow presses during overlay preview.
+**Call relations**: This is called by `handle_backtrack_overlay_event` on Right. It chooses between `step_forward_backtrack_and_highlight` and `overlay_forward_event`.
 
 *Call graph*: calls 2 internal fn (overlay_forward_event, step_forward_backtrack_and_highlight); called by 1 (handle_backtrack_overlay_event).
 
@@ -1427,11 +1437,11 @@ fn overlay_step_backtrack_forward(
 fn confirm_backtrack_from_main(&mut self) -> Option<BacktrackSelection>
 ```
 
-**Purpose**: Computes the current backtrack selection from main-view state and then resets backtrack mode. It does not itself submit the rollback.
+**Purpose**: Confirms a backtrack selection when the confirmation comes from the main view instead of the overlay. It returns the selection to the caller and clears the temporary backtrack state.
 
-**Data flow**: It calls `backtrack_selection(self.backtrack.nth_user_message)` to obtain an optional `BacktrackSelection`, then calls `reset_backtrack_state()` and returns the selection.
+**Data flow**: It reads the current selected user-message number, tries to build a `BacktrackSelection`, resets the backtrack state, and returns either that selection or nothing.
 
-**Call relations**: Used by main-view confirmation flows outside the overlay to convert current selection state into a rollback candidate.
+**Call relations**: This calls `backtrack_selection` to gather prompt data, then `reset_backtrack_state` so the caller can decide what to do next without leaving the app in preview mode.
 
 *Call graph*: calls 2 internal fn (backtrack_selection, reset_backtrack_state).
 
@@ -1442,11 +1452,11 @@ fn confirm_backtrack_from_main(&mut self) -> Option<BacktrackSelection>
 fn reset_backtrack_state(&mut self)
 ```
 
-**Purpose**: Clears all backtrack-mode state and removes any Esc hint from the composer. It is the common cleanup path after cancellation or confirmation.
+**Purpose**: Clears all temporary backtrack state. This prevents old thread ids, old selections, or old hints from affecting later user actions.
 
-**Data flow**: It sets `primed = false`, `base_id = None`, `nth_user_message = usize::MAX`, and calls `chat_widget.clear_esc_backtrack_hint()`. It does not touch `pending_rollback`.
+**Data flow**: It sets the primed flag to false, removes the base thread id, resets the selected message index to “none,” and clears the Esc-backtrack hint from the chat widget.
 
-**Call relations**: Called by several setup/teardown paths including overlay close, failed side-conversation rollback attempts, and main-view confirmation.
+**Call relations**: This is used after failed or unavailable flows, when closing a backtrack overlay, and after main-view confirmation. It is also called by rollback application when side conversations make editing previous prompts unsafe.
 
 *Call graph*: called by 4 (apply_backtrack_rollback, close_transcript_overlay, confirm_backtrack_from_main, open_backtrack_preview).
 
@@ -1461,11 +1471,11 @@ fn apply_backtrack_selection(
     )
 ```
 
-**Purpose**: Applies a precomputed backtrack selection and schedules a redraw. It is a small convenience wrapper around rollback staging.
+**Purpose**: Applies a backtrack selection and immediately asks the UI to redraw. It is a small convenience wrapper for callers that already have a completed selection.
 
-**Data flow**: It forwards `selection` to `apply_backtrack_rollback(selection)` and then schedules a frame through `tui.frame_requester().schedule_frame()`. It returns `()`.
+**Data flow**: It receives the terminal object and a `BacktrackSelection`, sends the selection through the normal rollback path, and schedules a new frame.
 
-**Call relations**: Used by callers that already computed a `BacktrackSelection` and just need to trigger the rollback flow.
+**Call relations**: This delegates the real work to `apply_backtrack_rollback`. It adds the UI refresh step that an event handler usually needs afterward.
 
 *Call graph*: calls 1 internal fn (apply_backtrack_rollback); 1 external calls (frame_requester).
 
@@ -1476,11 +1486,11 @@ fn apply_backtrack_selection(
 fn handle_backtrack_rollback_succeeded(&mut self, num_turns: u32)
 ```
 
-**Purpose**: Handles a successful rollback confirmation from the backend. If the rollback corresponds to an in-flight backtrack request, it finishes that request locally; otherwise it emits an app event for generic rollback trimming.
+**Purpose**: Responds when the core system reports that a rollback succeeded. It decides whether this success belongs to this app’s own pending backtrack request or should be applied as a general thread rollback event.
 
-**Data flow**: It checks `self.backtrack.pending_rollback`. If present, it calls `finish_pending_backtrack()`. Otherwise it sends `AppEvent::ApplyThreadRollback { num_turns }` through `app_event_tx`.
+**Data flow**: It receives the number of turns rolled back. If a pending backtrack exists, it finishes that pending local trim. If not, it sends an app event asking the normal event queue to apply the rollback in order.
 
-**Call relations**: Called from thread-routing rollback response handling after the server confirms rollback.
+**Call relations**: This is part of the confirmation boundary between the UI and the core system. It calls `finish_pending_backtrack` for guarded backtrack requests; otherwise it hands work to the app event channel.
 
 *Call graph*: calls 1 internal fn (finish_pending_backtrack).
 
@@ -1491,11 +1501,11 @@ fn handle_backtrack_rollback_succeeded(&mut self, num_turns: u32)
 fn handle_backtrack_rollback_failed(&mut self)
 ```
 
-**Purpose**: Clears the in-flight backtrack rollback guard after a rollback failure. It leaves any composer prefill intact for user convenience.
+**Purpose**: Clears the pending rollback guard after the core reports failure. This lets the user try another backtrack request later.
 
-**Data flow**: It sets `self.backtrack.pending_rollback = None` and returns `()`. No other state is changed.
+**Data flow**: It reads no extra input and simply removes the stored pending rollback. The transcript is not trimmed because the core did not confirm success.
 
-**Call relations**: Called when rollback RPC submission fails so the user can retry another backtrack action.
+**Call relations**: This is the failure counterpart to `handle_backtrack_rollback_succeeded`. It does not call other helpers because the safe response is just to unlock future rollback attempts.
 
 
 ##### `App::apply_non_pending_thread_rollback`  (lines 539–550)
@@ -1504,11 +1514,11 @@ fn handle_backtrack_rollback_failed(&mut self)
 fn apply_non_pending_thread_rollback(&mut self, num_turns: u32) -> bool
 ```
 
-**Purpose**: Applies local transcript trimming for a rollback that was not initiated by this TUI's backtrack flow. It drops the last N user turns and refreshes transcript-related UI state.
+**Purpose**: Applies a confirmed rollback that was not started by this TUI’s backtrack preview. It trims the local transcript by a number of user turns and cleans up related chat UI state.
 
-**Data flow**: It calls `trim_transcript_cells_drop_last_n_user_turns(&mut self.transcript_cells, num_turns)` and returns false immediately if nothing changed. On change it clears pending token activity and rate-limit hints in the chat widget, truncates agent copy history to the new `user_count`, calls `sync_overlay_after_transcript_trim()`, sets `backtrack_render_pending = true`, and returns true.
+**Data flow**: It receives a count of user turns to remove. It trims transcript cells from the end according to that count. If anything changed, it clears stale token/rate-limit hints, truncates copied-agent history to match the remaining user turns, syncs the overlay, marks rendering as pending, and returns true. If nothing changed, it returns false.
 
-**Call relations**: Used when rollback effects arrive without a matching `pending_rollback`, complementing `finish_pending_backtrack`.
+**Call relations**: This is used when rollback success arrives without a matching pending backtrack guard. It calls `trim_transcript_cells_drop_last_n_user_turns`, `user_count`, and `sync_overlay_after_transcript_trim`.
 
 *Call graph*: calls 3 internal fn (sync_overlay_after_transcript_trim, trim_transcript_cells_drop_last_n_user_turns, user_count).
 
@@ -1519,11 +1529,11 @@ fn apply_non_pending_thread_rollback(&mut self, num_turns: u32) -> bool
 fn finish_pending_backtrack(&mut self)
 ```
 
-**Purpose**: Completes a rollback that was initiated by this TUI's backtrack flow, but only if the response still targets the currently displayed thread. It trims transcript cells to the selected user boundary and refreshes dependent UI state.
+**Purpose**: Completes a rollback that this UI requested through backtracking. It only trims local history if the confirmation still matches the active thread.
 
-**Data flow**: It takes and clears `self.backtrack.pending_rollback`; if absent it returns. If `pending.thread_id != self.chat_widget.thread_id()`, it returns without trimming. Otherwise it calls `trim_transcript_cells_to_nth_user(&mut self.transcript_cells, pending.selection.nth_user_message)`, and on success clears pending token/rate-limit hints, truncates agent copy history to the new `user_count`, syncs the overlay after trim, and sets `backtrack_render_pending = true`.
+**Data flow**: It takes the stored pending rollback, compares its thread id with the current chat thread, and stops if they differ. If they match, it trims transcript cells up to the selected user message, clears stale chat-widget refresh state, truncates copied-agent history, syncs any open overlay, and marks rendering as pending.
 
-**Call relations**: Called only from `handle_backtrack_rollback_succeeded` when there is an in-flight pending rollback.
+**Call relations**: This is called by `handle_backtrack_rollback_succeeded`. It uses `trim_transcript_cells_to_nth_user` to make the local transcript match the selected rollback point.
 
 *Call graph*: calls 3 internal fn (sync_overlay_after_transcript_trim, trim_transcript_cells_to_nth_user, user_count); called by 1 (handle_backtrack_rollback_succeeded).
 
@@ -1534,11 +1544,11 @@ fn finish_pending_backtrack(&mut self)
 fn backtrack_selection(&self, nth_user_message: usize) -> Option<BacktrackSelection>
 ```
 
-**Purpose**: Builds a `BacktrackSelection` from the currently selected user-history cell, but only if the visible thread still matches the backtrack base thread. This prevents stale selections from crossing thread switches.
+**Purpose**: Builds the full rollback selection for a chosen user-message number. It gathers the original prompt text and attachments so they can be put back into the composer.
 
-**Data flow**: It reads `self.backtrack.base_id`; if absent or if `self.chat_widget.thread_id()` differs, it returns `None`. Otherwise it finds the transcript cell index with `nth_user_position`, downcasts that cell to `UserHistoryCell`, and clones its message, text elements, local image paths, and remote image URLs. If lookup/downcast fails, it falls back to empty prompt data. It returns `Some(BacktrackSelection { nth_user_message, ... })`.
+**Data flow**: It receives a user-message index. It first checks that the current thread still matches the thread recorded when backtracking began. Then it finds the matching user history cell and copies its message text, text elements, local image paths, and remote image URLs. It returns a `BacktrackSelection`, or nothing if the thread check fails.
 
-**Call relations**: Used by overlay confirmation and main-view confirmation to convert selection state into rollback input.
+**Call relations**: This is called by overlay confirmation and main-view confirmation. It uses `nth_user_position` to find the right transcript cell.
 
 *Call graph*: calls 1 internal fn (nth_user_position); called by 2 (confirm_backtrack_from_main, overlay_confirm_backtrack).
 
@@ -1549,11 +1559,11 @@ fn backtrack_selection(&self, nth_user_message: usize) -> Option<BacktrackSelect
 fn sync_overlay_after_transcript_trim(&mut self)
 ```
 
-**Purpose**: Realigns overlay and backtrack selection state after transcript cells have been trimmed by rollback. It also drops deferred history lines that might reference removed cells.
+**Purpose**: Keeps the transcript overlay and related buffered output consistent after history has been cut. Without this, the overlay could still show removed messages.
 
-**Data flow**: If the overlay is a transcript overlay, it replaces its committed cells with `self.transcript_cells.clone()`. If backtrack preview is active, it recomputes the valid selection range from `user_count(&self.transcript_cells)` and reapplies a clamped selection via `apply_backtrack_selection_internal`. Finally it clears `self.deferred_history_lines`.
+**Data flow**: It replaces overlay transcript cells with the trimmed transcript if the overlay is open. If preview mode is active, it clamps the selected user-message index to what still exists and reapplies the highlight. It also clears deferred history lines that may refer to removed cells.
 
-**Call relations**: Called after both pending and non-pending rollback trims so overlay rendering and buffered history output cannot drift from the trimmed transcript.
+**Call relations**: This is called after both pending and non-pending rollback trims. It uses `user_count` and `apply_backtrack_selection_internal` to repair the highlighted selection.
 
 *Call graph*: calls 2 internal fn (apply_backtrack_selection_internal, user_count); called by 2 (apply_non_pending_thread_rollback, finish_pending_backtrack).
 
@@ -1567,11 +1577,11 @@ fn trim_transcript_cells_to_nth_user(
 ) -> bool
 ```
 
-**Purpose**: Implements backtrack trimming semantics for a selected user-message index: remove that user message and everything newer. It returns whether the transcript actually changed.
+**Purpose**: Cuts transcript history just before a chosen user message. This is used after a confirmed backtrack so the selected old prompt and everything after it disappear from local history.
 
-**Data flow**: It takes a mutable vector of `Arc<dyn HistoryCell>` and an index. If the index is `usize::MAX`, it returns false. Otherwise it finds the corresponding cell index with `nth_user_position`, records the original length, truncates the vector at that cell index, and returns whether the new length differs from the original.
+**Data flow**: It receives the mutable transcript cell list and a user-message index. If the index is invalid, it does nothing. Otherwise it finds that user message’s cell position, truncates the list before that position, and returns whether the list actually changed.
 
-**Call relations**: Used by `finish_pending_backtrack` and directly tested with several transcript-shape scenarios.
+**Call relations**: This is called by `finish_pending_backtrack` and by tests that verify rollback trimming behavior. It relies on `nth_user_position` for the filtered user-message lookup.
 
 *Call graph*: calls 1 internal fn (nth_user_position); called by 4 (finish_pending_backtrack, trim_transcript_for_first_user_drops_user_and_newer_cells, trim_transcript_for_later_user_keeps_prior_history, trim_transcript_preserves_cells_before_selected_user).
 
@@ -1585,11 +1595,11 @@ fn trim_transcript_cells_drop_last_n_user_turns(
 ) -> bool
 ```
 
-**Purpose**: Drops the last N user turns from a transcript according to rollback semantics, preserving any leading non-user cells before the earliest remaining user turn. It tolerates oversized `num_turns` by trimming back to the first user turn.
+**Purpose**: Cuts transcript history by dropping the last N user turns. This supports rollback confirmations that arrive as a turn count rather than as a specific selected prompt.
 
-**Data flow**: It returns false immediately for `num_turns == 0`. Otherwise it collects user cell positions with `user_positions_iter`, returns false if there are no user cells, converts `num_turns` to `usize` with saturation, computes `cut_idx` as either the first user index (overflow case) or the position of the Nth user from the end, truncates the transcript at `cut_idx`, and returns whether the length changed.
+**Data flow**: It receives the mutable transcript cell list and a number of user turns. If the number is zero or there are no user messages, it does nothing. Otherwise it finds all user-message positions since the latest session start, chooses the cut point, truncates the transcript, and returns whether anything was removed.
 
-**Call relations**: Used by `apply_non_pending_thread_rollback` and covered by dedicated tests for normal and overflow trimming.
+**Call relations**: This is called by `apply_non_pending_thread_rollback` and by tests. It uses `user_positions_iter` to understand where user turns begin.
 
 *Call graph*: calls 1 internal fn (user_positions_iter); called by 3 (apply_non_pending_thread_rollback, trim_drop_last_n_user_turns_allows_overflow, trim_drop_last_n_user_turns_applies_rollback_semantics); 1 external calls (try_from).
 
@@ -1600,11 +1610,11 @@ fn trim_transcript_cells_drop_last_n_user_turns(
 fn user_count(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> usize
 ```
 
-**Purpose**: Counts user-history cells in the current session segment of the transcript. Cells before the most recent `SessionInfoCell` are ignored.
+**Purpose**: Counts user messages in the current session portion of the transcript. It ignores anything before the most recent session-start marker.
 
-**Data flow**: It delegates to `user_positions_iter(cells).count()` and returns the resulting `usize`.
+**Data flow**: It receives a slice of transcript cells, walks the user positions found by `user_positions_iter`, and returns the count.
 
-**Call relations**: Used throughout backtrack logic for selection bounds, rollback depth computation, and post-trim copy-history truncation.
+**Call relations**: Many backtrack functions use this to decide whether backtracking is possible, how far selection can move, and how much copied-agent history should remain after trimming.
 
 *Call graph*: calls 1 internal fn (user_positions_iter); called by 10 (backtrack_selection_with_duplicate_history_targets_unique_turn, apply_backtrack_rollback, apply_cancelled_turn_edit, apply_non_pending_thread_rollback, begin_overlay_backtrack_preview, finish_pending_backtrack, step_backtrack_and_highlight, step_forward_backtrack_and_highlight, sync_overlay_after_transcript_trim, has_backtrack_target).
 
@@ -1615,11 +1625,11 @@ fn user_count(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> usize
 fn has_backtrack_target(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> bool
 ```
 
-**Purpose**: Reports whether there is at least one eligible user message to backtrack to in the current session segment. It is the gate for showing hints and opening preview.
+**Purpose**: Answers the simple question: is there any user message that can be selected for backtracking? It is used before showing hints or opening preview mode.
 
-**Data flow**: It calls `user_count(cells)` and returns whether the count is greater than zero.
+**Data flow**: It receives transcript cells, counts the current-session user messages, and returns true if the count is greater than zero.
 
-**Call relations**: Used by priming and overlay-opening paths to decide whether backtrack UX should proceed.
+**Call relations**: This is called when priming backtrack, opening backtrack preview, and starting preview from an already-open overlay.
 
 *Call graph*: calls 1 internal fn (user_count); called by 3 (begin_overlay_backtrack_preview, open_backtrack_preview, prime_backtrack).
 
@@ -1633,11 +1643,11 @@ fn nth_user_position(
 ) -> Option<usize>
 ```
 
-**Purpose**: Maps a logical user-message index within the current session segment to the corresponding transcript cell index. This is the bridge between backtrack selection state and actual transcript storage.
+**Purpose**: Finds the transcript cell position for the Nth user message in the current session. This bridges the user-facing selection number and the raw transcript list index.
 
-**Data flow**: It iterates `user_positions_iter(cells)` with enumeration, finds the first `(i, idx)` where `i == nth`, and returns `Some(idx)`; otherwise `None`.
+**Data flow**: It receives transcript cells and a zero-based user-message number. It walks the filtered user-message positions and returns the matching cell index if one exists.
 
-**Call relations**: Used by selection highlighting, selection extraction, and transcript trimming helpers.
+**Call relations**: This helper is used when highlighting selections, building rollback selections, and trimming to a selected user message.
 
 *Call graph*: calls 1 internal fn (user_positions_iter); called by 3 (apply_backtrack_selection_internal, backtrack_selection, trim_transcript_cells_to_nth_user).
 
@@ -1650,11 +1660,11 @@ fn user_positions_iter(
 ) -> impl Iterator<Item = usize> + '_
 ```
 
-**Purpose**: Iterates transcript indices of `UserHistoryCell`s after the most recent session-start marker. This defines the universe of backtrackable user turns.
+**Purpose**: Produces the transcript indexes of user messages after the most recent session-start marker. This is the shared definition of which user messages count for backtracking.
 
-**Data flow**: It computes `session_start_type = TypeId::of::<SessionInfoCell>()` and `user_type = TypeId::of::<UserHistoryCell>()`, finds the index after the last session-start cell (or zero if none), then iterates `cells` from that point and yields indices whose runtime type id matches `user_type`.
+**Data flow**: It receives transcript cells, finds the latest `SessionInfoCell`, starts after it, and yields indexes whose cells are `UserHistoryCell` values.
 
-**Call relations**: This iterator underpins `user_count`, `nth_user_position`, and rollback trimming semantics.
+**Call relations**: This iterator feeds `user_count`, `nth_user_position`, and turn-count trimming. It keeps all those operations using the same current-session boundary.
 
 *Call graph*: called by 3 (nth_user_position, trim_transcript_cells_drop_last_n_user_turns, user_count).
 
@@ -1665,11 +1675,11 @@ fn user_positions_iter(
 fn agent_group_count(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> usize
 ```
 
-**Purpose**: Counts distinct agent message groups in the current session segment for tests. It ignores stream continuations and non-agent cells.
+**Purpose**: Counts agent message groups in tests. It helps verify that special informational cells do not get mistaken for assistant output groups.
 
-**Data flow**: It delegates to `agent_group_positions_iter(cells).count()` and returns the count.
+**Data flow**: It receives transcript cells, counts positions yielded by `agent_group_positions_iter`, and returns the total.
 
-**Call relations**: Used only in tests to validate transcript grouping behavior around compacted-context markers.
+**Call relations**: This test-only helper is used by the agent-group test. It delegates the actual filtering rules to `agent_group_positions_iter`.
 
 *Call graph*: calls 1 internal fn (agent_group_positions_iter).
 
@@ -1682,11 +1692,11 @@ fn agent_group_positions_iter(
 ) -> impl Iterator<Item = usize> + '_
 ```
 
-**Purpose**: Iterates indices of agent message cells that begin a new copy-source group after the most recent session start. Stream continuations are excluded.
+**Purpose**: Finds the transcript indexes of top-level agent message groups for tests. It ignores stream continuations so one assistant response is counted as one group.
 
-**Data flow**: It finds the start index after the last `SessionInfoCell`, then iterates cells from there, downcasts each to `AgentMessageCell`, checks `!cell.is_stream_continuation()`, and yields indices for those first-in-group agent cells.
+**Data flow**: It receives transcript cells, starts after the latest session marker, and yields indexes for `AgentMessageCell` values that are not stream continuations.
 
-**Call relations**: Used only by `agent_group_count` in tests.
+**Call relations**: This is called by `agent_group_count` in test builds. It mirrors the session-boundary idea used by user-message iteration.
 
 *Call graph*: called by 1 (agent_group_count).
 
@@ -1697,11 +1707,11 @@ fn agent_group_positions_iter(
 fn render_lines(lines: &[Line<'static>]) -> Vec<String>
 ```
 
-**Purpose**: Converts rendered `ratatui::Line` values into plain strings for snapshot-style assertions. It strips styling and concatenates span contents.
+**Purpose**: Turns rendered terminal lines into plain strings for snapshot tests. This makes it easy to compare what the user would see.
 
-**Data flow**: It iterates over the input lines, then over each line's spans, concatenates `span.content` into a `String`, and collects the strings into a `Vec<String>`.
+**Data flow**: It receives a list of styled terminal lines, joins each line’s spans into ordinary text, and returns a vector of strings.
 
-**Call relations**: Used by the snapshot-oriented test at the end of the module.
+**Call relations**: This is used by the snapshot test for the “no previous message to edit” info message.
 
 *Call graph*: 1 external calls (iter).
 
@@ -1712,11 +1722,11 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String>
 fn trim_transcript_for_first_user_drops_user_and_newer_cells()
 ```
 
-**Purpose**: Verifies that trimming to the first user message removes that user cell and everything after it. This is the most aggressive valid backtrack trim.
+**Purpose**: Checks that trimming to the first user message removes that user message and everything after it. This protects the basic rollback-to-start behavior.
 
-**Data flow**: It builds a transcript with one user cell followed by one agent cell, calls `trim_transcript_cells_to_nth_user(&mut cells, 0)`, and asserts that the resulting vector is empty.
+**Data flow**: It builds a transcript with a user message and an assistant response, trims to user message zero, and asserts that the transcript becomes empty.
 
-**Call relations**: This test directly exercises the selected-user trimming helper.
+**Call relations**: This test calls `trim_transcript_cells_to_nth_user`, exercising the helper used by pending backtrack completion.
 
 *Call graph*: calls 1 internal fn (trim_transcript_cells_to_nth_user); 2 external calls (assert!, vec!).
 
@@ -1727,11 +1737,11 @@ fn trim_transcript_for_first_user_drops_user_and_newer_cells()
 fn trim_transcript_preserves_cells_before_selected_user()
 ```
 
-**Purpose**: Checks that trimming to a selected user preserves earlier non-user context cells. Introductory agent output before the selected user should remain.
+**Purpose**: Checks that cells before the selected user message are kept when trimming. This matters because intro or earlier assistant context should not be deleted by mistake.
 
-**Data flow**: It builds a transcript of intro agent, first user, and trailing agent cells, trims to user index 0, then asserts that only the intro agent cell remains and that its rendered text is unchanged.
+**Data flow**: It builds a transcript with an intro assistant cell, a user message, and a later assistant cell. After trimming to the user message, it verifies only the intro cell remains and still renders as expected.
 
-**Call relations**: This test covers the boundary where trimming should stop exactly at the selected user cell.
+**Call relations**: This test calls `trim_transcript_cells_to_nth_user` to confirm the cut happens just before the chosen user cell.
 
 *Call graph*: calls 1 internal fn (trim_transcript_cells_to_nth_user); 2 external calls (assert_eq!, vec!).
 
@@ -1742,11 +1752,11 @@ fn trim_transcript_preserves_cells_before_selected_user()
 fn trim_transcript_for_later_user_keeps_prior_history()
 ```
 
-**Purpose**: Verifies that trimming to a later user keeps all earlier transcript history intact while removing the selected user and newer cells. This models rewinding to an intermediate prompt.
+**Purpose**: Checks that trimming to a later user message keeps all earlier conversation history. This ensures backtracking to the second prompt does not erase the first prompt and its preceding response.
 
-**Data flow**: It constructs a transcript with intro agent, first user, between agent, second user, and tail agent cells, trims to user index 1, and asserts that the first three cells remain with their original contents.
+**Data flow**: It builds a multi-turn transcript, trims to the second user message, and asserts that the intro, first user message, and between-assistant message remain.
 
-**Call relations**: This test exercises `trim_transcript_cells_to_nth_user` on a nonzero user index.
+**Call relations**: This test exercises `trim_transcript_cells_to_nth_user` for a non-first selection.
 
 *Call graph*: calls 1 internal fn (trim_transcript_cells_to_nth_user); 2 external calls (assert_eq!, vec!).
 
@@ -1757,11 +1767,11 @@ fn trim_transcript_for_later_user_keeps_prior_history()
 fn trim_drop_last_n_user_turns_applies_rollback_semantics()
 ```
 
-**Purpose**: Checks the helper that drops the last N user turns by count rather than by explicit selection. Dropping one turn should remove the newest user turn and its following cells.
+**Purpose**: Verifies that dropping the last user turn removes the latest user message and later assistant output while preserving earlier turns.
 
-**Data flow**: It builds a transcript with two user turns and trailing agent cells, calls `trim_transcript_cells_drop_last_n_user_turns(&mut cells, 1)`, and asserts that the function returned true, the transcript now has two cells, and the remaining user cell is the first one.
+**Data flow**: It builds a two-turn transcript, drops one user turn from the end, and checks that only the first turn remains.
 
-**Call relations**: This test covers the generic rollback-trim helper used for non-pending rollbacks.
+**Call relations**: This test calls `trim_transcript_cells_drop_last_n_user_turns`, the helper used for non-pending rollback confirmations.
 
 *Call graph*: calls 1 internal fn (trim_transcript_cells_drop_last_n_user_turns); 3 external calls (assert!, assert_eq!, vec!).
 
@@ -1772,11 +1782,11 @@ fn trim_drop_last_n_user_turns_applies_rollback_semantics()
 fn trim_drop_last_n_user_turns_allows_overflow()
 ```
 
-**Purpose**: Verifies that requesting more turns than exist trims back to the first user turn rather than failing. Leading non-user context should still be preserved.
+**Purpose**: Checks that asking to drop more turns than exist is safe. The function should trim back to the first user turn without crashing or underflowing.
 
-**Data flow**: It builds a transcript with intro agent, one user, and trailing agent, calls `trim_transcript_cells_drop_last_n_user_turns(&mut cells, u32::MAX)`, and asserts that only the intro agent cell remains with its original rendered text.
+**Data flow**: It builds a transcript with an intro assistant cell and one user turn, asks to drop an extremely large number of turns, and verifies the intro cell remains.
 
-**Call relations**: This test covers the overflow/saturation branch of the rollback-trim helper.
+**Call relations**: This test calls `trim_transcript_cells_drop_last_n_user_turns` to cover oversized rollback counts.
 
 *Call graph*: calls 1 internal fn (trim_transcript_cells_drop_last_n_user_turns); 3 external calls (assert!, assert_eq!, vec!).
 
@@ -1787,11 +1797,11 @@ fn trim_drop_last_n_user_turns_allows_overflow()
 fn agent_group_count_ignores_context_compacted_marker()
 ```
 
-**Purpose**: Ensures that context-compacted info cells do not count as agent message groups. Only actual first-in-group agent cells should be counted.
+**Purpose**: Ensures that an informational “Context compacted” marker is not counted as an assistant message group. This keeps test helper counting aligned with real transcript meaning.
 
-**Data flow**: It builds a transcript with agent, info-event, and agent cells, calls `agent_group_count(&cells)`, and asserts that the count is 2.
+**Data flow**: It builds cells with two assistant messages separated by an info event, counts agent groups, and asserts the count is two.
 
-**Call relations**: This test validates the grouping iterator used only in test support.
+**Call relations**: This test uses `agent_group_count`, which in turn uses `agent_group_positions_iter`.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -1802,11 +1812,11 @@ fn agent_group_count_ignores_context_compacted_marker()
 fn backtrack_target_requires_user_message()
 ```
 
-**Purpose**: Checks that backtrack availability depends on the presence of at least one user message, not merely any transcript content. Agent-only and info-only transcripts should not enable backtrack.
+**Purpose**: Confirms that backtracking is only available when there is at least one user message. Assistant or info-only transcripts should not offer an edit target.
 
-**Data flow**: It builds a transcript with an agent cell and an info event, asserts `!has_backtrack_target(&cells)`, then pushes a `UserHistoryCell` and asserts `has_backtrack_target(&cells)`.
+**Data flow**: It first builds a transcript without user messages and asserts no target exists. Then it adds a user message and asserts a target is available.
 
-**Call relations**: This test locks down the gate used by backtrack priming and overlay opening.
+**Call relations**: This test covers the behavior behind `has_backtrack_target`, which is used before showing hints or opening preview mode.
 
 *Call graph*: 4 external calls (new, new, assert!, vec!).
 
@@ -1817,24 +1827,20 @@ fn backtrack_target_requires_user_message()
 fn backtrack_unavailable_info_message_snapshot()
 ```
 
-**Purpose**: Snapshots the rendered informational message shown when there is no previous user message to edit. This protects the exact user-facing wording and formatting.
+**Purpose**: Checks the rendered text for the “No previous message to edit” message. This helps prevent accidental changes to a visible user-facing message.
 
-**Data flow**: It creates an info history cell with `NO_PREVIOUS_MESSAGE_TO_EDIT`, renders its display lines to plain strings via `render_lines`, joins them with newlines, and snapshots the result with `insta`.
+**Data flow**: It creates an info-event cell with the unavailable message, renders it into plain text lines, joins them, and compares the result with a stored snapshot.
 
-**Call relations**: This test covers the user-visible fallback path used by `open_backtrack_preview` and `begin_overlay_backtrack_preview`.
+**Call relations**: This test uses `tests::render_lines` and the history-cell info-message constructor to verify the exact display output.
 
 *Call graph*: 3 external calls (new_info_event, assert_snapshot!, render_lines).
 
 
 ### `tui/src/multi_agents.rs`
 
-`domain_logic` · `history rendering, agent picker display, and keyboard handling during interactive sessions`
+`domain_logic` · `TUI event rendering and keyboard handling`
 
-This module is the presentation layer for multi-agent activity. It defines lightweight display structs such as `AgentPickerThreadEntry`, `SubAgentActivityDisplay`, `AgentMetadata`, and `SpawnRequestSummary`, then uses them to render collaboration events into `PlainHistoryCell`s and picker labels. The formatting code is intentionally concrete: spawn, send-input, resume, wait, close, and sub-agent activity events each map to specific title lines and optional detail lines. Titles are built from styled `Span`s, prefixed with a dim bullet, and may include agent nickname/role plus spawn-request model and reasoning-effort details. Prompt and status messages are truncated to fixed grapheme limits so history rows stay compact.
-
-The main dispatcher is `tool_call_history_cell`, which pattern-matches `ThreadItem::CollabAgentToolCall`, suppresses some in-progress rows, parses receiver thread IDs, and routes to helpers like `spawn_end`, `waiting_begin`, `waiting_end`, or `resume_end`. Waiting completion merges receiver order with any extra agent states, deduplicates by parsed `ThreadId`, and sorts extras for stable output. Status rendering distinguishes pending, running, interrupted, completed-with-preview, errored-with-preview, shutdown, and not-found states.
-
-The file also owns fast-switch keyboard semantics for previous/next agent navigation. Canonical bindings are Alt-Left and Alt-Right, with macOS-only Option-b/f fallbacks gated by `allow_word_motion_fallback` so empty-composer navigation works without stealing normal word-motion editing.
+When the app can run more than one agent thread, the terminal interface needs to explain that activity without overwhelming the user. This file is like the sign-maker for a busy workshop: it does not decide which worker does a job, but it writes the labels, progress notes, and shortcut hints that help a person understand the workshop. It builds rows for the history view when an agent is spawned, sent input, resumed, waited on, interrupted, completed, errored, or closed. It also formats names for the `/agent` picker, including nicknames and roles such as `Robie [explorer]`, and provides the keyboard bindings for moving to the previous or next agent. A few details are deliberately user-friendly: long prompts and error messages are shortened, empty names are ignored, and status text is colored so success, running work, and errors are easy to scan. The file also has small tests that lock down the expected wording and styling. Without this file, multi-agent actions would still happen in the backend, but the TUI would have no consistent way to show them, making agent collaboration hard to follow.
 
 #### Function details
 
@@ -1844,11 +1850,11 @@ The file also owns fast-switch keyboard semantics for previous/next agent naviga
 fn agent_picker_status_dot_spans(is_closed: bool) -> Vec<Span<'static>>
 ```
 
-**Purpose**: Builds the colored status-dot prefix shown for agent picker entries.
+**Purpose**: Creates the small dot shown beside an agent in the picker. The dot is green when the agent is still considered active and plain when it is closed.
 
-**Data flow**: It takes `is_closed: bool`, chooses a plain bullet for closed agents or a green bullet for active/open agents, appends a trailing space span, and returns the two-span vector.
+**Data flow**: It receives whether the agent is closed. It chooses a styled bullet symbol and adds a following space. It returns these pieces as terminal text spans that the picker can draw.
 
-**Call relations**: This helper is used by picker rendering code to keep status-dot styling consistent across agent rows.
+**Call relations**: This is used when building agent picker rows, where each row needs a quick visual status cue before the agent name.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1863,11 +1869,11 @@ fn format_agent_picker_item_name(
 ) -> String
 ```
 
-**Purpose**: Formats the human-readable picker label from optional nickname and role, with a special label for the primary thread.
+**Purpose**: Builds the human-readable name shown for an agent in the `/agent` picker. It combines a nickname and role when available, and gives the main thread a special default label.
 
-**Data flow**: Inputs are optional nickname and role strings plus `is_primary`. If primary, it returns `Main [default]`. Otherwise it trims and filters empty nickname/role values, then returns one of `nickname [role]`, `nickname`, `[role]`, or `Agent`.
+**Data flow**: It receives an optional nickname, optional role, and a flag saying whether this is the primary thread. It trims empty text away, chooses the clearest available label, and returns a single display string.
 
-**Call relations**: This function is consumed by picker UI code that needs a stable display name independent of the underlying thread ID.
+**Call relations**: Picker-building code calls this when it needs the row title for a thread. It keeps naming rules in one place so the picker and footer labels stay consistent.
 
 *Call graph*: 1 external calls (format!).
 
@@ -1878,11 +1884,11 @@ fn format_agent_picker_item_name(
 fn previous_agent_shortcut() -> crate::key_hint::KeyBinding
 ```
 
-**Purpose**: Returns the canonical key binding for switching to the previous agent.
+**Purpose**: Defines the standard keyboard shortcut for moving to the previous agent. In this file, that shortcut is Alt plus the left arrow key.
 
-**Data flow**: It constructs and returns `crate::key_hint::alt(KeyCode::Left)`. No state is read or written.
+**Data flow**: It takes no input. It asks the shared key-hint helper to describe Alt+Left. It returns a key binding object that can be shown to users or matched against input.
 
-**Call relations**: This binding is used both for display in picker subtitles and for matching actual key events in `previous_agent_shortcut_matches`.
+**Call relations**: Shortcut display code uses this to print hints, and `previous_agent_shortcut_matches` uses it when checking actual key presses.
 
 *Call graph*: calls 1 internal fn (alt); called by 3 (picker_subtitle, picker_subtitle_mentions_shortcuts, previous_agent_shortcut_matches).
 
@@ -1893,11 +1899,11 @@ fn previous_agent_shortcut() -> crate::key_hint::KeyBinding
 fn next_agent_shortcut() -> crate::key_hint::KeyBinding
 ```
 
-**Purpose**: Returns the canonical key binding for switching to the next agent.
+**Purpose**: Defines the standard keyboard shortcut for moving to the next agent. In this file, that shortcut is Alt plus the right arrow key.
 
-**Data flow**: It constructs and returns `crate::key_hint::alt(KeyCode::Right)`. No state is mutated.
+**Data flow**: It takes no input. It asks the shared key-hint helper to describe Alt+Right. It returns a key binding object for display and matching.
 
-**Call relations**: Like the previous binding, this is used for both UI hints and event matching via `next_agent_shortcut_matches`.
+**Call relations**: Shortcut display code uses this to print hints, and `next_agent_shortcut_matches` uses it when checking actual key presses.
 
 *Call graph*: calls 1 internal fn (alt); called by 3 (picker_subtitle, picker_subtitle_mentions_shortcuts, next_agent_shortcut_matches).
 
@@ -1911,11 +1917,11 @@ fn previous_agent_shortcut_matches(
 ) -> bool
 ```
 
-**Purpose**: Checks whether a key event should be interpreted as the previous-agent command, including optional platform fallback behavior.
+**Purpose**: Checks whether a key press should switch to the previous agent. It accepts both the normal shortcut and, on supported platforms, a fallback key sequence.
 
-**Data flow**: It takes a `KeyEvent` and `allow_word_motion_fallback`. It returns true if the event matches `previous_agent_shortcut().is_press(...)` or if `previous_agent_word_motion_fallback(...)` returns true.
+**Data flow**: It receives a keyboard event and a flag saying whether word-motion fallback is safe to use. It tests the event against Alt+Left, then against the fallback rule. It returns true only if one of those should mean previous agent.
 
-**Call relations**: Callers use this predicate instead of hard-coding key combinations; it delegates fallback-specific logic to `previous_agent_word_motion_fallback`.
+**Call relations**: The TUI input loop can call this when a key arrives. It delegates the normal binding to `previous_agent_shortcut` and platform-specific backup behavior to `previous_agent_word_motion_fallback`.
 
 *Call graph*: calls 2 internal fn (previous_agent_shortcut, previous_agent_word_motion_fallback).
 
@@ -1929,11 +1935,11 @@ fn next_agent_shortcut_matches(
 ) -> bool
 ```
 
-**Purpose**: Checks whether a key event should be interpreted as the next-agent command, including optional platform fallback behavior.
+**Purpose**: Checks whether a key press should switch to the next agent. It accepts both the normal shortcut and, on supported platforms, a fallback key sequence.
 
-**Data flow**: It takes a `KeyEvent` and `allow_word_motion_fallback`. It returns true if the event matches `next_agent_shortcut().is_press(...)` or if `next_agent_word_motion_fallback(...)` returns true.
+**Data flow**: It receives a keyboard event and a flag saying whether fallback behavior is allowed. It tests the event against Alt+Right, then against the fallback rule. It returns true if the key should move forward through agents.
 
-**Call relations**: This is the symmetric companion to `previous_agent_shortcut_matches`, delegating fallback handling to `next_agent_word_motion_fallback`.
+**Call relations**: The TUI input loop can call this when processing keys. It delegates the normal binding to `next_agent_shortcut` and platform-specific backup behavior to `next_agent_word_motion_fallback`.
 
 *Call graph*: calls 2 internal fn (next_agent_shortcut, next_agent_word_motion_fallback).
 
@@ -1947,11 +1953,11 @@ fn previous_agent_word_motion_fallback(
 ) -> bool
 ```
 
-**Purpose**: Implements the macOS-specific Option-b fallback for previous-agent navigation when enhanced keyboard reporting is unavailable.
+**Purpose**: Recognizes a backup previous-agent shortcut on systems where terminals may report Option+Left as Option+b. This matters most on macOS terminals without enhanced keyboard reporting.
 
-**Data flow**: On macOS it inspects the full `KeyEvent` and returns true only when fallback is allowed and the event is an Alt-`b` press or repeat; on non-macOS builds it ignores inputs and returns false.
+**Data flow**: It receives a key event and a permission flag. On macOS, it checks for Alt+b press or repeat only when fallback is allowed; on other systems it always returns false. The output is a yes-or-no match.
 
-**Call relations**: This helper is only consulted by `previous_agent_shortcut_matches`, keeping platform-specific fallback logic isolated.
+**Call relations**: `previous_agent_shortcut_matches` calls this after checking the main shortcut. Callers should only allow this fallback when it will not interfere with text editing.
 
 *Call graph*: called by 1 (previous_agent_shortcut_matches); 1 external calls (matches!).
 
@@ -1965,11 +1971,11 @@ fn next_agent_word_motion_fallback(
 ) -> bool
 ```
 
-**Purpose**: Implements the macOS-specific Option-f fallback for next-agent navigation when enhanced keyboard reporting is unavailable.
+**Purpose**: Recognizes a backup next-agent shortcut on systems where terminals may report Option+Right as Option+f. This keeps agent switching usable in some macOS terminal setups.
 
-**Data flow**: On macOS it returns true only when fallback is allowed and the event is an Alt-`f` press or repeat; on non-macOS builds it always returns false.
+**Data flow**: It receives a key event and a permission flag. On macOS, it checks for Alt+f press or repeat only when fallback is allowed; on other systems it always returns false. It returns whether the fallback matched.
 
-**Call relations**: This helper is only used by `next_agent_shortcut_matches`.
+**Call relations**: `next_agent_shortcut_matches` calls this after checking the main shortcut. It is deliberately gated so normal word-by-word cursor movement in the composer is not stolen.
 
 *Call graph*: called by 1 (next_agent_shortcut_matches); 1 external calls (matches!).
 
@@ -1980,11 +1986,11 @@ fn next_agent_word_motion_fallback(
 fn spawn_request_summary(item: &ThreadItem) -> Option<SpawnRequestSummary>
 ```
 
-**Purpose**: Extracts the requested model and reasoning effort from a spawn-agent tool call when both fields are present.
+**Purpose**: Pulls out the model and reasoning effort from a completed agent-spawn request. This lets the UI later say not just that an agent was spawned, but what kind of model settings were requested.
 
-**Data flow**: It pattern-matches a `ThreadItem`. For `ThreadItem::CollabAgentToolCall` with `tool: SpawnAgent`, `model: Some`, and `reasoning_effort: Some`, it clones those values into `SpawnRequestSummary`; otherwise it returns `None`.
+**Data flow**: It receives a thread history item. If the item is a spawn-agent tool call with both model and reasoning effort present, it copies those values into a small summary object. Otherwise it returns nothing.
 
-**Call relations**: This helper is used by higher-level collaboration handling and by `tool_call_history_cell` to annotate spawn history rows with request details.
+**Call relations**: Collaboration event processing and `tool_call_history_cell` use this to preserve spawn details for display, especially when the final event needs a compact label like a model name plus reasoning level.
 
 *Call graph*: called by 2 (on_collab_agent_tool_call, tool_call_history_cell).
 
@@ -1999,11 +2005,11 @@ fn tool_call_history_cell(
 ) -> Option<PlainHistoryCell>
 ```
 
-**Purpose**: Converts a collaboration tool-call `ThreadItem` into a rendered history cell, or suppresses it when the event should not yet appear.
+**Purpose**: Converts a multi-agent tool-call event into one displayable history cell. It is the main translator from backend collaboration events into readable TUI transcript rows.
 
-**Data flow**: It takes a `ThreadItem`, an optional cached spawn request, and an `agent_metadata` lookup closure. It first rejects non-`CollabAgentToolCall` items. For matching items it parses the first receiver thread ID, normalizes the prompt, then dispatches by `tool`: completed spawn calls become `spawn_end`, completed send-input calls become `interaction_end`, resume calls become `resume_begin` or `resume_end` depending on status, wait calls become `waiting_begin` or `waiting_end`, and completed close calls become `close_end`. Some in-progress tools return `None` to avoid premature rows. It returns `Option<PlainHistoryCell>`.
+**Data flow**: It receives a thread item, an optional cached spawn summary, and a lookup function for agent metadata. It checks what kind of agent tool call happened, ignores some in-progress events that should not be shown yet, builds the right title and details, and returns a `PlainHistoryCell` when there is something to display.
 
-**Call relations**: This is the main formatter used by collaboration event handling and tests. It delegates concrete row construction to the specialized helpers for each tool type.
+**Call relations**: Event-handling code calls this when a collaboration tool call arrives. It hands off to helpers such as `spawn_end`, `waiting_begin`, and `waiting_end` so each kind of row has consistent wording.
 
 *Call graph*: calls 4 internal fn (spawn_end, spawn_request_summary, waiting_begin, waiting_end); called by 4 (on_collab_agent_tool_call, collab_events_snapshot, collab_resume_interrupted_snapshot, title_styles_nickname_and_role); 1 external calls (matches!).
 
@@ -2014,11 +2020,11 @@ fn tool_call_history_cell(
 fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentActivityDisplay>
 ```
 
-**Purpose**: Extracts a compact display record from a `SubAgentActivity` thread item.
+**Purpose**: Extracts the compact information needed to update the visible state of a sub-agent. It tells the UI which thread the activity belongs to, where the agent lives, and whether it looks active.
 
-**Data flow**: It pattern-matches `ThreadItem::SubAgentActivity`, parses `agent_thread_id` into `ThreadId`, clones `agent_path`, and sets `is_running_hint` to false only for `Interrupted`. It returns `Some(SubAgentActivityDisplay)` or `None`.
+**Data flow**: It receives a thread item. If the item is sub-agent activity, it parses the agent thread id, copies the agent path, and marks it as running unless the activity says it was interrupted. It returns that display data or nothing if the item is not relevant.
 
-**Call relations**: This helper is used by higher-level activity handling that needs structured sub-agent display data rather than a rendered history cell.
+**Call relations**: Sub-agent activity handling can call this before updating picker or activity state. It relies on `parse_thread_id` so invalid thread identifiers do not enter the display state.
 
 *Call graph*: calls 1 internal fn (parse_thread_id); 1 external calls (matches!).
 
@@ -2029,11 +2035,11 @@ fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentActivityDispl
 fn sub_agent_activity_history_cell(item: &ThreadItem) -> Option<PlainHistoryCell>
 ```
 
-**Purpose**: Formats a sub-agent activity event into a simple collaboration history cell.
+**Purpose**: Turns a sub-agent activity event into a simple history row. This gives the transcript short notes such as started, interacted with, or interrupted.
 
-**Data flow**: It matches `ThreadItem::SubAgentActivity`, builds a title line with `sub_agent_activity_title`, passes that plus an empty details vector to `collab_event`, and returns the resulting `PlainHistoryCell` inside `Some`; non-matching items return `None`.
+**Data flow**: It receives a thread item. If it is sub-agent activity, it builds a styled title from the activity kind and agent path, adds no extra detail lines, and returns a `PlainHistoryCell`. Other item types produce no cell.
 
-**Call relations**: This function is called by sub-agent activity handling code and delegates title construction and common cell assembly to local helpers.
+**Call relations**: Sub-agent event handling calls this when it wants an activity event to appear in the transcript. It delegates title wording to `sub_agent_activity_title` and row assembly to `collab_event`.
 
 *Call graph*: calls 2 internal fn (collab_event, sub_agent_activity_title); called by 1 (on_sub_agent_activity); 1 external calls (new).
 
@@ -2044,11 +2050,11 @@ fn sub_agent_activity_history_cell(item: &ThreadItem) -> Option<PlainHistoryCell
 fn sub_agent_activity_summary(kind: SubAgentActivityKind, agent_path: &str) -> String
 ```
 
-**Purpose**: Produces a plain string summary for a sub-agent activity kind and path.
+**Purpose**: Creates a one-line plain-text summary of a sub-agent activity. This is useful in places that need text rather than styled terminal spans.
 
-**Data flow**: It takes a `SubAgentActivityKind` and `agent_path` and returns one of `Started`, `Interacted with`, or `Interrupted` followed by the path in backticks.
+**Data flow**: It receives the activity kind and the agent path. It chooses the correct verb, inserts the path, and returns a string like `Started <path>` or `Interrupted <path>`.
 
-**Call relations**: This helper provides a non-rich-text summary parallel to `sub_agent_activity_title` for contexts that need plain strings.
+**Call relations**: Any UI component needing a compact activity label can use this instead of rebuilding the wording itself.
 
 *Call graph*: 1 external calls (format!).
 
@@ -2059,11 +2065,11 @@ fn sub_agent_activity_summary(kind: SubAgentActivityKind, agent_path: &str) -> S
 fn sub_agent_activity_title(kind: SubAgentActivityKind, agent_path: &str) -> Line<'static>
 ```
 
-**Purpose**: Builds the styled title line for a sub-agent activity history row.
+**Purpose**: Builds the styled title line for a sub-agent activity history row. It bolds the action words and colors the agent path so it stands out.
 
-**Data flow**: It maps the activity kind to a bold prefix string, wraps the path in cyan backticks, passes the span vector to `title_spans_line`, and returns the resulting `Line<'static>`.
+**Data flow**: It receives an activity kind and an agent path. It chooses a prefix such as `Started` or `Interrupted`, wraps the path in backticks, styles the pieces, and returns one terminal line.
 
-**Call relations**: This helper is used by `sub_agent_activity_history_cell` to produce the row title before common cell assembly.
+**Call relations**: `sub_agent_activity_history_cell` calls this before wrapping the title into a full history cell.
 
 *Call graph*: calls 1 internal fn (title_spans_line); called by 1 (sub_agent_activity_history_cell); 1 external calls (vec!).
 
@@ -2079,11 +2085,11 @@ fn spawn_end(
 ) -> PlainHistoryC
 ```
 
-**Purpose**: Builds the history cell shown when a spawn-agent call completes or fails.
+**Purpose**: Builds the history row shown after an agent spawn request finishes. It shows either the new agent label or a failure message, plus a short prompt preview if there was one.
 
-**Data flow**: Inputs are an optional new thread ID, the spawn prompt, optional spawn-request details, and an agent metadata lookup closure. If a thread ID exists it builds a `Spawned ...` title with `title_with_agent`; otherwise it uses `title_text("Agent spawn failed")`. It optionally adds a truncated prompt detail via `prompt_line`, then returns `collab_event(title, details)`.
+**Data flow**: It receives the new thread id if one exists, the spawn prompt, optional model settings, and a metadata lookup. It builds a title, adds a truncated prompt detail when useful, and returns a display cell.
 
-**Call relations**: This helper is called from `tool_call_history_cell` for completed spawn calls.
+**Call relations**: `tool_call_history_cell` calls this for finished spawn-agent tool calls. It uses label and title helpers so spawned-agent rows match the rest of the collaboration transcript.
 
 *Call graph*: calls 5 internal fn (agent_label, collab_event, prompt_line, title_text, title_with_agent); called by 1 (tool_call_history_cell); 1 external calls (new).
 
@@ -2098,11 +2104,11 @@ fn interaction_end(
 ) -> PlainHistoryCell
 ```
 
-**Purpose**: Builds the history cell for a completed send-input action to an existing agent.
+**Purpose**: Builds the history row shown after input has been sent to an agent. It makes clear which agent received the message and shows a short preview of the message.
 
-**Data flow**: It takes the receiver thread ID, prompt text, and metadata lookup closure, builds a `Sent input to ...` title with `title_with_agent`, optionally appends a truncated prompt detail from `prompt_line`, and returns the assembled `PlainHistoryCell` via `collab_event`.
+**Data flow**: It receives the receiver thread id, prompt text, and metadata lookup. It creates a title like `Sent input to Robie`, adds a truncated prompt line if non-empty, and returns a display cell.
 
-**Call relations**: This helper is reached from `tool_call_history_cell` for completed `SendInput` tool calls.
+**Call relations**: The tool-call rendering path uses this for completed send-input events. It shares `prompt_line`, `agent_label`, and `collab_event` with spawn rendering so similar events look alike.
 
 *Call graph*: calls 4 internal fn (agent_label, collab_event, prompt_line, title_with_agent); 1 external calls (new).
 
@@ -2116,11 +2122,11 @@ fn waiting_begin(
 ) -> PlainHistoryCell
 ```
 
-**Purpose**: Builds the history cell shown while waiting on one or more agents.
+**Purpose**: Builds the history row shown when the app starts waiting for one or more agents. It adapts the wording for one agent, many agents, or an unknown list.
 
-**Data flow**: It takes receiver thread ID strings and a metadata lookup closure, parses valid thread IDs, fetches metadata for each, and chooses a title based on count: `Waiting for <agent>`, `Waiting for agents`, or `Waiting for N agents`. For multi-agent waits it also builds one detail line per agent label. It returns the final `PlainHistoryCell` via `collab_event`.
+**Data flow**: It receives receiver thread id strings and a metadata lookup. It parses valid ids, fetches names and roles, chooses an appropriate title, and, for multiple agents, adds one detail line per agent. It returns a display cell.
 
-**Call relations**: This helper is called by `tool_call_history_cell` for in-progress `Wait` tool calls.
+**Call relations**: `tool_call_history_cell` calls this for in-progress wait events. It uses shared label and title helpers so waiting rows match other agent rows.
 
 *Call graph*: calls 4 internal fn (agent_label, collab_event, title_text, title_with_agent); called by 1 (tool_call_history_cell); 2 external calls (new, format!).
 
@@ -2135,11 +2141,11 @@ fn waiting_end(
 ) -> PlainH
 ```
 
-**Purpose**: Builds the history cell shown when a wait operation completes and agent statuses are available.
+**Purpose**: Builds the history row shown when waiting for agents has finished. It summarizes the outcome for each agent that completed or reported a status.
 
-**Data flow**: It takes receiver thread IDs, the `agents_states` map, and a metadata lookup closure. It computes detail lines with `wait_complete_lines`, uses `title_text("Finished waiting")` for the title, and returns `collab_event(title, details)`.
+**Data flow**: It receives receiver thread ids, a map of agent states, and a metadata lookup. It asks `wait_complete_lines` to turn those statuses into detail lines, adds the title `Finished waiting`, and returns a display cell.
 
-**Call relations**: This helper is called by `tool_call_history_cell` for completed `Wait` tool calls.
+**Call relations**: `tool_call_history_cell` calls this for completed wait events. It delegates the per-agent status formatting to `wait_complete_lines` and the final cell shape to `collab_event`.
 
 *Call graph*: calls 3 internal fn (collab_event, title_text, wait_complete_lines); called by 1 (tool_call_history_cell).
 
@@ -2153,11 +2159,11 @@ fn close_end(
 ) -> PlainHistoryCell
 ```
 
-**Purpose**: Builds the history cell for a completed close-agent action.
+**Purpose**: Builds the history row shown after an agent has been closed. It names the closed agent so the user can connect the close action to the right thread.
 
-**Data flow**: It takes the receiver thread ID and metadata lookup closure, creates a `Closed ...` title with `title_with_agent`, passes an empty details vector to `collab_event`, and returns the resulting cell.
+**Data flow**: It receives the receiver thread id and metadata lookup. It formats the agent label, creates a `Closed ...` title, adds no details, and returns a display cell.
 
-**Call relations**: This helper is used by `tool_call_history_cell` for completed `CloseAgent` calls.
+**Call relations**: The tool-call rendering path uses this for completed close-agent events. It relies on the same label and event helpers as spawn, send, and resume rows.
 
 *Call graph*: calls 3 internal fn (agent_label, collab_event, title_with_agent); 1 external calls (new).
 
@@ -2171,11 +2177,11 @@ fn resume_begin(
 ) -> PlainHistoryCell
 ```
 
-**Purpose**: Builds the history cell shown while an agent resume action is in progress.
+**Purpose**: Builds the history row shown while an agent is being resumed. This gives immediate feedback that a resume action has started.
 
-**Data flow**: It takes the receiver thread ID and metadata lookup closure, creates a `Resuming ...` title with `title_with_agent`, and returns a no-details `collab_event` cell.
+**Data flow**: It receives the receiver thread id and metadata lookup. It creates a `Resuming ...` title with the agent label and returns a display cell with no detail lines.
 
-**Call relations**: This helper is used by `tool_call_history_cell` for in-progress `ResumeAgent` calls.
+**Call relations**: The tool-call rendering path uses this for in-progress resume-agent events. It passes through `title_with_agent` and `collab_event` for consistent transcript formatting.
 
 *Call graph*: calls 3 internal fn (agent_label, collab_event, title_with_agent); 1 external calls (new).
 
@@ -2191,11 +2197,11 @@ fn resume_end(
 ) -> PlainHistoryCell
 ```
 
-**Purpose**: Builds the history cell for a completed resume action, including a status or fallback error detail line.
+**Purpose**: Builds the history row shown after an agent resume request finishes. It includes a status line so the user can see whether the resumed agent is running, interrupted, errored, or otherwise unavailable.
 
-**Data flow**: It takes the receiver thread ID, optional `CollabAgentState`, a fallback error string, and metadata lookup closure. It creates a `Resumed ...` title with `title_with_agent`, computes one detail line with `status_summary_line`, and returns the assembled cell via `collab_event`.
+**Data flow**: It receives the receiver thread id, optional agent state, fallback error text, and metadata lookup. It creates a `Resumed ...` title and adds one detail line based on the status or fallback error. It returns a display cell.
 
-**Call relations**: This helper is called by `tool_call_history_cell` for completed `ResumeAgent` calls after `first_agent_state` selects the relevant status.
+**Call relations**: The tool-call rendering path uses this for finished resume-agent events. It relies on `status_summary_line` for the result wording and on shared title/event helpers for layout.
 
 *Call graph*: calls 3 internal fn (agent_label, collab_event, title_with_agent); 1 external calls (vec!).
 
@@ -2206,11 +2212,11 @@ fn resume_end(
 fn collab_event(title: Line<'static>, details: Vec<Line<'static>>) -> PlainHistoryCell
 ```
 
-**Purpose**: Assembles a collaboration history cell from a title line and optional detail lines with tree-style prefixes.
+**Purpose**: Assembles a title and optional detail lines into a plain history cell. It gives collaboration events a common shape in the transcript.
 
-**Data flow**: It takes a title `Line<'static>` and a vector of detail lines. It starts a `Vec<Line<'static>>` with the title, and if details are present it prefixes them using `prefix_lines(details, "  └ ".dim(), "    ".into())`, then constructs and returns `PlainHistoryCell::new(lines)`.
+**Data flow**: It receives a title line and a list of detail lines. It puts the title first, indents detail lines under it with a branch-like prefix, and returns a `PlainHistoryCell` containing all lines.
 
-**Call relations**: This is the common cell-construction helper used by all specific event-formatting functions in the module.
+**Call relations**: Most row-building helpers call this as their final step, including spawn, wait, resume, close, interaction, and sub-agent activity rendering.
 
 *Call graph*: calls 2 internal fn (new, prefix_lines); called by 8 (close_end, interaction_end, resume_begin, resume_end, spawn_end, sub_agent_activity_history_cell, waiting_begin, waiting_end); 1 external calls (vec!).
 
@@ -2221,11 +2227,11 @@ fn collab_event(title: Line<'static>, details: Vec<Line<'static>>) -> PlainHisto
 fn title_text(title: impl Into<String>) -> Line<'static>
 ```
 
-**Purpose**: Builds a bold bullet-prefixed title line from plain text.
+**Purpose**: Creates a simple bold title line without an agent label. It is used for generic messages such as failures or finished waiting.
 
-**Data flow**: It takes any `Into<String>` title, wraps it in a bold `Span`, passes that vector to `title_spans_line`, and returns the resulting line.
+**Data flow**: It receives text that can become a string. It wraps the text in a bold span, adds the standard leading bullet through `title_spans_line`, and returns a terminal line.
 
-**Call relations**: This helper is used when a title does not need agent-specific spans, such as generic waiting or failure messages.
+**Call relations**: Helpers such as `spawn_end`, `waiting_begin`, and `waiting_end` use this when the title does not need a specific agent label.
 
 *Call graph*: calls 1 internal fn (title_spans_line); called by 3 (spawn_end, waiting_begin, waiting_end); 1 external calls (vec!).
 
@@ -2240,11 +2246,11 @@ fn title_with_agent(
 ) -> Line<'static>
 ```
 
-**Purpose**: Builds a bullet-prefixed title line that includes an action prefix, styled agent label, and optional spawn-request details.
+**Purpose**: Creates a styled title line that includes an action, an agent label, and optional spawn settings. This is the standard title builder for agent-specific rows.
 
-**Data flow**: It takes a prefix string, an `AgentLabel`, and optional `SpawnRequestSummary`. It starts with a bold `"<prefix> "` span, extends with `agent_label_spans(agent)`, then with `spawn_request_spans(spawn_request)`, and converts the result through `title_spans_line`.
+**Data flow**: It receives an action prefix, an agent label, and optional spawn request details. It styles the prefix, expands the agent label into spans, appends model/reasoning details if present, and returns one title line.
 
-**Call relations**: This helper is used by most collaboration event formatters to keep agent-bearing titles consistent.
+**Call relations**: Spawn, send-input, wait, close, and resume row builders call this whenever the row is about a particular agent.
 
 *Call graph*: calls 3 internal fn (agent_label_spans, spawn_request_spans, title_spans_line); called by 6 (close_end, interaction_end, resume_begin, resume_end, spawn_end, waiting_begin); 1 external calls (vec!).
 
@@ -2255,11 +2261,11 @@ fn title_with_agent(
 fn title_spans_line(mut spans: Vec<Span<'static>>) -> Line<'static>
 ```
 
-**Purpose**: Prepends the standard dim bullet marker to a title span list and converts it into a `Line`.
+**Purpose**: Adds the standard leading bullet to a set of styled title pieces. This keeps all collaboration event titles visually aligned.
 
-**Data flow**: It takes a mutable vector of title spans, allocates a new vector with one extra slot, pushes `"• ".dim()`, appends the provided spans, and returns the resulting `Line<'static>`.
+**Data flow**: It receives a list of terminal spans. It creates a new list starting with a dim bullet, appends the supplied spans, and returns them as one terminal line.
 
-**Call relations**: This is the final common step used by `sub_agent_activity_title`, `title_text`, and `title_with_agent`.
+**Call relations**: `title_text`, `title_with_agent`, and `sub_agent_activity_title` use this as the last step in creating a title.
 
 *Call graph*: called by 3 (sub_agent_activity_title, title_text, title_with_agent); 2 external calls (from, with_capacity).
 
@@ -2270,11 +2276,11 @@ fn title_spans_line(mut spans: Vec<Span<'static>>) -> Line<'static>
 fn parse_thread_id(thread_id: &str) -> Option<ThreadId>
 ```
 
-**Purpose**: Parses a protocol thread ID string into a typed `ThreadId`.
+**Purpose**: Safely converts a thread id string into the strongly typed thread identifier used by the program. Invalid ids are rejected instead of being displayed as if they were valid.
 
-**Data flow**: It takes `&str`, calls `ThreadId::from_string(thread_id).ok()`, and returns `Option<ThreadId>`.
+**Data flow**: It receives a string. It asks the `ThreadId` parser to read it and returns the parsed id on success or nothing on failure.
 
-**Call relations**: This helper is used where protocol payloads carry thread IDs as strings, notably in `sub_agent_activity_display`.
+**Call relations**: `sub_agent_activity_display` uses this before exposing sub-agent state to the UI. Other rendering helpers also depend on parsed ids when they need metadata for a thread.
 
 *Call graph*: calls 1 internal fn (from_string); called by 1 (sub_agent_activity_display).
 
@@ -2285,11 +2291,11 @@ fn parse_thread_id(thread_id: &str) -> Option<ThreadId>
 fn agent_label(thread_id: ThreadId, metadata: &AgentMetadata) -> AgentLabel<'_>
 ```
 
-**Purpose**: Packages a thread ID and optional metadata references into the internal `AgentLabel` struct used for rendering.
+**Purpose**: Packages a thread id together with optional nickname and role into a lightweight label description. This separates choosing label data from turning it into styled text.
 
-**Data flow**: It takes a `ThreadId` and borrowed `AgentMetadata`, then returns `AgentLabel { thread_id: Some(thread_id), nickname: ..., role: ... }` using `as_deref()` on the optional strings.
+**Data flow**: It receives a thread id and an `AgentMetadata` record. It borrows the nickname and role text if present and returns an `AgentLabel` containing those references plus the id.
 
-**Call relations**: This helper is used by the event-formatting functions before passing labels into `title_with_agent` or `agent_label_line`.
+**Call relations**: Agent-specific row builders call this before passing the label to title or line-formatting helpers.
 
 *Call graph*: called by 6 (close_end, interaction_end, resume_begin, resume_end, spawn_end, waiting_begin).
 
@@ -2300,11 +2306,11 @@ fn agent_label(thread_id: ThreadId, metadata: &AgentMetadata) -> AgentLabel<'_>
 fn agent_label_line(agent: AgentLabel<'_>) -> Line<'static>
 ```
 
-**Purpose**: Converts an `AgentLabel` into a standalone rendered line.
+**Purpose**: Turns an agent label into a full terminal line. This is mainly useful when an agent needs to appear as its own detail row.
 
-**Data flow**: It takes an `AgentLabel`, calls `agent_label_spans(agent)`, and converts the resulting span vector into a `Line<'static>`.
+**Data flow**: It receives an `AgentLabel`. It converts the label into styled spans using `agent_label_spans` and returns those spans as a line.
 
-**Call relations**: This helper is used by `waiting_begin` when listing multiple agents in detail lines.
+**Call relations**: `waiting_begin` uses this style of output when listing multiple agents being waited on.
 
 *Call graph*: calls 1 internal fn (agent_label_spans).
 
@@ -2315,11 +2321,11 @@ fn agent_label_line(agent: AgentLabel<'_>) -> Line<'static>
 fn agent_label_spans(agent: AgentLabel<'_>) -> Vec<Span<'static>>
 ```
 
-**Purpose**: Builds the styled span sequence for an agent label, preferring nickname, then thread ID, then a generic fallback, and optionally appending the role.
+**Purpose**: Turns an agent label into styled pieces of terminal text. It prefers a nickname, falls back to the thread id, and finally to the word `agent` if neither is available.
 
-**Data flow**: It takes an `AgentLabel`, trims and filters empty nickname/role values, then pushes a cyan bold nickname if present, otherwise a cyan thread ID if present, otherwise cyan `agent`. If a role exists it appends a dim space and an unstyled `[role]` span. It returns the span vector.
+**Data flow**: It receives an `AgentLabel`. It trims empty nickname and role text, colors the main name cyan, bolds nicknames, appends a role like `[worker]` when present, and returns the styled spans.
 
-**Call relations**: This is the core label-rendering helper used by both `title_with_agent` and `agent_label_line`.
+**Call relations**: `title_with_agent`, `agent_label_line`, and status detail builders use this so every place names agents the same way.
 
 *Call graph*: called by 2 (agent_label_line, title_with_agent); 3 external calls (from, new, format!).
 
@@ -2330,11 +2336,11 @@ fn agent_label_spans(agent: AgentLabel<'_>) -> Vec<Span<'static>>
 fn spawn_request_spans(spawn_request: Option<&SpawnRequestSummary>) -> Vec<Span<'static>>
 ```
 
-**Purpose**: Formats optional spawn-request model and reasoning-effort details for inclusion in a title line.
+**Purpose**: Formats optional spawn settings for display after an agent name. It shows the model and reasoning effort only when there is meaningful information.
 
-**Data flow**: It takes `Option<&SpawnRequestSummary>`. If absent, or if the trimmed model is empty and reasoning effort equals the default, it returns an empty vector. Otherwise it formats either `(effort)` or `(model effort)`, prefixes it with a dim space span, colors the details magenta, and returns the two-span vector.
+**Data flow**: It receives an optional spawn request summary. If none is present, or if the model is empty and reasoning effort is default, it returns no spans. Otherwise it returns dim spacing plus a magenta detail like `(gpt-5 high)`.
 
-**Call relations**: This helper is used only by `title_with_agent` so spawn rows can show the requested model configuration inline.
+**Call relations**: `title_with_agent` calls this when building a spawn title that may include model settings.
 
 *Call graph*: called by 1 (title_with_agent); 4 external calls (default, new, format!, vec!).
 
@@ -2345,11 +2351,11 @@ fn spawn_request_spans(spawn_request: Option<&SpawnRequestSummary>) -> Vec<Span<
 fn prompt_line(prompt: &str) -> Option<Line<'static>>
 ```
 
-**Purpose**: Turns a prompt string into an optional truncated detail line for history display.
+**Purpose**: Creates a short display line for a prompt or message sent to an agent. It hides empty prompts and shortens long ones so history rows stay readable.
 
-**Data flow**: It trims the input prompt and returns `None` if empty. Otherwise it truncates the text with `truncate_text(..., COLLAB_PROMPT_PREVIEW_GRAPHEMES)`, wraps it in a `Span` and `Line`, and returns `Some(line)`.
+**Data flow**: It receives prompt text. It trims whitespace, returns nothing if the prompt is empty, or truncates it to the configured preview length and returns it as a terminal line.
 
-**Call relations**: This helper is used by `spawn_end` and `interaction_end` to attach prompt previews only when meaningful text exists.
+**Call relations**: `spawn_end` and `interaction_end` call this when adding prompt previews below their titles.
 
 *Call graph*: calls 1 internal fn (truncate_text); called by 2 (interaction_end, spawn_end); 2 external calls (from, from).
 
@@ -2364,11 +2370,11 @@ fn wait_complete_lines(
 ) -
 ```
 
-**Purpose**: Builds the per-agent status detail lines shown after a wait operation completes.
+**Purpose**: Builds the per-agent detail lines shown after waiting finishes. It lists known receiver agents first and then any extra agent states in a stable order.
 
-**Data flow**: Inputs are receiver thread ID strings, the `agents_states` map, and a metadata lookup closure. It parses receiver IDs, looks up matching states, tracks seen IDs in a `HashSet`, then collects extra states not listed among receivers, sorts those extras by thread ID string, and appends them. If no entries remain it returns a single `No agents completed yet` line; otherwise it renders each entry as `agent_label: status_summary_spans(status)`.
+**Data flow**: It receives receiver thread id strings, a map from thread ids to agent states, and a metadata lookup. It parses ids, matches them with statuses, fetches display names, formats each status, and returns lines; if none are available, it returns `No agents completed yet`.
 
-**Call relations**: This helper is called by `waiting_end` and encapsulates the deduplication, ordering, and status formatting for completed waits.
+**Call relations**: `waiting_end` calls this to create the body of the finished-waiting history cell. It uses label and status summary helpers so each line reads like `Robie: Completed - result`.
 
 *Call graph*: called by 1 (waiting_end); 2 external calls (new, vec!).
 
@@ -2382,11 +2388,11 @@ fn first_agent_state(
 ) -> Option<&'a CollabAgentState>
 ```
 
-**Purpose**: Selects the most relevant agent state for single-target resume completion, preferring receiver order and falling back to the lexicographically smallest available state entry.
+**Purpose**: Finds the best available agent state when only one status line is needed. It prefers the first requested receiver, then falls back to the first state by id.
 
-**Data flow**: It takes receiver thread ID strings and the `agents_states` map. It first searches receiver IDs in order for a matching state; if none match, it picks the minimum map key and returns that state reference. The result is `Option<&CollabAgentState>`.
+**Data flow**: It receives the receiver thread ids and the map of agent states. It looks for a state belonging to one of the requested ids in order, otherwise picks the lowest id in the map. It returns a borrowed state or nothing.
 
-**Call relations**: This helper is used by `tool_call_history_cell` before calling `resume_end`.
+**Call relations**: Resume completion rendering uses this idea to choose which status should explain the result of a resume attempt.
 
 
 ##### `status_summary_line`  (lines 614–619)
@@ -2395,11 +2401,11 @@ fn first_agent_state(
 fn status_summary_line(status: Option<&CollabAgentState>, fallback_error: &str) -> Line<'static>
 ```
 
-**Purpose**: Converts an optional agent state into a rendered status line, using a fallback error when no state is available.
+**Purpose**: Turns an optional agent state into one display line. If no state exists, it shows a fallback error instead.
 
-**Data flow**: It takes `Option<&CollabAgentState>` and a fallback error string. If a state exists it converts `status_summary_spans(status)` into a line; otherwise it converts `error_summary_spans(fallback_error)` into a line.
+**Data flow**: It receives an optional state and fallback error text. With a state, it delegates to `status_summary_spans`; without one, it delegates to `error_summary_spans`. It returns the resulting spans as a line.
 
-**Call relations**: This helper is used by `resume_end` to produce its single detail line.
+**Call relations**: `resume_end` uses this to add the outcome line under a resumed-agent title.
 
 *Call graph*: calls 2 internal fn (error_summary_spans, status_summary_spans).
 
@@ -2410,11 +2416,11 @@ fn status_summary_line(status: Option<&CollabAgentState>, fallback_error: &str) 
 fn status_summary_spans(status: &CollabAgentState) -> Vec<Span<'static>>
 ```
 
-**Purpose**: Formats a `CollabAgentState` into styled status spans, including truncated message previews for completed and errored states.
+**Purpose**: Formats an agent's current status as styled terminal text. It gives each state a clear word such as running, completed, interrupted, or not found, and may include a short message preview.
 
-**Data flow**: It matches `status.status`: pending init becomes cyan `Pending init`, running becomes cyan bold `Running`, interrupted becomes yellow `Interrupted`, completed becomes green `Completed` plus an optional dim separator and truncated normalized message preview, errored delegates to `error_summary_spans`, shutdown becomes plain `Shutdown`, and not found becomes red `Not found`. It returns a span vector.
+**Data flow**: It receives an agent state. It matches the status value, chooses wording and color, normalizes and truncates any message where appropriate, and returns styled spans.
 
-**Call relations**: This helper is used by `status_summary_line` and indirectly by wait-completion rendering to keep status formatting consistent.
+**Call relations**: `status_summary_line` and finished-wait detail rendering use this to explain agent outcomes consistently. It calls `error_summary_spans` when the state is errored.
 
 *Call graph*: calls 2 internal fn (error_summary_spans, truncate_text); called by 1 (status_summary_line); 2 external calls (from, vec!).
 
@@ -2425,11 +2431,11 @@ fn status_summary_spans(status: &CollabAgentState) -> Vec<Span<'static>>
 fn error_summary_spans(error: &str) -> Vec<Span<'static>>
 ```
 
-**Purpose**: Formats an error label and optional truncated error preview into styled spans.
+**Purpose**: Formats an error as short styled terminal text. It marks the word `Error` in red and appends a compact preview of the error message if one exists.
 
-**Data flow**: It takes an error string, starts with red `Error`, normalizes whitespace and truncates the message with `truncate_text(..., COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES)`, and if non-empty appends a dim separator plus the preview. It returns the span vector.
+**Data flow**: It receives an error string. It collapses whitespace, truncates the preview to the configured length, and returns red error text plus optional message spans.
 
-**Call relations**: This helper is used directly by `status_summary_line` and by `status_summary_spans` for errored agent states.
+**Call relations**: `status_summary_line` uses this when there is no agent state, and `status_summary_spans` uses it for errored agent states.
 
 *Call graph*: calls 1 internal fn (truncate_text); called by 2 (status_summary_line, status_summary_spans); 2 external calls (from, vec!).
 
@@ -2440,11 +2446,11 @@ fn error_summary_spans(error: &str) -> Vec<Span<'static>>
 fn collab_events_snapshot()
 ```
 
-**Purpose**: Builds a representative sequence of collaboration tool-call cells and snapshots their rendered text.
+**Purpose**: Checks that a typical sequence of collaboration events renders exactly as expected. It covers spawning, sending input, waiting, finishing with mixed results, and closing.
 
-**Data flow**: The test constructs several `ThreadItem::CollabAgentToolCall` values for spawn, send-input, wait begin, wait end, and close; renders each through `tool_call_history_cell`; converts the resulting cells to plain text with local helpers; joins them; and snapshots the transcript.
+**Data flow**: It builds fake thread ids, fake tool-call history items, and metadata. It passes them through `tool_call_history_cell`, converts the cells to plain text, and compares the result to a stored snapshot.
 
-**Call relations**: It exercises the main dispatcher and most event-formatting helpers across realistic multi-agent scenarios.
+**Call relations**: This test protects the transcript wording and layout produced by the main rendering path. If a helper changes the visible output, the snapshot will reveal it.
 
 *Call graph*: calls 2 internal fn (from_string, tool_call_history_cell); 5 external calls (from, new, assert_snapshot!, agent_state, vec!).
 
@@ -2455,11 +2461,11 @@ fn collab_events_snapshot()
 fn agent_shortcut_matches_option_arrow_word_motion_fallbacks_only_when_allowed()
 ```
 
-**Purpose**: On macOS, verifies that canonical Alt-arrow shortcuts always match and Option-b/f fallbacks only match when explicitly allowed.
+**Purpose**: On macOS, checks that agent-switch shortcuts recognize both Option-arrow and the Option-b/f fallback only when allowed. This prevents shortcut support from breaking normal text editing.
 
-**Data flow**: The test creates several `KeyEvent`s and asserts the boolean results of `previous_agent_shortcut_matches` and `next_agent_shortcut_matches` under both allowed and disallowed fallback settings.
+**Data flow**: It creates several key events and passes them to the previous/next shortcut matchers with fallback enabled or disabled. It asserts which ones should match and which ones should not.
 
-**Call relations**: It covers the platform-specific fallback logic behind the shortcut-matching helpers.
+**Call relations**: This test exercises `previous_agent_shortcut_matches` and `next_agent_shortcut_matches`, especially their platform fallback behavior.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2470,11 +2476,11 @@ fn agent_shortcut_matches_option_arrow_word_motion_fallbacks_only_when_allowed()
 fn agent_shortcut_matches_option_arrows_only()
 ```
 
-**Purpose**: On non-macOS platforms, verifies that only Alt-arrow shortcuts match and Alt-b/f do not.
+**Purpose**: On non-macOS systems, checks that only the normal Alt-arrow shortcuts switch agents. The word-motion fallback is expected to stay disabled there.
 
-**Data flow**: The test constructs Alt-left, Alt-right, Alt-b, and Alt-f events and asserts the expected results from the shortcut-matching helpers.
+**Data flow**: It creates Alt-left, Alt-right, Alt-b, and Alt-f key events. It sends them through the shortcut matchers and asserts that only the arrow events match.
 
-**Call relations**: It validates the non-macOS stub implementations of the word-motion fallback helpers.
+**Call relations**: This test protects the non-macOS behavior of the previous and next shortcut matchers.
 
 *Call graph*: 1 external calls (assert!).
 
@@ -2485,11 +2491,11 @@ fn agent_shortcut_matches_option_arrows_only()
 fn title_styles_nickname_and_role()
 ```
 
-**Purpose**: Checks that rendered title spans apply the expected styling to agent nickname, role, and spawn-request details.
+**Purpose**: Checks that an agent title is styled correctly when both nickname, role, model, and reasoning effort are present. This catches subtle visual regressions, not just text changes.
 
-**Data flow**: The test renders a spawn tool-call cell through `tool_call_history_cell`, inspects the first display line's spans, and asserts exact content and style properties such as cyan bold nickname, plain role text, and magenta model/effort details.
+**Data flow**: It builds a spawn event with metadata for an agent named Robie. It renders the history cell, inspects the title spans, and asserts the expected text, colors, and bold styling.
 
-**Call relations**: It exercises `title_with_agent`, `agent_label_spans`, and `spawn_request_spans` through the main history-cell path.
+**Call relations**: This test goes through `tool_call_history_cell` and indirectly checks helpers such as `title_with_agent`, `agent_label_spans`, and `spawn_request_spans`.
 
 *Call graph*: calls 2 internal fn (from_string, tool_call_history_cell); 6 external calls (from, new, assert!, assert_eq!, agent_state, vec!).
 
@@ -2500,11 +2506,11 @@ fn title_styles_nickname_and_role()
 fn collab_resume_interrupted_snapshot()
 ```
 
-**Purpose**: Snapshots the rendered output for a completed resume action whose resulting agent state is interrupted.
+**Purpose**: Checks the transcript output for a resume event where the agent ends up interrupted. This locks down the wording for an important edge case.
 
-**Data flow**: The test constructs a resume `ThreadItem`, renders it with `tool_call_history_cell`, converts the cell to text, and snapshots the result.
+**Data flow**: It builds a completed resume tool-call item with an interrupted agent state. It renders it through `tool_call_history_cell` and compares the text output to a stored snapshot.
 
-**Call relations**: It specifically covers the `ResumeAgent` completed path and interrupted-status formatting.
+**Call relations**: This test covers the resume-completion branch and the interrupted status formatting used by `status_summary_spans`.
 
 *Call graph*: calls 2 internal fn (from_string, tool_call_history_cell); 4 external calls (from, assert_snapshot!, agent_state, vec!).
 
@@ -2515,11 +2521,11 @@ fn collab_resume_interrupted_snapshot()
 fn agent_state(status: CollabAgentStatus, message: Option<&str>) -> CollabAgentState
 ```
 
-**Purpose**: Creates a `CollabAgentState` test fixture from a status and optional message.
+**Purpose**: Creates a small fake agent state for tests. It keeps the test setup shorter and easier to read.
 
-**Data flow**: It takes a `CollabAgentStatus` and optional `&str`, converts the message to `Option<String>`, and returns the populated `CollabAgentState`.
+**Data flow**: It receives a status and optional message string. It copies the message into an owned string when present and returns a `CollabAgentState`.
 
-**Call relations**: This helper is used by the collaboration rendering tests to build concise fixture data.
+**Call relations**: The snapshot and styling tests call this whenever they need a realistic agent state without repeating struct construction.
 
 
 ##### `tests::metadata_for`  (lines 922–936)
@@ -2528,11 +2534,11 @@ fn agent_state(status: CollabAgentStatus, message: Option<&str>) -> CollabAgentS
 fn metadata_for(thread_id: ThreadId, robie_id: ThreadId, bob_id: ThreadId) -> AgentMetadata
 ```
 
-**Purpose**: Returns deterministic test metadata for known thread IDs and default metadata for others.
+**Purpose**: Provides predictable fake nicknames and roles for test thread ids. This lets tests verify rendered labels such as `Robie [explorer]` and `Bob [worker]`.
 
-**Data flow**: It compares the input `thread_id` against two fixture IDs and returns `AgentMetadata` with nickname/role for Robie or Bob, otherwise `AgentMetadata::default()`.
+**Data flow**: It receives a thread id plus the known ids for Robie and Bob. It returns matching metadata for those ids, or empty default metadata for any other id.
 
-**Call relations**: This helper is passed as the metadata lookup closure in tests that render collaboration history cells.
+**Call relations**: Tests pass this as the metadata lookup function to `tool_call_history_cell`, mimicking how the real app supplies agent display names.
 
 *Call graph*: 1 external calls (default).
 
@@ -2543,11 +2549,11 @@ fn metadata_for(thread_id: ThreadId, robie_id: ThreadId, bob_id: ThreadId) -> Ag
 fn cell_to_text(cell: &PlainHistoryCell) -> String
 ```
 
-**Purpose**: Converts a `PlainHistoryCell` into newline-joined plain text for snapshot assertions.
+**Purpose**: Converts a rendered history cell into plain text for snapshot comparisons. It removes styling so tests can focus on the visible words and layout.
 
-**Data flow**: It calls `cell.display_lines(200)`, maps each line through `line_to_text`, collects the strings, joins them with newlines, and returns the result.
+**Data flow**: It receives a `PlainHistoryCell`. It asks the cell for display lines at a wide test width, converts each line to text, joins them with newlines, and returns the string.
 
-**Call relations**: This helper is used by snapshot tests to compare rendered collaboration cells without style metadata.
+**Call relations**: Snapshot tests use this after rendering cells through the production helpers.
 
 *Call graph*: calls 1 internal fn (display_lines).
 
@@ -2558,20 +2564,22 @@ fn cell_to_text(cell: &PlainHistoryCell) -> String
 fn line_to_text(line: &Line<'static>) -> String
 ```
 
-**Purpose**: Flattens a styled `Line<'static>` into its concatenated textual content.
+**Purpose**: Converts one styled terminal line into plain text. It is a small test helper for stripping colors and styles away.
 
-**Data flow**: It iterates the line's spans, extracts each span's `content`, collects them into a vector, joins them, and returns the resulting string.
+**Data flow**: It receives a terminal line made of spans. It reads each span's text content, joins the pieces together, and returns the resulting string.
 
-**Call relations**: This helper supports `cell_to_text` in the collaboration rendering tests.
+**Call relations**: `tests::cell_to_text` calls this for each line before snapshot comparison.
 
 
 ### `tui/src/pager_overlay.rs`
 
-`domain_logic` · `overlay display and transcript browsing`
+`domain_logic` · `during TUI overlay display, draw, resize, and key-event handling`
 
-This module provides two overlay types behind a common `Overlay` enum: `TranscriptOverlay` for transcript history plus optional live in-flight output, and `StaticOverlay` for arbitrary static lines or renderables. Both are built on `PagerView`, which owns a list of `Renderable` chunks, scroll state, title, pager keymap, cached content-height metadata, and an optional pending chunk to scroll into view after wrapping is known. `PagerView::render` draws a dim slash-style header, computes the content area, clamps scroll offset, renders only visible chunks (including partial top chunks via `render_offset_content`), fills unused rows with `~`, and draws a bottom bar with scroll percentage.
+This module is the terminal UI’s “reading room.” When the normal chat view is too small for a full transcript, help text, or another long block of content, this file draws an alternate full-screen overlay with a title, scrollable body, progress indicator, and key hints. Without it, users would be stuck with only the main viewport and could not reliably inspect long conversation history or static pages.
 
-Transcript rendering wraps each `HistoryCell` in `CellRenderable`, preserving semantic hyperlinks by rendering `HyperlinkLine`s and then calling `mark_buffer_hyperlinks`. User cells receive `user_message_style`, optionally reversed when highlighted. To avoid repeated height recomputation, chunks are wrapped in `CachedRenderable`. `TranscriptOverlay` maintains committed cells separately from the optional live tail; the tail is represented as one extra renderable appended after committed cells and is rebuilt only when a `LiveTailKey` changes. That key includes width, active-cell revision, stream-continuation spacing, and optional animation tick, so Ctrl+T can stay synchronized with in-place streaming updates without recomputing on every draw. Insert, replace, and consolidate operations preserve bottom-follow behavior and remap highlighted cell indices carefully. Footer hints are rendered from the pager keymap and change when a cell is highlighted to advertise edit navigation.
+The core piece is `PagerView`, a reusable scrollable page. It knows how tall its content is, draws only the visible part, clamps scrolling so it does not wander past the end, and shows a bottom percentage like a document viewer. Content is supplied as `Renderable` objects, meaning small pieces that know how to draw themselves and report their height.
+
+`TranscriptOverlay` uses that pager for conversation history. It renders committed history cells and can append a temporary “live tail” for the message or command still streaming. That live tail is cached, like keeping a sticky note instead of rewriting it every frame, and is rebuilt only when width, revision, continuation state, or animation tick changes. `StaticOverlay` is the simpler version for fixed text or fixed renderable blocks. The file also includes tests that check scrolling, hints, wrapping, hyperlinks, and keeping the transcript synchronized when history changes.
 
 #### Function details
 
@@ -2581,11 +2589,11 @@ Transcript rendering wraps each `HistoryCell` in `CellRenderable`, preserving se
 fn new_transcript(cells: Vec<Arc<dyn HistoryCell>>, keymap: PagerKeymap) -> Self
 ```
 
-**Purpose**: Constructs an `Overlay::Transcript` from committed history cells and a pager keymap. It is the enum-level constructor for transcript overlays.
+**Purpose**: Creates an overlay that shows the conversation transcript in a scrollable full-screen pager. It is used when the app wants to open the transcript view with the current saved history.
 
-**Data flow**: Takes a `Vec<Arc<dyn HistoryCell>>` and `PagerKeymap`, creates `TranscriptOverlay::new(cells, keymap)`, wraps it in `Overlay::Transcript`, and returns it. It does not mutate external state.
+**Data flow**: It receives committed history cells and a pager keymap. It passes them into `TranscriptOverlay::new`, wraps the result as the transcript variant of `Overlay`, and returns that ready-to-use overlay.
 
-**Call relations**: Called by higher-level app code when opening transcript overlays. It delegates all transcript-specific setup to `TranscriptOverlay::new`.
+**Call relations**: Higher-level app flows call this when opening or restoring the transcript overlay. It hands construction to `TranscriptOverlay::new`, so callers can work with the general `Overlay` enum instead of knowing the exact overlay type.
 
 *Call graph*: calls 1 internal fn (new); called by 5 (handle_key_event, clear_only_ui_reset_preserves_chat_session_state, queued_rollback_syncs_overlay_and_clears_deferred_history, open_transcript_overlay, open_pending_transcript_if_ready); 1 external calls (Transcript).
 
@@ -2600,11 +2608,11 @@ fn new_static_with_lines(
     ) -> Self
 ```
 
-**Purpose**: Constructs an `Overlay::Static` from plain lines and a title. It is the convenience constructor for simple static pager content.
+**Purpose**: Creates a scrollable overlay for fixed text lines, such as help or informational content. It gives static content the same pager behavior as the transcript view.
 
-**Data flow**: Accepts `Vec<Line<'static>>`, a title string, and a keymap, creates `StaticOverlay::with_title`, wraps it in `Overlay::Static`, and returns it. It has no side effects.
+**Data flow**: It receives already-built terminal text lines, a title, and key bindings. It asks `StaticOverlay::with_title` to build the page, wraps it as the static variant, and returns it.
 
-**Call relations**: Used by callers that want a pager overlay without building custom renderables.
+**Call relations**: Event-handling code uses this when it needs to show simple fixed text. It delegates the real setup to `StaticOverlay::with_title` and exposes the result through the shared `Overlay` type.
 
 *Call graph*: calls 1 internal fn (with_title); called by 1 (handle_event); 1 external calls (Static).
 
@@ -2619,11 +2627,11 @@ fn new_static_with_renderables(
     ) -> Self
 ```
 
-**Purpose**: Constructs an `Overlay::Static` from arbitrary renderables and a title. It is the flexible constructor for static overlays.
+**Purpose**: Creates a static overlay from drawable content blocks instead of plain text lines. This is useful when the page is made from richer widgets that already know how to render themselves.
 
-**Data flow**: Takes a vector of boxed renderables, title, and keymap, creates `StaticOverlay::with_renderables`, wraps it in `Overlay::Static`, and returns it. It writes no state.
+**Data flow**: It receives a list of renderable blocks, a title, and key bindings. It builds a `StaticOverlay` from those blocks and returns it as an `Overlay`.
 
-**Call relations**: Used by callers that already have custom renderable chunks to page through.
+**Call relations**: Callers that already have renderable widgets use this path. It forwards setup to `StaticOverlay::with_renderables`, then lets the rest of the app treat the result like any other overlay.
 
 *Call graph*: calls 1 internal fn (with_renderables); called by 1 (handle_event); 1 external calls (Static).
 
@@ -2634,11 +2642,11 @@ fn new_static_with_renderables(
 fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()>
 ```
 
-**Purpose**: Dispatches an overlay event to the concrete transcript or static overlay implementation. It is the enum-level event adapter.
+**Purpose**: Routes keyboard, draw, resize, and other terminal events to the active overlay type. This keeps the app from needing separate event code for transcript and static overlays.
 
-**Data flow**: Matches `self` and forwards the mutable `Tui` and `TuiEvent` to the contained overlay's `handle_event`, returning that `Result<()>`. It mutates only the delegated overlay.
+**Data flow**: It receives a mutable overlay, the TUI object, and an event. It checks which overlay variant is active, passes the event to that overlay’s own handler, and returns any I/O error from drawing.
 
-**Call relations**: Called by higher-level app code while an overlay is active.
+**Call relations**: The main TUI loop calls this whenever an overlay is open. It dispatches to either `TranscriptOverlay::handle_event` or `StaticOverlay::handle_event`, which then decide whether to scroll, draw, or close.
 
 
 ##### `Overlay::is_done`  (lines 86–91)
@@ -2647,11 +2655,11 @@ fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()>
 fn is_done(&self) -> bool
 ```
 
-**Purpose**: Reports whether the active overlay has been closed. It hides the distinction between transcript and static overlays.
+**Purpose**: Reports whether the current overlay has been closed by the user. The app uses this to know when to leave the alternate screen and return to the normal chat view.
 
-**Data flow**: Matches `self` and returns the contained overlay's `is_done()` boolean. It has no side effects.
+**Data flow**: It reads the active overlay variant and asks that overlay for its `is_done` flag. It returns true when the overlay should be dismissed, otherwise false.
 
-**Call relations**: Used by overlay-driving code to know when to dismiss the alternate-screen view.
+**Call relations**: After events are handled, the outer UI can call this shared method without caring whether the overlay is transcript or static. It delegates to the matching overlay’s `is_done` method.
 
 
 ##### `first_or_empty`  (lines 94–96)
@@ -2660,11 +2668,11 @@ fn is_done(&self) -> bool
 fn first_or_empty(bindings: &[KeyBinding]) -> Vec<KeyBinding>
 ```
 
-**Purpose**: Returns a one-element vector containing the first key binding from a slice, or an empty vector if the slice is empty. It simplifies footer-hint assembly.
+**Purpose**: Picks the first key binding from a list, or returns no key if the list is empty. This keeps footer hints short instead of showing every possible shortcut.
 
-**Data flow**: Reads `bindings.first()`, copies it if present, converts the optional item into an iterator, collects into `Vec<KeyBinding>`, and returns it. It writes no state.
+**Data flow**: It receives a slice of key bindings. It copies the first binding if one exists, puts it in a one-item vector, or returns an empty vector if there is no binding.
 
-**Call relations**: Used by both transcript and static footer-hint renderers to show only the primary binding for each action.
+**Call relations**: Both overlay hint renderers call this while building the footer. The result is then passed to `render_key_hints` to draw compact instructions.
 
 *Call graph*: called by 2 (render_hints, render_hints); 1 external calls (first).
 
@@ -2675,11 +2683,11 @@ fn first_or_empty(bindings: &[KeyBinding]) -> Vec<KeyBinding>
 fn render_key_hints(area: Rect, buf: &mut Buffer, pairs: &[(Vec<KeyBinding>, &str)])
 ```
 
-**Purpose**: Renders one dim footer line of key hints from `(keys, description)` pairs. It formats multiple keys with `/` separators and spaces between hint groups.
+**Purpose**: Draws one footer line of shortcut hints, such as keys for scrolling or quitting. It turns key-and-description pairs into readable dim text.
 
-**Data flow**: Builds a `Vec<Span>` starting with a leading space, appends each key binding and description pair with separators, wraps the spans in a single `Line`, and renders a dim `Paragraph` into the provided buffer area. It writes only to the render buffer.
+**Data flow**: It receives a screen rectangle, a buffer to draw into, and pairs of key bindings plus labels. It builds styled spans with spacing between groups, then renders them as one paragraph line into the buffer.
 
-**Call relations**: Called by `TranscriptOverlay::render_hints` and `StaticOverlay::render_hints` to draw their two-line footer help.
+**Call relations**: `TranscriptOverlay::render_hints` and `StaticOverlay::render_hints` use this as their shared hint drawer. It relies on the key binding display formatting and the terminal paragraph widget to do the actual drawing.
 
 *Call graph*: called by 2 (render_hints, render_hints); 3 external calls (new, from, vec!).
 
@@ -2695,11 +2703,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs the shared pager state for an overlay, including renderables, title, initial scroll offset, and keymap. It initializes all cached layout metadata as unknown.
+**Purpose**: Creates the reusable scrollable pager state. It stores the content blocks, title, initial scroll position, and keys used for navigation.
 
-**Data flow**: Stores the provided renderables, title, scroll offset, and keymap, and initializes `last_content_height`, `last_rendered_height`, and `pending_scroll_chunk` to `None`. It returns the new `PagerView`.
+**Data flow**: It receives renderables, a title, a starting scroll offset, and a keymap. It packages them with empty cached layout information and no pending scroll target, then returns the pager view.
 
-**Call relations**: Used by both overlay types and by tests that exercise pager behavior directly.
+**Call relations**: `TranscriptOverlay::new`, `StaticOverlay::with_renderables`, and test helpers call this to create a pager. Later draw and key-event methods use the stored state.
 
 *Call graph*: called by 3 (with_renderables, new, pager_view).
 
@@ -2710,11 +2718,11 @@ fn new(
 fn content_height(&self, width: u16) -> usize
 ```
 
-**Purpose**: Computes the total wrapped content height of all renderable chunks at a given width. This is the basis for scroll clamping and percentage display.
+**Purpose**: Calculates how many terminal rows all content needs at a given width. This matters because wrapping changes height when the terminal gets narrower or wider.
 
-**Data flow**: Iterates `self.renderables`, calls each chunk's `desired_height(width)`, sums the results as `usize`, and returns the total. It does not mutate state.
+**Data flow**: It receives a width. It asks each renderable how tall it wants to be at that width, adds those heights together, and returns the total.
 
-**Call relations**: Called during `PagerView::render` after the content area width is known.
+**Call relations**: `PagerView::render` calls this before drawing so it can clamp scrolling and compute the bottom progress indicator.
 
 *Call graph*: called by 1 (render).
 
@@ -2725,11 +2733,11 @@ fn content_height(&self, width: u16) -> usize
 fn render(&mut self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the full pager view: clear, header, scrollable content, and bottom bar. It also updates cached layout metadata and satisfies any pending scroll-to-chunk request once wrapping is known.
+**Purpose**: Draws the whole pager: clears the area, paints the title, draws visible content, and shows the bottom progress bar. It also resolves any pending request to scroll a chosen content chunk into view.
 
-**Data flow**: Clears the area, renders the header, computes the content area, stores its height via `update_last_content_height`, computes total content height, stores it in `last_rendered_height`, optionally calls `ensure_chunk_visible` for `pending_scroll_chunk`, clamps `scroll_offset` against the maximum scrollable range, renders visible content, and finally renders the bottom bar. It writes to the buffer and mutates pager scroll/cache fields.
+**Data flow**: It receives a screen rectangle and output buffer. It clears the rectangle, computes the content area, updates layout caches, adjusts scroll position, draws content, and writes the bottom bar.
 
-**Call relations**: Called by both `TranscriptOverlay::render` and `StaticOverlay::render`. It is the core rendering engine shared by all pager overlays.
+**Call relations**: `TranscriptOverlay::render` and `StaticOverlay::render` call this for the main upper part of their overlays. Internally it coordinates `render_header`, `content_area`, `content_height`, `ensure_chunk_visible`, `render_content`, and `render_bottom_bar`.
 
 *Call graph*: calls 7 internal fn (content_area, content_height, ensure_chunk_visible, render_bottom_bar, render_content, render_header, update_last_content_height); called by 2 (render, render).
 
@@ -2740,11 +2748,11 @@ fn render(&mut self, area: Rect, buf: &mut Buffer)
 fn render_header(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Draws the dim slash-style header line containing the pager title. It gives overlays a consistent visual chrome.
+**Purpose**: Draws the pager’s title line. It gives the overlay a visible header so the user knows what screen they are reading.
 
-**Data flow**: Renders a repeated `/ ` pattern dimmed across the width, then formats `/ {title}` and renders it dimmed over the same area. It writes only to the buffer.
+**Data flow**: It receives the full area and buffer. It writes a dim slash pattern across the line, then writes the title over it.
 
-**Call relations**: Called internally by `PagerView::render` before content rendering.
+**Call relations**: `PagerView::render` calls this at the start of each draw. It only paints the header; the body and footer are handled by other pager methods.
 
 *Call graph*: called by 1 (render); 2 external calls (from, format!).
 
@@ -2755,11 +2763,11 @@ fn render_header(&self, area: Rect, buf: &mut Buffer)
 fn render_content(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Draws the visible portion of the scrollable renderable chunks and fills any remaining rows with `~` markers. It supports partially visible top chunks by rendering into a temporary buffer and copying from an offset.
+**Purpose**: Draws just the currently visible slice of the scrollable content. It skips content above the viewport and stops when content is below it, which avoids unnecessary drawing.
 
-**Data flow**: Uses `scroll_offset` to track a virtual y-position across `self.renderables`, skips chunks entirely above the viewport, stops after chunks entirely below it, renders partially clipped top chunks via `render_offset_content`, renders fully visible chunks directly, tracks the lowest drawn row, and fills the rest of the content area with a leading `~` and spaces. It writes to the buffer but does not change pager state.
+**Data flow**: It receives the content area and buffer. It walks through renderable blocks, compares each block’s vertical position with the current scroll offset, draws visible blocks directly or through an offset buffer, and fills leftover empty rows with a `~` marker.
 
-**Call relations**: Called by `PagerView::render` after scroll clamping. It delegates partial-chunk rendering to `render_offset_content`.
+**Call relations**: `PagerView::render` calls this after scroll position is settled. If a renderable starts above the visible area, it calls `render_offset_content` to copy only the visible lower part.
 
 *Call graph*: calls 1 internal fn (render_offset_content); called by 1 (render); 4 external calls (from, bottom, new, right).
 
@@ -2776,11 +2784,11 @@ fn render_bottom_bar(
     )
 ```
 
-**Purpose**: Draws the separator line below content and the current scroll percentage. The percentage is based on the current offset relative to the maximum scroll range.
+**Purpose**: Draws the separator line and scroll percentage at the bottom of the pager. This tells users how far through the content they are.
 
-**Data flow**: Computes the separator row from `content_area.bottom()`, renders a dim horizontal rule, calculates percentage as 100 for empty or fully fitting content or as rounded offset/max-scroll otherwise, formats ` {percent}% `, and renders it near the right edge. It writes only to the buffer.
+**Data flow**: It receives the full overlay area, the content area, the output buffer, and total content height. It draws a dim horizontal line, calculates percent based on scroll offset versus maximum scroll, and writes that percent near the right edge.
 
-**Call relations**: Called by `PagerView::render` after content rendering.
+**Call relations**: `PagerView::render` calls this after content rendering. It uses the same height calculations that keep scrolling bounded, so the progress display matches what the user sees.
 
 *Call graph*: called by 1 (render); 4 external calls (bottom, new, from, format!).
 
@@ -2791,11 +2799,11 @@ fn render_bottom_bar(
 fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) -> Result<()>
 ```
 
-**Purpose**: Processes pager navigation keys for line scrolling, page scrolling, half-page scrolling, and jumps to top or bottom. It updates scroll offset and schedules a redraw when a recognized key is handled.
+**Purpose**: Applies pager navigation keys such as up, down, page up, page down, half-page moves, top, and bottom. It lets both overlay types share the same scrolling behavior.
 
-**Data flow**: Matches the incoming `KeyEvent` against the configured pager keymap, mutates `scroll_offset` accordingly using `page_height` or `content_area` where needed, and schedules a frame on the provided `Tui`'s frame requester when a navigation action occurs. It returns `Ok(())` whether or not a key matched.
+**Data flow**: It receives the TUI object and a key event. If the key matches a navigation binding, it changes `scroll_offset` safely and schedules another frame; if not, it leaves state unchanged.
 
-**Call relations**: Called by both `TranscriptOverlay::handle_event` and `StaticOverlay::handle_event` for non-close key events. It is the shared input engine for pager navigation.
+**Call relations**: Both `TranscriptOverlay::handle_event` and `StaticOverlay::handle_event` pass unhandled keys here. It calls `page_height` and `content_area` when a key needs a viewport-sized movement, then asks the TUI frame requester to redraw.
 
 *Call graph*: calls 2 internal fn (content_area, page_height); called by 2 (handle_event, handle_event); 1 external calls (frame_requester).
 
@@ -2806,11 +2814,11 @@ fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) -> Resul
 fn page_height(&self, viewport_area: Rect) -> usize
 ```
 
-**Purpose**: Returns the effective content-page height used for page-up/page-down operations. It prefers the last rendered content height so paging matches the actual chrome-adjusted viewport.
+**Purpose**: Returns how many content rows count as one page jump. It prefers the last real rendered height so page movement lines up with what was actually visible.
 
-**Data flow**: Reads `last_content_height` and returns it if present; otherwise computes `self.content_area(viewport_area).height as usize`. It does not mutate state.
+**Data flow**: It receives the terminal viewport area. It returns the cached content-area height if available, otherwise computes the content area from the viewport and returns that height.
 
-**Call relations**: Used by `PagerView::handle_key_event` for page-up and page-down calculations.
+**Call relations**: `PagerView::handle_key_event` calls this for page-up and page-down keys. This helps paging stay continuous after the pager has been drawn once.
 
 *Call graph*: called by 1 (handle_key_event).
 
@@ -2821,11 +2829,11 @@ fn page_height(&self, viewport_area: Rect) -> usize
 fn update_last_content_height(&mut self, height: u16)
 ```
 
-**Purpose**: Stores the most recently rendered content-area height. This cached value is later used for paging and bottom-follow calculations.
+**Purpose**: Stores the most recent visible content height. This cache lets later key presses know how big a page is.
 
-**Data flow**: Writes `Some(height as usize)` into `last_content_height`. It returns nothing.
+**Data flow**: It receives a height in terminal rows and saves it as `last_content_height`.
 
-**Call relations**: Called from `PagerView::render` once the content area has been computed.
+**Call relations**: `PagerView::render` calls this every draw after calculating the content area. `page_height` later reads the stored value.
 
 *Call graph*: called by 1 (render).
 
@@ -2836,11 +2844,11 @@ fn update_last_content_height(&mut self, height: u16)
 fn content_area(&self, area: Rect) -> Rect
 ```
 
-**Purpose**: Computes the inner scrollable area by removing one row for the header and one row for the bottom bar separator/footer chrome. It standardizes pager layout geometry.
+**Purpose**: Calculates the rectangle where scrollable content should be drawn. It reserves one row for the header and one row for the bottom bar.
 
-**Data flow**: Takes a `Rect`, increments `y` by 1, subtracts 2 from `height` with saturation, and returns the adjusted rectangle. It does not mutate pager state.
+**Data flow**: It receives the full pager area. It moves the top down by one row and reduces height by two rows, using saturating arithmetic so tiny areas do not underflow.
 
-**Call relations**: Used by rendering and key handling whenever pager logic needs the actual scrollable viewport.
+**Call relations**: `PagerView::render` uses this for layout, and `PagerView::handle_key_event` uses it to compute half-page movement.
 
 *Call graph*: called by 2 (handle_key_event, render).
 
@@ -2851,11 +2859,11 @@ fn content_area(&self, area: Rect) -> Rect
 fn is_scrolled_to_bottom(&self) -> bool
 ```
 
-**Purpose**: Reports whether the pager is effectively pinned to the bottom, accounting for the special `usize::MAX` sentinel and wrapped content height. This supports follow-along behavior for transcript updates.
+**Purpose**: Tells whether the pager is currently following the end of the content. This is important for transcript behavior: if the user is at the bottom, new output should keep them at the bottom; if they scrolled up, it should not yank them down.
 
-**Data flow**: Reads `scroll_offset`, `last_content_height`, `last_rendered_height`, and `renderables`, returning true for the explicit bottom sentinel, empty content, or content that fully fits, and otherwise comparing `scroll_offset` against the computed maximum scroll. It writes no state.
+**Data flow**: It reads the current scroll offset, last content height, renderable list, and last rendered content height. It returns true for the special bottom marker, empty or short content, or an offset at or past the maximum scroll.
 
-**Call relations**: Used by transcript overlay mutation methods to preserve bottom-follow behavior when cells or live tail content change.
+**Call relations**: Transcript update methods call this before inserting, replacing, consolidating, or syncing live-tail content. `TranscriptOverlay::is_scrolled_to_bottom` also exposes it to the app draw loop.
 
 *Call graph*: called by 5 (consolidate_cells, insert_cell, is_scrolled_to_bottom, replace_cells, sync_live_tail).
 
@@ -2866,11 +2874,11 @@ fn is_scrolled_to_bottom(&self) -> bool
 fn scroll_chunk_into_view(&mut self, chunk_index: usize)
 ```
 
-**Purpose**: Requests that a specific renderable chunk be made visible on the next render pass. It defers the actual scroll calculation until wrapping width is known.
+**Purpose**: Requests that a particular content block be made visible on the next render. It delays the actual scroll calculation until the pager knows the current wrapping width.
 
-**Data flow**: Writes `Some(chunk_index)` into `pending_scroll_chunk`. It returns `()`.
+**Data flow**: It receives a renderable index and stores it as `pending_scroll_chunk`. Nothing is drawn immediately.
 
-**Call relations**: Called by `TranscriptOverlay::set_highlight_cell` so the highlighted transcript cell becomes visible after render-time wrapping is computed.
+**Call relations**: `TranscriptOverlay::set_highlight_cell` calls this after selecting a transcript cell. `PagerView::render` later consumes the pending request and calls `ensure_chunk_visible`.
 
 *Call graph*: called by 1 (set_highlight_cell).
 
@@ -2881,11 +2889,11 @@ fn scroll_chunk_into_view(&mut self, chunk_index: usize)
 fn ensure_chunk_visible(&mut self, idx: usize, area: Rect)
 ```
 
-**Purpose**: Adjusts `scroll_offset` so the specified renderable chunk is fully visible within the current content area if possible. It scrolls upward or downward only when needed.
+**Purpose**: Adjusts scrolling so a selected content block appears in the visible area. It is like asking a document viewer to scroll just enough to show a paragraph.
 
-**Data flow**: Given a chunk index and content area, it computes the chunk's start and end rows by summing `desired_height(area.width)` across preceding renderables, compares those bounds to the current visible top and bottom derived from `scroll_offset`, and mutates `scroll_offset` to bring the chunk into view. It returns nothing.
+**Data flow**: It receives a renderable index and current content area. It calculates the block’s top and bottom row from previous renderable heights, compares that with the visible window, and updates `scroll_offset` only if needed.
 
-**Call relations**: Called from `PagerView::render` when a pending scroll-to-chunk request exists.
+**Call relations**: `PagerView::render` calls this when a pending scroll request exists. Tests call it directly to confirm that selected chunks scroll into view.
 
 *Call graph*: called by 1 (render).
 
@@ -2896,11 +2904,11 @@ fn ensure_chunk_visible(&mut self, idx: usize, area: Rect)
 fn new(renderable: impl Into<Box<dyn Renderable>>) -> Self
 ```
 
-**Purpose**: Wraps another renderable with width-sensitive desired-height caching. This avoids recomputing wrapped heights on every draw when width is unchanged.
+**Purpose**: Wraps a renderable with a small height cache. This avoids repeatedly recalculating wrapped height when the terminal width has not changed.
 
-**Data flow**: Consumes any value convertible into `Box<dyn Renderable>`, stores it, and initializes cached `height` and `last_width` cells to `None`. It returns the wrapper.
+**Data flow**: It receives something that can become a boxed renderable. It stores that renderable and initializes cached height and cached width as empty.
 
-**Call relations**: Used when building transcript cell renderables and live-tail renderables so repeated pager layout passes are cheaper.
+**Call relations**: Transcript cell rendering and live-tail rendering use this wrapper, and static text pages use it too. It later serves calls through the `Renderable` trait methods.
 
 *Call graph*: called by 1 (live_tail_renderable); 2 external calls (into, new).
 
@@ -2911,11 +2919,11 @@ fn new(renderable: impl Into<Box<dyn Renderable>>) -> Self
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Forwards rendering to the wrapped renderable without altering the cache. It preserves the original drawing behavior.
+**Purpose**: Draws the wrapped content without changing the cache. The cache is only for height, not for the actual terminal buffer.
 
-**Data flow**: Calls `self.renderable.render(area, buf)` with the provided area and buffer. It writes only through the wrapped renderable.
+**Data flow**: It receives an area and buffer. It forwards both directly to the inner renderable’s `render` method.
 
-**Call relations**: Invoked by pager rendering whenever a cached renderable is visible.
+**Call relations**: The pager calls this through the generic `Renderable` trait whenever a cached block is visible. It acts as a transparent wrapper around the real renderer.
 
 
 ##### `CachedRenderable::desired_height`  (lines 384–391)
@@ -2924,11 +2932,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Returns the wrapped renderable's desired height, recomputing only when the width changes. It is the caching logic behind `CachedRenderable`.
+**Purpose**: Returns the wrapped content’s height, recalculating only when the width changes. This saves work for content whose height is expensive to compute.
 
-**Data flow**: Reads `last_width`; if it differs from the requested width, it calls the wrapped renderable's `desired_height(width)`, stores the result in `height`, updates `last_width`, and then returns the cached height or zero. It mutates the cache cells.
+**Data flow**: It receives a width. If the width differs from the cached width, it asks the inner renderable for its height and stores the answer; then it returns the cached height, or zero if none is present.
 
-**Call relations**: Used by pager layout code through the `Renderable` trait whenever chunk heights are needed.
+**Call relations**: The pager calls this often while laying out and scrolling. By caching, it protects transcript rendering from repeated wrapping calculations.
 
 
 ##### `CellRenderable::render`  (lines 400–407)
@@ -2937,11 +2945,11 @@ fn desired_height(&self, width: u16) -> u16
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders one committed transcript history cell while preserving semantic hyperlinks. It converts the cell's hyperlink-aware transcript lines into visible text and then marks the corresponding buffer cells.
+**Purpose**: Draws one committed history cell in transcript form, preserving terminal hyperlinks. This is how chat messages, command output, and other history entries appear in the transcript overlay.
 
-**Data flow**: Calls `self.cell.transcript_hyperlink_lines(area.width)`, converts those lines to visible `Line`s with `visible_lines`, renders them in a styled wrapped `Paragraph`, and then calls `mark_buffer_hyperlinks` over the same area with zero scroll rows. It writes to the buffer but does not mutate the cell.
+**Data flow**: It receives an area and buffer. It asks the history cell for hyperlink-aware transcript lines at the current width, converts them to visible text, draws them with the cell style, and then marks the buffer cells that should behave as hyperlinks.
 
-**Call relations**: Used inside transcript overlays for each committed `HistoryCell`, typically wrapped in `CachedRenderable` and sometimes `InsetRenderable`.
+**Call relations**: Transcript renderables use this through `CachedRenderable`. The pager calls it only for visible cells, while hyperlink helpers preserve links after wrapping.
 
 *Call graph*: calls 2 internal fn (mark_buffer_hyperlinks, visible_lines); 2 external calls (new, from).
 
@@ -2952,11 +2960,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Returns the wrapped transcript cell's desired transcript height at the given width. It delegates height calculation to the cell itself.
+**Purpose**: Reports how many rows a history cell needs in transcript form. The pager uses this before drawing to know where each cell begins and ends.
 
-**Data flow**: Calls `self.cell.desired_transcript_height(width)` and returns the result. It has no side effects.
+**Data flow**: It receives a width and asks the underlying history cell for its desired transcript height at that width. It returns that height.
 
-**Call relations**: Used by pager layout through the `Renderable` trait for committed transcript cells.
+**Call relations**: The pager calls this through `Renderable` during layout, scrolling, and height calculations. It lets each history cell own its own wrapping rules.
 
 
 ##### `HyperlinkLinesRenderable::render`  (lines 419–424)
@@ -2965,11 +2973,11 @@ fn desired_height(&self, width: u16) -> u16
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders a precomputed set of hyperlink-aware lines, preserving semantic links in the buffer. It is used for the transcript overlay's live tail.
+**Purpose**: Draws a set of already-prepared hyperlink-aware lines. This is used mainly for the live tail, where content comes from the active in-progress cell rather than committed history.
 
-**Data flow**: Converts `self.lines.clone()` to visible lines with `visible_lines`, renders them in a wrapped `Paragraph`, and then calls `mark_buffer_hyperlinks` over the same area. It writes to the buffer but does not mutate the stored lines.
+**Data flow**: It receives an area and buffer. It turns stored hyperlink lines into visible text, renders them with wrapping, and then marks hyperlink spans in the output buffer.
 
-**Call relations**: Constructed by `TranscriptOverlay::live_tail_renderable` for the optional in-flight active-cell tail.
+**Call relations**: `TranscriptOverlay::live_tail_renderable` wraps this in `CachedRenderable`. The pager later draws it as the optional final block in the transcript.
 
 *Call graph*: calls 2 internal fn (mark_buffer_hyperlinks, visible_lines); 2 external calls (new, from).
 
@@ -2980,11 +2988,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Computes the wrapped height of the stored hyperlink lines at a given width. It mirrors the rendering path's wrapping behavior.
+**Purpose**: Calculates how tall prepared hyperlink-aware lines will be after wrapping. This lets the pager place the live tail correctly.
 
-**Data flow**: Builds a wrapped `Paragraph` from `visible_lines(self.lines.clone())`, calls `line_count(width)`, converts the result to `u16`, and returns zero on conversion failure. It does not mutate state.
+**Data flow**: It receives a width, converts hyperlink lines into visible text, asks the paragraph widget for its wrapped line count, converts that count to a terminal-row height, and returns zero if conversion fails.
 
-**Call relations**: Used by pager layout for live-tail chunks.
+**Call relations**: The pager calls this through the renderable interface when laying out the live tail. It uses the same wrapping rules as `HyperlinkLinesRenderable::render`.
 
 *Call graph*: calls 1 internal fn (visible_lines); 2 external calls (new, from).
 
@@ -2995,11 +3003,11 @@ fn desired_height(&self, width: u16) -> u16
 fn new(transcript_cells: Vec<Arc<dyn HistoryCell>>, keymap: PagerKeymap) -> Self
 ```
 
-**Purpose**: Constructs a transcript overlay from committed transcript cells and a pager keymap, initially scrolled to the bottom. It starts with no highlighted cell and no live tail.
+**Purpose**: Builds a transcript overlay from committed conversation history. It starts at the bottom so the newest transcript entries are visible first.
 
-**Data flow**: Builds initial renderables from `render_cells(&transcript_cells, None)`, creates a `PagerView` titled `T R A N S C R I P T` with `scroll_offset = usize::MAX`, stores the committed cells, sets `highlight_cell` and `live_tail_key` to `None`, and `is_done` to false. It returns the overlay.
+**Data flow**: It receives history cells and a keymap. It turns the cells into renderable blocks, creates a `PagerView` titled `T R A N S C R I P T` with a bottom scroll marker, and stores the cells plus overlay state.
 
-**Call relations**: Called by `Overlay::new_transcript` and transcript-overlay tests. It delegates chunk construction to `render_cells`.
+**Call relations**: `Overlay::new_transcript` and test helpers call this. It uses `TranscriptOverlay::render_cells` to convert history into pager content.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (new_transcript, transcript_overlay); 1 external calls (render_cells).
 
@@ -3013,11 +3021,11 @@ fn render_cells(
     ) -> Vec<Box<dyn Renderable>>
 ```
 
-**Purpose**: Converts committed history cells into pager renderables with appropriate styling and spacing. User cells get user-message styling, highlighted user cells are reversed, and non-continuation cells after the first receive a top inset.
+**Purpose**: Converts committed history cells into drawable transcript blocks. It also adds spacing between separate transcript entries and special styling for user messages or highlighted messages.
 
-**Data flow**: Iterates the input cells with indices, creates a `CellRenderable` for each, wraps it in `CachedRenderable`, conditionally wraps that in `InsetRenderable` when the cell is not a stream continuation and is not the first cell, and collects the boxed renderables into a vector. It returns the vector without mutating overlay state.
+**Data flow**: It receives a slice of history cells and an optional highlighted cell index. For each cell, it builds a `CellRenderable`, wraps it in a height cache, applies user/highlight style when appropriate, adds a top inset when the cell starts a new stream, and returns the renderable list.
 
-**Call relations**: Used during overlay construction and whenever committed cells are rebuilt after insert/replace/consolidate/highlight changes.
+**Call relations**: `TranscriptOverlay::new`, `insert_cell`, and `rebuild_renderables` use this whenever committed transcript content must be rebuilt. The resulting blocks become `PagerView` content.
 
 
 ##### `TranscriptOverlay::insert_cell`  (lines 532–560)
@@ -3026,11 +3034,11 @@ fn render_cells(
 fn insert_cell(&mut self, cell: Arc<dyn HistoryCell>)
 ```
 
-**Purpose**: Appends one committed transcript cell while preserving any cached live tail and maintaining bottom-follow behavior when appropriate. It also fixes live-tail spacing if the first committed cell arrives after a tail-only state.
+**Purpose**: Adds one newly committed transcript cell while preserving any in-progress live tail already shown at the end. It keeps “follow the bottom” behavior when the user was already at the bottom.
 
-**Data flow**: Checks whether the pager was scrolled to bottom, records whether there were prior committed cells, removes any live-tail renderable via `take_live_tail_renderable`, pushes the new cell into `self.cells`, rebuilds committed renderables with `render_cells`, conditionally rewraps the tail in a top inset if it now follows the first committed cell and is not a stream continuation, reattaches the tail, and restores `scroll_offset = usize::MAX` if bottom-follow was active.
+**Data flow**: It checks whether the pager was at the bottom, removes the live tail if present, pushes the new committed cell, rebuilds committed renderables, reattaches the tail with correct spacing if needed, and restores bottom scrolling when appropriate.
 
-**Call relations**: Called by higher-level app code when a new committed history cell arrives while the transcript overlay is open. It relies on `take_live_tail_renderable` and `render_cells` to preserve the committed/live-tail invariant.
+**Call relations**: The app calls this as new history becomes committed after the overlay has opened. It uses `PagerView::is_scrolled_to_bottom`, `take_live_tail_renderable`, and `render_cells` to update without losing the active tail.
 
 *Call graph*: calls 4 internal fn (is_scrolled_to_bottom, take_live_tail_renderable, tlbr, new); 2 external calls (new, render_cells).
 
@@ -3041,11 +3049,11 @@ fn insert_cell(&mut self, cell: Arc<dyn HistoryCell>)
 fn replace_cells(&mut self, cells: Vec<Arc<dyn HistoryCell>>)
 ```
 
-**Purpose**: Replaces the committed transcript cell list wholesale while preserving any cached live tail and bottom-follow behavior. It is used when transcript history is trimmed or rewritten.
+**Purpose**: Replaces the committed transcript history shown by the overlay. This keeps the overlay accurate when the main app trims or rolls back history.
 
-**Data flow**: Checks bottom-follow state, overwrites `self.cells`, clears `highlight_cell` if it now points past the end, rebuilds renderables via `rebuild_renderables`, and restores bottom-follow by setting `scroll_offset = usize::MAX` when needed. It returns `()`.
+**Data flow**: It checks whether the view was following the bottom, replaces the stored cells, clears an out-of-range highlight, rebuilds renderables while preserving the live tail, and restores bottom scrolling if needed.
 
-**Call relations**: Called by higher-level synchronization logic when the overlay's committed transcript must be replaced to match the main transcript.
+**Call relations**: Higher-level transcript synchronization code calls this after history changes. It relies on `rebuild_renderables` so the live tail is temporarily removed and reattached safely.
 
 *Call graph*: calls 2 internal fn (is_scrolled_to_bottom, rebuild_renderables).
 
@@ -3060,11 +3068,11 @@ fn consolidate_cells(
     )
 ```
 
-**Purpose**: Replaces a range of committed cells with one consolidated cell while remapping any highlighted cell index and preserving bottom-follow behavior. It mirrors transcript consolidation performed elsewhere in the app.
+**Purpose**: Replaces a range of committed cells with one combined cell. This mirrors main transcript consolidation so the overlay does not show stale separate entries.
 
-**Data flow**: Checks bottom-follow state, clamps the requested range to the current cell count, adjusts `highlight_cell` if it falls inside or after the removed range, splices `self.cells` to replace the clamped range with `consolidated`, clears highlight if it now points past the end, rebuilds renderables, and restores bottom-follow if previously active.
+**Data flow**: It checks bottom-follow state, clamps the requested range to the overlay’s current cells, adjusts any highlighted index, splices in the consolidated cell, rebuilds renderables, and restores bottom-follow scrolling if needed.
 
-**Call relations**: Called by higher-level app logic when agent messages are consolidated. It depends on `rebuild_renderables` to preserve any live tail while updating committed chunks.
+**Call relations**: The app uses this when an agent message or related history entries are merged. It calls `PagerView::is_scrolled_to_bottom` and `rebuild_renderables` to preserve user position and live-tail state.
 
 *Call graph*: calls 2 internal fn (is_scrolled_to_bottom, rebuild_renderables); 1 external calls (once).
 
@@ -3080,11 +3088,11 @@ fn sync_live_tail(
     )
 ```
 
-**Purpose**: Synchronizes the optional render-only live tail with the current active-cell transcript state, recomputing it only when a cache key changes. This keeps Ctrl+T overlays in sync with in-flight output without unnecessary work.
+**Purpose**: Keeps the optional in-progress transcript tail up to date. It avoids expensive rebuilding unless the active cell’s cache key changes.
 
-**Data flow**: Builds an optional `LiveTailKey` from `width` and `active_key`; if it matches `self.live_tail_key`, returns immediately. Otherwise it records whether the pager was at bottom, removes any existing tail via `take_live_tail_renderable`, stores the new key, calls `compute_lines(width)` when a key exists, and if non-empty lines are returned pushes a new tail renderable from `live_tail_renderable(lines, !self.cells.is_empty(), key.is_stream_continuation)`. If bottom-follow was active, it resets `scroll_offset = usize::MAX`.
+**Data flow**: It receives the width, an optional active-cell key, and a function that can compute tail lines. It builds the next cache key, returns early if unchanged, removes the old tail, stores the new key, computes and appends a new tail if needed, and preserves bottom-follow scrolling.
 
-**Call relations**: Called by the app draw loop while a transcript overlay is open. It relies on callers to provide an `ActiveCellTranscriptKey` that changes when active-cell transcript output changes or animates.
+**Call relations**: The app draw loop calls this before rendering the transcript overlay. It uses `take_live_tail_renderable` and `live_tail_renderable`; the supplied callback does the actual active-cell line generation only when necessary.
 
 *Call graph*: calls 2 internal fn (is_scrolled_to_bottom, take_live_tail_renderable); 1 external calls (live_tail_renderable).
 
@@ -3095,11 +3103,11 @@ fn sync_live_tail(
 fn set_highlight_cell(&mut self, cell: Option<usize>)
 ```
 
-**Purpose**: Sets which committed transcript cell is highlighted and requests that it be scrolled into view. Highlighting affects styling and footer hints.
+**Purpose**: Sets or clears the highlighted transcript cell used for edit navigation. When a cell is highlighted, the overlay scrolls it into view.
 
-**Data flow**: Writes `highlight_cell`, rebuilds renderables via `rebuild_renderables`, and if a highlight index is present stores it in the pager via `scroll_chunk_into_view`. It returns `()`.
+**Data flow**: It receives an optional cell index, stores it, rebuilds committed renderables with the new highlight style, and if a cell is selected, records a pending scroll-to-cell request.
 
-**Call relations**: Called by higher-level transcript-edit navigation logic. It ties together visual highlighting and deferred scroll positioning.
+**Call relations**: Editing flows call this when the user moves through transcript messages. It calls `rebuild_renderables` and then `PagerView::scroll_chunk_into_view`, which is resolved on the next render.
 
 *Call graph*: calls 2 internal fn (scroll_chunk_into_view, rebuild_renderables).
 
@@ -3110,11 +3118,11 @@ fn set_highlight_cell(&mut self, cell: Option<usize>)
 fn is_scrolled_to_bottom(&self) -> bool
 ```
 
-**Purpose**: Exposes whether the transcript overlay's pager is currently pinned to the bottom. This is used by the app to decide whether live-tail animations are worth driving.
+**Purpose**: Exposes whether the transcript pager is pinned to the bottom. The app uses this to decide whether live-tail animations should keep running.
 
-**Data flow**: Delegates directly to `self.view.is_scrolled_to_bottom()` and returns the boolean. It has no side effects.
+**Data flow**: It reads the inner pager state and returns the result of its bottom-checking logic.
 
-**Call relations**: Queried by external app code during draw scheduling and transcript synchronization.
+**Call relations**: The app draw loop can call this without reaching into `PagerView`. It simply delegates to `PagerView::is_scrolled_to_bottom`.
 
 *Call graph*: calls 1 internal fn (is_scrolled_to_bottom).
 
@@ -3125,11 +3133,11 @@ fn is_scrolled_to_bottom(&self) -> bool
 fn rebuild_renderables(&mut self)
 ```
 
-**Purpose**: Rebuilds committed transcript renderables while preserving any existing live-tail renderable at the end. It maintains the invariant that committed chunks come first and the optional tail comes last.
+**Purpose**: Rebuilds the committed transcript renderables while preserving the optional live tail. This is the safe reset path after history or highlighting changes.
 
-**Data flow**: Removes any tail via `take_live_tail_renderable`, rebuilds committed chunks from `self.cells` and `highlight_cell` using `render_cells`, then reattaches the tail if one existed. It mutates `self.view.renderables`.
+**Data flow**: It removes the live tail if present, rebuilds renderables from the committed cells and highlight setting, then appends the saved tail again.
 
-**Call relations**: Used internally by replace, consolidate, and highlight changes whenever committed-cell presentation must be regenerated.
+**Call relations**: `replace_cells`, `consolidate_cells`, and `set_highlight_cell` call this after changing transcript state. It depends on `take_live_tail_renderable` and `render_cells`.
 
 *Call graph*: calls 1 internal fn (take_live_tail_renderable); called by 3 (consolidate_cells, replace_cells, set_highlight_cell); 1 external calls (render_cells).
 
@@ -3140,11 +3148,11 @@ fn rebuild_renderables(&mut self)
 fn take_live_tail_renderable(&mut self) -> Option<Box<dyn Renderable>>
 ```
 
-**Purpose**: Removes and returns the optional live-tail renderable if one is currently appended after the committed cells. It relies on the invariant that the tail, when present, is the final renderable.
+**Purpose**: Removes and returns the cached live-tail renderable if one is currently appended. It treats the live tail as the single extra block after all committed cells.
 
-**Data flow**: Compares `self.view.renderables.len()` against `self.cells.len()` and pops the last renderable only when there are more renderables than committed cells. It returns `Option<Box<dyn Renderable>>` and mutates the renderables vector when a tail exists.
+**Data flow**: It compares the number of renderables with the number of committed cells. If there is an extra final renderable, it pops and returns it; otherwise it returns nothing.
 
-**Call relations**: Used by insert, rebuild, and live-tail sync operations to temporarily detach the tail while committed chunks are rebuilt.
+**Call relations**: `insert_cell`, `rebuild_renderables`, and `sync_live_tail` call this before changing committed content or replacing the tail. The method relies on the invariant that the live tail is always last.
 
 *Call graph*: called by 3 (insert_cell, rebuild_renderables, sync_live_tail).
 
@@ -3159,11 +3167,11 @@ fn live_tail_renderable(
     ) -> Box<dyn Renderable>
 ```
 
-**Purpose**: Builds the boxed renderable used for the optional live tail, adding top spacing when it follows prior committed cells and is not a stream continuation. It encapsulates the tail-spacing rule.
+**Purpose**: Builds the renderable block for in-progress transcript output. It adds top spacing when the live tail follows prior non-continuation content.
 
-**Data flow**: Wraps `HyperlinkLinesRenderable { lines }` in `CachedRenderable`, then conditionally wraps that in `InsetRenderable` with a one-row top inset when `has_prior_cells && !is_stream_continuation`. It returns the boxed renderable.
+**Data flow**: It receives hyperlink-aware lines, whether committed cells come before it, and whether the tail continues the previous stream. It wraps the lines in a cached renderable and, when needed, wraps that in an inset that adds one blank row above.
 
-**Call relations**: Called by `sync_live_tail` when a non-empty active-cell tail should be displayed.
+**Call relations**: `sync_live_tail` calls this after computing fresh live-tail lines. The returned block is appended to the pager after committed cells.
 
 *Call graph*: calls 3 internal fn (new, tlbr, new); 1 external calls (new).
 
@@ -3174,11 +3182,11 @@ fn live_tail_renderable(
 fn render_hints(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the transcript overlay's two-line footer hints, including scroll/page/jump controls and edit-navigation hints that depend on whether a cell is highlighted. It adapts the footer to transcript-specific interactions.
+**Purpose**: Draws the two-line footer of keyboard hints for the transcript overlay. It includes scrolling shortcuts, quit instructions, and edit-navigation hints.
 
-**Data flow**: Splits the footer area into two one-line rectangles, builds key-hint pairs from the pager keymap using `first_or_empty`, conditionally adds edit-prev/edit-next/edit-message hints based on `highlight_cell`, and renders both lines via `render_key_hints`. It writes only to the buffer.
+**Data flow**: It receives a footer area and buffer. It splits the footer into two rows, picks compact key examples from the keymap, builds hint pairs, and draws them through `render_key_hints`.
 
-**Call relations**: Called by `TranscriptOverlay::render` after the pager view itself has been drawn.
+**Call relations**: `TranscriptOverlay::render` calls this after drawing the pager. It uses `first_or_empty` and shared hint rendering so hints match the configured keymap.
 
 *Call graph*: calls 2 internal fn (first_or_empty, render_key_hints); called by 1 (render); 2 external calls (new, vec!).
 
@@ -3189,11 +3197,11 @@ fn render_hints(&self, area: Rect, buf: &mut Buffer)
 fn render(&mut self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the transcript overlay by splitting the area into pager content and footer hints. It is the top-level drawing method for transcript overlays.
+**Purpose**: Draws the full transcript overlay, including the pager and bottom shortcut hints. It reserves the last three rows for help text.
 
-**Data flow**: Computes a top area of `height - 3` rows and a bottom 3-row footer area, calls `self.view.render(top, buf)`, then `self.render_hints(bottom, buf)`. It writes to the buffer and may mutate pager layout caches during the delegated render.
+**Data flow**: It receives the whole terminal area and buffer. It splits the area into a main pager region and a footer region, renders the pager above, then renders transcript-specific hints below.
 
-**Call relations**: Called from `TranscriptOverlay::handle_event` on draw/resize and directly by tests.
+**Call relations**: `TranscriptOverlay::handle_event` calls this during draw and resize events, and tests call it directly. It delegates the main document work to `PagerView::render`.
 
 *Call graph*: calls 2 internal fn (render, render_hints); called by 1 (transcript_line_numbers); 1 external calls (new).
 
@@ -3204,11 +3212,11 @@ fn render(&mut self, area: Rect, buf: &mut Buffer)
 fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()>
 ```
 
-**Purpose**: Processes overlay events for transcript overlays: close keys, pager navigation keys, and redraw events. It is the event-loop entry point for transcript overlays.
+**Purpose**: Responds to terminal events while the transcript overlay is active. It closes on close keys, scrolls on pager keys, and redraws on draw or resize events.
 
-**Data flow**: Matches the incoming `TuiEvent`; on key events it closes the overlay if either close binding matches, otherwise delegates to `self.view.handle_key_event`; on draw/resize it asks `tui.draw` to render the overlay; all other events are ignored. It mutates `is_done` and pager state as needed and returns `Result<()>`.
+**Data flow**: It receives the TUI object and an event. For key events, it sets `is_done` on close keys or passes navigation keys to the pager; for draw and resize, it asks the TUI to draw the overlay; other events are ignored.
 
-**Call relations**: Called through `Overlay::handle_event` by higher-level app code while a transcript overlay is active.
+**Call relations**: `Overlay::handle_event` routes transcript events here. It calls `PagerView::handle_key_event` for scrolling and the TUI draw function for screen updates.
 
 *Call graph*: calls 1 internal fn (handle_key_event); 1 external calls (draw).
 
@@ -3219,11 +3227,11 @@ fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()>
 fn is_done(&self) -> bool
 ```
 
-**Purpose**: Returns whether the transcript overlay has been closed. It is the transcript-specific completion flag accessor.
+**Purpose**: Reports whether the transcript overlay should close. It becomes true when the user presses a configured close key.
 
-**Data flow**: Reads and returns `self.is_done`. It has no side effects.
+**Data flow**: It reads and returns the overlay’s `is_done` flag.
 
-**Call relations**: Used by `Overlay::is_done` and potentially by tests or overlay-driving code.
+**Call relations**: `Overlay::is_done` delegates here when the active overlay is a transcript overlay. The flag is set by `TranscriptOverlay::handle_event`.
 
 
 ##### `TranscriptOverlay::committed_cell_count`  (lines 808–810)
@@ -3232,11 +3240,11 @@ fn is_done(&self) -> bool
 fn committed_cell_count(&self) -> usize
 ```
 
-**Purpose**: Returns the number of committed transcript cells currently stored in the overlay. It is a test-only inspection helper.
+**Purpose**: Returns the number of committed transcript cells for tests. It helps verify that overlay synchronization keeps the expected committed history.
 
-**Data flow**: Reads `self.cells.len()` and returns it. It does not mutate state.
+**Data flow**: It reads the `cells` vector length and returns it.
 
-**Call relations**: Available only under `#[cfg(test)]` for assertions about overlay synchronization.
+**Call relations**: This function is compiled only for tests. It gives tests a safe way to inspect internal transcript state without exposing it in normal builds.
 
 
 ##### `StaticOverlay::with_title`  (lines 819–830)
@@ -3249,11 +3257,11 @@ fn with_title(
     ) -> Self
 ```
 
-**Purpose**: Constructs a static overlay from plain lines by wrapping them in a paragraph renderable. It is the convenience constructor for simple static pager content.
+**Purpose**: Builds a static overlay from plain text lines and a title. It is the simple path for fixed pages that do not need custom renderable widgets.
 
-**Data flow**: Builds a wrapped `Paragraph` from the provided lines, boxes it inside `CachedRenderable`, places it in a one-element renderables vector, and delegates to `with_renderables`. It returns the new `StaticOverlay`.
+**Data flow**: It receives text lines, a title, and a keymap. It creates a wrapped paragraph from the lines, wraps that in a cached renderable, and forwards to `StaticOverlay::with_renderables`.
 
-**Call relations**: Called by `Overlay::new_static_with_lines` and by static-overlay tests.
+**Call relations**: `Overlay::new_static_with_lines` and test helpers call this. It converts plain text into the richer renderable form used by the pager.
 
 *Call graph*: called by 2 (new_static_with_lines, static_overlay); 4 external calls (new, with_renderables, from, vec!).
 
@@ -3268,11 +3276,11 @@ fn with_renderables(
     ) -> Self
 ```
 
-**Purpose**: Constructs a static overlay from arbitrary renderables and a title. It initializes the shared pager view at the top of the content.
+**Purpose**: Builds a static overlay from renderable content blocks. This is the base constructor for fixed-content pager screens.
 
-**Data flow**: Creates `PagerView::new(renderables, title, 0, keymap)`, stores it with `is_done = false`, and returns the overlay. It writes no external state.
+**Data flow**: It receives renderables, a title, and a keymap. It creates a `PagerView` starting at the top and stores it with `is_done` set to false.
 
-**Call relations**: Called by `Overlay::new_static_with_renderables` and by `with_title`.
+**Call relations**: `Overlay::new_static_with_renderables` calls this directly, and `with_title` calls it after turning lines into a paragraph. It uses `PagerView::new` for the shared scrolling machinery.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (new_static_with_renderables).
 
@@ -3283,11 +3291,11 @@ fn with_renderables(
 fn render_hints(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the static overlay's two-line footer hints for scrolling, paging, jumping, and quitting. Unlike transcript overlays, it has no edit-navigation hints.
+**Purpose**: Draws the footer shortcuts for a static overlay. It shows scrolling, paging, jumping, and quitting instructions.
 
-**Data flow**: Builds two footer lines from the pager keymap using `first_or_empty` and `render_key_hints`, with the second line containing only the close hint. It writes only to the buffer.
+**Data flow**: It receives a footer area and buffer. It splits the area into two rows, collects representative keys from the keymap, and draws both hint lines with `render_key_hints`.
 
-**Call relations**: Called by `StaticOverlay::render` after the pager view itself has been drawn.
+**Call relations**: `StaticOverlay::render` calls this after drawing the pager. It shares `first_or_empty` and `render_key_hints` with the transcript footer.
 
 *Call graph*: calls 2 internal fn (first_or_empty, render_key_hints); called by 1 (render); 2 external calls (new, vec!).
 
@@ -3298,11 +3306,11 @@ fn render_hints(&self, area: Rect, buf: &mut Buffer)
 fn render(&mut self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the static overlay by splitting the area into pager content and footer hints. It is the top-level drawing method for static overlays.
+**Purpose**: Draws the full static overlay, with scrollable content above and key hints below. It uses the same visual layout as the transcript overlay.
 
-**Data flow**: Computes top and bottom areas, calls `self.view.render(top, buf)`, then `self.render_hints(bottom, buf)`. It writes to the buffer and may mutate pager caches through the delegated render.
+**Data flow**: It receives the full terminal area and buffer. It reserves three rows at the bottom, renders the pager in the top area, and paints static-overlay hints in the bottom area.
 
-**Call relations**: Called from `StaticOverlay::handle_event` on draw/resize and directly by tests.
+**Call relations**: `StaticOverlay::handle_event` calls this during draw and resize events, and tests call it directly. It delegates scrolling layout to `PagerView::render`.
 
 *Call graph*: calls 2 internal fn (render, render_hints); 1 external calls (new).
 
@@ -3313,11 +3321,11 @@ fn render(&mut self, area: Rect, buf: &mut Buffer)
 fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()>
 ```
 
-**Purpose**: Processes overlay events for static overlays: close keys, pager navigation keys, and redraw events. It is the event-loop entry point for static overlays.
+**Purpose**: Responds to terminal events while a static overlay is active. It closes on the close key, scrolls on pager keys, and redraws when asked.
 
-**Data flow**: Matches the incoming `TuiEvent`; on key events it closes the overlay if the close binding matches, otherwise delegates to `self.view.handle_key_event`; on draw/resize it redraws via `tui.draw`; other events are ignored. It mutates `is_done` and pager state as needed and returns `Result<()>`.
+**Data flow**: It receives the TUI object and an event. Key events either set `is_done` or go to the pager; draw and resize events cause the overlay to be drawn; all other events are ignored.
 
-**Call relations**: Called through `Overlay::handle_event` by higher-level app code while a static overlay is active.
+**Call relations**: `Overlay::handle_event` routes static-overlay events here. It uses `PagerView::handle_key_event` for navigation and the TUI draw call for screen updates.
 
 *Call graph*: calls 1 internal fn (handle_key_event); 1 external calls (draw).
 
@@ -3328,11 +3336,11 @@ fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()>
 fn is_done(&self) -> bool
 ```
 
-**Purpose**: Returns whether the static overlay has been closed. It is the static-overlay completion accessor.
+**Purpose**: Reports whether the static overlay has been closed. The app uses this to know when it can leave overlay mode.
 
-**Data flow**: Reads and returns `self.is_done`. It has no side effects.
+**Data flow**: It returns the stored `is_done` flag.
 
-**Call relations**: Used by `Overlay::is_done` and by overlay-driving code.
+**Call relations**: `Overlay::is_done` delegates here for static overlays. The flag is changed by `StaticOverlay::handle_event` when the close key is pressed.
 
 
 ##### `render_offset_content`  (lines 911–936)
@@ -3346,11 +3354,11 @@ fn render_offset_content(
 ) -> u16
 ```
 
-**Purpose**: Renders a renderable into a temporary tall buffer and copies only the visible rows starting at a vertical offset into the destination buffer. It is how the pager displays a partially clipped top chunk.
+**Purpose**: Draws the lower visible part of a renderable whose top has scrolled off-screen. It is a small off-screen drawing trick used when a content block starts above the viewport.
 
-**Data flow**: Computes the renderable's desired height, allocates a temporary `Buffer` tall enough for the visible slice, renders the full chunk into that buffer, computes `copy_height` from the destination area and `scroll_offset`, copies the relevant cells row-by-row into the destination buffer, and returns the number of rows copied. It writes to the destination buffer and allocates a temporary buffer.
+**Data flow**: It receives the visible area, output buffer, renderable, and number of rows to skip. It renders the needed portion into a temporary buffer, copies the visible rows into the real buffer, and returns how many rows were copied.
 
-**Call relations**: Called by `PagerView::render_content` when the first visible chunk begins above the viewport top.
+**Call relations**: `PagerView::render_content` calls this when a renderable is partly above the visible area. This lets renderables stay simple: they can draw from their own top, while this helper handles clipping.
 
 *Call graph*: called by 1 (render_content); 4 external calls (empty, new, desired_height, render).
 
@@ -3361,11 +3369,11 @@ fn render_offset_content(
 fn display_lines(&self, _width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Returns the test cell's stored lines for generic display rendering. It is part of the minimal `HistoryCell` test implementation.
+**Purpose**: Provides simple display lines for the test history cell. It lets tests use a minimal fake cell instead of real chat history types.
 
-**Data flow**: Ignores width and clones `self.lines`. It has no side effects.
+**Data flow**: It ignores the width and returns a clone of the stored lines.
 
-**Call relations**: Used implicitly by code paths that render or inspect generic history-cell display output in tests.
+**Call relations**: Tests use `TestCell` anywhere a `HistoryCell` is needed. This method satisfies the `HistoryCell` trait.
 
 
 ##### `tests::TestCell::raw_lines`  (lines 970–972)
@@ -3374,11 +3382,11 @@ fn display_lines(&self, _width: u16) -> Vec<Line<'static>>
 fn raw_lines(&self) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Returns the test cell's stored lines as raw lines. It satisfies the `HistoryCell` trait for tests.
+**Purpose**: Provides raw lines for the fake test cell. For this simple cell, raw lines are the same as displayed lines.
 
-**Data flow**: Clones and returns `self.lines`. It does not mutate state.
+**Data flow**: It returns a clone of the stored test lines.
 
-**Call relations**: Part of the test-only `HistoryCell` implementation used throughout overlay tests.
+**Call relations**: This exists to complete the `HistoryCell` trait for `TestCell`. The tests can then pass `TestCell` into transcript overlay constructors.
 
 
 ##### `tests::TestCell::transcript_lines`  (lines 974–976)
@@ -3387,11 +3395,11 @@ fn raw_lines(&self) -> Vec<Line<'static>>
 fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Returns the test cell's stored lines for transcript rendering. It gives transcript overlay tests deterministic content.
+**Purpose**: Provides transcript lines for the fake test cell. It keeps tests predictable by returning exactly the lines placed in the cell.
 
-**Data flow**: Ignores width and clones `self.lines`. It has no side effects.
+**Data flow**: It ignores width and returns a clone of the stored lines.
 
-**Call relations**: Used by transcript overlay rendering paths in tests.
+**Call relations**: Transcript rendering code calls this through the `HistoryCell` trait during tests. It makes snapshot and scrolling tests easy to reason about.
 
 
 ##### `tests::paragraph_block`  (lines 979–986)
@@ -3400,11 +3408,11 @@ fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>>
 fn paragraph_block(label: &str, lines: usize) -> Box<dyn Renderable>
 ```
 
-**Purpose**: Builds a boxed paragraph renderable containing numbered lines with a common label prefix. It is a helper for pager-layout tests.
+**Purpose**: Creates a simple renderable paragraph with numbered lines for pager tests. It is used to test content height and chunk scrolling without real transcript cells.
 
-**Data flow**: Creates `Line`s `label0`, `label1`, ... up to the requested count, wraps them in `Text` and `Paragraph`, boxes the paragraph as `Box<dyn Renderable>`, and returns it. It mutates no external state.
+**Data flow**: It receives a label and line count. It builds lines like `label0`, `label1`, wraps them in text and a paragraph widget, boxes the paragraph, and returns it as a renderable.
 
-**Call relations**: Used by pager-view tests that need simple renderables with predictable heights and contents.
+**Call relations**: Pager-specific tests call this to build predictable renderable chunks. Those chunks are then passed to `tests::pager_view`.
 
 *Call graph*: 3 external calls (new, new, from).
 
@@ -3415,11 +3423,11 @@ fn paragraph_block(label: &str, lines: usize) -> Box<dyn Renderable>
 fn default_pager_keymap() -> crate::keymap::PagerKeymap
 ```
 
-**Purpose**: Returns the default pager keymap from the runtime keymap defaults. It keeps tests aligned with production bindings.
+**Purpose**: Returns the default pager key bindings for tests. This avoids repeating keymap setup in every test.
 
-**Data flow**: Calls `crate::keymap::RuntimeKeymap::defaults().pager` and returns the resulting `PagerKeymap`. It has no side effects.
+**Data flow**: It asks the runtime keymap for defaults and returns the pager portion.
 
-**Call relations**: Used by test constructors for transcript overlays, static overlays, and pager views.
+**Call relations**: Test helper constructors call this when creating transcript overlays, static overlays, or pager views.
 
 *Call graph*: calls 1 internal fn (defaults).
 
@@ -3430,11 +3438,11 @@ fn default_pager_keymap() -> crate::keymap::PagerKeymap
 fn transcript_overlay(cells: Vec<Arc<dyn HistoryCell>>) -> TranscriptOverlay
 ```
 
-**Purpose**: Constructs a transcript overlay test fixture with the default pager keymap. It shortens test setup.
+**Purpose**: Builds a transcript overlay for tests using the default pager keymap. It keeps test setup short.
 
-**Data flow**: Takes committed cells, calls `TranscriptOverlay::new(cells, default_pager_keymap())`, and returns the overlay. It mutates no external state.
+**Data flow**: It receives test history cells, gets the default keymap, creates a `TranscriptOverlay`, and returns it.
 
-**Call relations**: Used by many transcript overlay tests in this file.
+**Call relations**: Many transcript overlay tests call this helper. It delegates to `TranscriptOverlay::new`.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (default_pager_keymap).
 
@@ -3445,11 +3453,11 @@ fn transcript_overlay(cells: Vec<Arc<dyn HistoryCell>>) -> TranscriptOverlay
 fn static_overlay(lines: Vec<Line<'static>>, title: &str) -> StaticOverlay
 ```
 
-**Purpose**: Constructs a static overlay test fixture with the default pager keymap. It is a convenience helper for static-overlay tests.
+**Purpose**: Builds a static overlay for tests from lines and a title. It supplies default pager keys automatically.
 
-**Data flow**: Takes lines and a title, calls `StaticOverlay::with_title(..., default_pager_keymap())`, and returns the overlay. It has no side effects.
+**Data flow**: It receives lines and a title string, creates a default keymap, calls `StaticOverlay::with_title`, and returns the overlay.
 
-**Call relations**: Used by static overlay snapshot and wrapping tests.
+**Call relations**: Static overlay snapshot and wrapping tests use this helper. It delegates to the production constructor.
 
 *Call graph*: calls 1 internal fn (with_title); 1 external calls (default_pager_keymap).
 
@@ -3464,11 +3472,11 @@ fn pager_view(
     ) -> PagerView
 ```
 
-**Purpose**: Constructs a pager view test fixture with the default pager keymap. It simplifies direct pager-behavior tests.
+**Purpose**: Builds a pager view for tests with predictable title, content, scroll offset, and default keys. It lets tests exercise pager behavior directly.
 
-**Data flow**: Takes renderables, title, and initial scroll offset, calls `PagerView::new(..., default_pager_keymap())`, and returns the pager view. It writes no external state.
+**Data flow**: It receives renderables, title, and scroll offset. It adds the default pager keymap and returns a `PagerView`.
 
-**Call relations**: Used by tests that exercise pager internals without going through an overlay wrapper.
+**Call relations**: Pager unit tests call this helper before checking height, scrolling, and bottom detection. It delegates to `PagerView::new`.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (default_pager_keymap).
 
@@ -3479,11 +3487,11 @@ fn pager_view(
 fn edit_prev_hint_is_visible()
 ```
 
-**Purpose**: Verifies that the transcript overlay footer shows the `edit prev` hint even when no cell is highlighted. This locks in the footer help text for transcript browsing.
+**Purpose**: Checks that the transcript overlay footer shows the `edit prev` hint. This protects a user-facing shortcut prompt from disappearing.
 
-**Data flow**: Creates a one-cell transcript overlay, renders it into a wide buffer, converts the buffer to text with `buffer_to_text`, and asserts that the text contains `edit prev`. It mutates only the test buffer.
+**Data flow**: It creates a one-cell transcript overlay, renders it into a wide buffer, converts the buffer to text, and asserts that the text contains `edit prev`.
 
-**Call relations**: Exercises `TranscriptOverlay::render_hints` through the full render path.
+**Call relations**: This test uses `tests::transcript_overlay` and `tests::buffer_to_text`. It indirectly exercises `TranscriptOverlay::render_hints`.
 
 *Call graph*: 6 external calls (empty, new, assert!, buffer_to_text, transcript_overlay, vec!).
 
@@ -3494,11 +3502,11 @@ fn edit_prev_hint_is_visible()
 fn edit_next_hint_is_visible_when_highlighted()
 ```
 
-**Purpose**: Verifies that the transcript overlay footer adds the `edit next` hint when a cell is highlighted. This covers the highlight-dependent footer branch.
+**Purpose**: Checks that the `edit next` hint appears when a transcript cell is highlighted. This confirms the footer changes when edit navigation mode is active.
 
-**Data flow**: Creates a one-cell transcript overlay, calls `set_highlight_cell(Some(0))`, renders into a wide buffer, converts to text, and asserts that `edit next` appears. It mutates the overlay and test buffer.
+**Data flow**: It creates an overlay, highlights the first cell, renders into a buffer, turns the buffer into text, and asserts that `edit next` is present.
 
-**Call relations**: Exercises the highlighted-cell branch of `TranscriptOverlay::render_hints`.
+**Call relations**: This test calls `TranscriptOverlay::set_highlight_cell` through normal overlay state, then verifies the rendered hints.
 
 *Call graph*: 6 external calls (empty, new, assert!, buffer_to_text, transcript_overlay, vec!).
 
@@ -3509,11 +3517,11 @@ fn edit_next_hint_is_visible_when_highlighted()
 fn transcript_overlay_snapshot_basic()
 ```
 
-**Purpose**: Captures a baseline snapshot of transcript overlay rendering with several simple cells. It guards the overall pager layout and transcript presentation.
+**Purpose**: Captures the basic look of a transcript overlay with a few cells. Snapshot testing helps catch accidental visual changes.
 
-**Data flow**: Builds a transcript overlay with three test cells, renders it into a `TestBackend` terminal, and snapshots the backend output. It writes only to the test terminal buffer.
+**Data flow**: It creates an overlay with three fake cells, draws it into a test terminal, and compares the backend output to a stored snapshot.
 
-**Call relations**: Exercises the standard transcript overlay render path.
+**Call relations**: This test uses `tests::transcript_overlay` and the real `TranscriptOverlay::render` path through terminal drawing.
 
 *Call graph*: 5 external calls (new, assert_snapshot!, new, transcript_overlay, vec!).
 
@@ -3524,11 +3532,11 @@ fn transcript_overlay_snapshot_basic()
 fn transcript_overlay_preserves_semantic_web_links()
 ```
 
-**Purpose**: Ensures that transcript overlay rendering preserves OSC 8 semantic hyperlinks from markdown cells. This verifies that hyperlink metadata survives pager rendering.
+**Purpose**: Verifies that committed transcript content keeps terminal hyperlinks after rendering. This protects clickable links in the transcript overlay.
 
-**Data flow**: Creates a transcript overlay containing an `AgentMarkdownCell` with a long destination URL, renders into a buffer, and asserts that some cell symbol contains the OSC 8 open sequence for that destination. It mutates only the test buffer.
+**Data flow**: It creates a markdown history cell containing a URL, renders the overlay into a buffer, and asserts that at least one buffer cell contains the terminal hyperlink escape sequence for that URL.
 
-**Call relations**: Exercises `CellRenderable::render` and `mark_buffer_hyperlinks` through the transcript overlay.
+**Call relations**: This test exercises `CellRenderable::render`, `visible_lines`, and `mark_buffer_hyperlinks` through normal transcript overlay rendering.
 
 *Call graph*: 5 external calls (empty, new, assert!, transcript_overlay, vec!).
 
@@ -3539,11 +3547,11 @@ fn transcript_overlay_preserves_semantic_web_links()
 fn transcript_overlay_renders_live_tail()
 ```
 
-**Purpose**: Captures a snapshot showing that a live tail appended via `sync_live_tail` is rendered after committed transcript cells. It verifies the basic live-tail feature.
+**Purpose**: Checks that the transcript overlay can show in-progress live-tail content after committed cells. It verifies the visible layout with a snapshot.
 
-**Data flow**: Creates a one-cell transcript overlay, calls `sync_live_tail` with a non-empty active-cell key and a closure returning one `HyperlinkLine`, renders into a test terminal, and snapshots the output. It mutates the overlay's live-tail state.
+**Data flow**: It creates an overlay with one committed cell, syncs a live tail containing `tail`, draws the overlay, and compares the terminal output to a snapshot.
 
-**Call relations**: Exercises `TranscriptOverlay::sync_live_tail` and the tail-rendering path.
+**Call relations**: This test drives `TranscriptOverlay::sync_live_tail` and then normal rendering. It confirms that the live tail is appended to pager content.
 
 *Call graph*: 5 external calls (new, assert_snapshot!, new, transcript_overlay, vec!).
 
@@ -3554,11 +3562,11 @@ fn transcript_overlay_renders_live_tail()
 fn transcript_overlay_live_tail_preserves_semantic_web_links()
 ```
 
-**Purpose**: Ensures that semantic hyperlinks are preserved in the live tail just as they are for committed cells. This covers the hyperlink-aware tail renderable path.
+**Purpose**: Verifies that live-tail content also preserves terminal hyperlinks. This matters because streamed output may contain links before it is committed.
 
-**Data flow**: Creates an empty transcript overlay, computes live-tail lines from an `AgentMarkdownCell`, syncs the tail, renders into a buffer, and asserts that some cell symbol contains the destination's OSC 8 sequence. It mutates the overlay and test buffer.
+**Data flow**: It creates a markdown cell with a URL, opens an empty transcript overlay, syncs the live tail from that cell’s hyperlink lines, renders, and checks the buffer for the hyperlink escape sequence.
 
-**Call relations**: Exercises `HyperlinkLinesRenderable::render` through `TranscriptOverlay::sync_live_tail`.
+**Call relations**: This test exercises `TranscriptOverlay::sync_live_tail`, `HyperlinkLinesRenderable::render`, and hyperlink marking for uncommitted content.
 
 *Call graph*: calls 1 internal fn (new); 6 external calls (empty, new, new, assert!, new, transcript_overlay).
 
@@ -3569,11 +3577,11 @@ fn transcript_overlay_live_tail_preserves_semantic_web_links()
 fn transcript_overlay_sync_live_tail_is_noop_for_identical_key()
 ```
 
-**Purpose**: Verifies that `sync_live_tail` does not recompute the tail when called again with an identical cache key. This locks in the caching behavior.
+**Purpose**: Checks that live-tail recomputation is skipped when the cache key has not changed. This protects the performance optimization described at the top of the file.
 
-**Data flow**: Creates a transcript overlay, defines a `Cell<usize>` call counter and one `ActiveCellTranscriptKey`, calls `sync_live_tail` twice with closures that increment the counter, and asserts that the counter is only 1. It mutates the overlay and local counter.
+**Data flow**: It creates an overlay and a call counter, syncs a live tail twice with the same key, and asserts that the line-computing callback ran only once.
 
-**Call relations**: Directly tests the key-equality early return in `TranscriptOverlay::sync_live_tail`.
+**Call relations**: This test focuses on `TranscriptOverlay::sync_live_tail`. It confirms that identical keys return early before calling the supplied compute function again.
 
 *Call graph*: 4 external calls (assert_eq!, new, transcript_overlay, vec!).
 
@@ -3584,11 +3592,11 @@ fn transcript_overlay_sync_live_tail_is_noop_for_identical_key()
 fn buffer_to_text(buf: &Buffer, area: Rect) -> String
 ```
 
-**Purpose**: Converts a rendered buffer region into plain text for assertions and snapshots, trimming trailing spaces per row for stability. It is a general overlay test helper.
+**Purpose**: Turns a terminal buffer region into plain text for assertions. It makes visual tests easier to read and compare.
 
-**Data flow**: Iterates all cells in the given area row by row, appends the first character of each symbol or a space, trims trailing spaces after each row, appends a newline, and returns the resulting string. It does not mutate the buffer.
+**Data flow**: It receives a buffer and rectangle. It walks each cell, appends the first displayed character or a space, trims trailing spaces per line, and returns the accumulated string.
 
-**Call relations**: Used by multiple tests that assert on rendered textual content rather than full terminal snapshots.
+**Call relations**: Several tests call this after rendering overlays or pager views. It is a test-only inspection helper, not part of production drawing.
 
 *Call graph*: 3 external calls (bottom, right, new).
 
@@ -3599,11 +3607,11 @@ fn buffer_to_text(buf: &Buffer, area: Rect) -> String
 fn transcript_overlay_apply_patch_scroll_vt100_clears_previous_page()
 ```
 
-**Purpose**: Regression-tests transcript overlay rendering after scrolling around a sequence of patch and command cells, ensuring stale content from a previous page is cleared. It targets VT100-style redraw correctness.
+**Purpose**: Checks that rendering after scrolling does not leave stale characters from a previous page. This protects terminal output correctness for complex transcript cells.
 
-**Data flow**: Builds a realistic transcript with patch events, approval decisions, and a completed exec cell, renders the overlay into a buffer, manually resets `scroll_offset` to the top, renders again into the same buffer, converts the buffer to text, and snapshots it. It mutates the overlay and test buffer.
+**Data flow**: It builds several realistic history cells involving patch events, approval decisions, and command output, renders the overlay, changes scroll offset, renders again into the same buffer, converts it to text, and compares a snapshot.
 
-**Call relations**: Exercises pager redraw behavior, especially `PagerView::render_content` and its clearing/fill logic.
+**Call relations**: This test exercises the real transcript rendering path, including `PagerView::render_content` cleanup behavior. It helps ensure old buffer contents are cleared when the visible page changes.
 
 *Call graph*: 15 external calls (new, empty, from_millis, new, from, new, new, assert_snapshot!, new_active_exec_command, new_patch_event (+5 more)).
 
@@ -3614,11 +3622,11 @@ fn transcript_overlay_apply_patch_scroll_vt100_clears_previous_page()
 fn transcript_overlay_keeps_scroll_pinned_at_bottom()
 ```
 
-**Purpose**: Verifies that inserting a committed cell preserves bottom-follow behavior when the overlay was already at the bottom. This is important for live transcript viewing.
+**Purpose**: Verifies that adding a committed cell keeps the transcript at the bottom when it was already following the bottom. This is the expected live transcript behavior.
 
-**Data flow**: Creates a long transcript overlay, renders once to populate layout caches, asserts `is_scrolled_to_bottom()`, inserts a new cell, and asserts that `scroll_offset` is the bottom sentinel `usize::MAX`. It mutates the overlay under test.
+**Data flow**: It creates a long overlay, renders once to establish layout, asserts it is at bottom, inserts a new cell, and checks that the scroll offset is the special bottom marker.
 
-**Call relations**: Exercises the follow-bottom branch in `TranscriptOverlay::insert_cell`.
+**Call relations**: This test drives `TranscriptOverlay::insert_cell` after `PagerView::is_scrolled_to_bottom` has been primed by rendering.
 
 *Call graph*: 7 external calls (new, new, assert!, assert_eq!, new, transcript_overlay, vec!).
 
@@ -3629,11 +3637,11 @@ fn transcript_overlay_keeps_scroll_pinned_at_bottom()
 fn transcript_overlay_preserves_manual_scroll_position()
 ```
 
-**Purpose**: Verifies that inserting a committed cell does not force-scroll to the bottom when the user has manually scrolled upward. This preserves user browsing position.
+**Purpose**: Verifies that adding a cell does not drag the user to the bottom if they manually scrolled up. This protects readers from losing their place.
 
-**Data flow**: Creates and renders a long transcript overlay, manually sets `scroll_offset = 0`, inserts a new cell, and asserts that the offset remains 0. It mutates the overlay under test.
+**Data flow**: It creates and renders a long overlay, manually sets the scroll offset to the top, inserts a new cell, and asserts the offset is still zero.
 
-**Call relations**: Exercises the non-follow-bottom branch in `TranscriptOverlay::insert_cell`.
+**Call relations**: This test exercises the non-following branch of `TranscriptOverlay::insert_cell`.
 
 *Call graph*: 6 external calls (new, new, assert_eq!, new, transcript_overlay, vec!).
 
@@ -3644,11 +3652,11 @@ fn transcript_overlay_preserves_manual_scroll_position()
 fn transcript_overlay_consolidation_remaps_highlight_inside_range()
 ```
 
-**Purpose**: Checks that when a highlighted cell lies inside a consolidated range, the highlight moves to the replacement cell. This preserves a meaningful highlight after consolidation.
+**Purpose**: Checks that when highlighted cells are consolidated, a highlight inside the replaced range moves to the new consolidated cell. This keeps edit selection meaningful after history changes.
 
-**Data flow**: Creates a transcript overlay, highlights cell 3, consolidates range `2..5` into one replacement cell, and asserts that `highlight_cell` becomes `Some(2)`. It mutates the overlay under test.
+**Data flow**: It creates an overlay, highlights a cell within a range, consolidates that range into one cell, and asserts the highlight now points to the replacement index.
 
-**Call relations**: Exercises the inside-range highlight remapping logic in `TranscriptOverlay::consolidate_cells`.
+**Call relations**: This test focuses on the highlight-adjustment logic inside `TranscriptOverlay::consolidate_cells`.
 
 *Call graph*: 4 external calls (new, assert_eq!, transcript_overlay, vec!).
 
@@ -3659,11 +3667,11 @@ fn transcript_overlay_consolidation_remaps_highlight_inside_range()
 fn transcript_overlay_consolidation_remaps_highlight_after_range()
 ```
 
-**Purpose**: Checks that when a highlighted cell lies after a consolidated range, the highlight shifts left by the number of removed cells minus one. This keeps the highlight attached to the same logical later cell.
+**Purpose**: Checks that a highlighted cell after a consolidated range shifts left by the right amount. This keeps highlight indices aligned with the changed cell list.
 
-**Data flow**: Creates a transcript overlay, highlights cell 6, consolidates range `2..5`, and asserts that `highlight_cell` becomes `Some(4)`. It mutates the overlay under test.
+**Data flow**: It creates an overlay, highlights a later cell, consolidates earlier cells into one, and asserts the highlight index moved to the new equivalent position.
 
-**Call relations**: Exercises the after-range highlight remapping branch in `TranscriptOverlay::consolidate_cells`.
+**Call relations**: This test exercises the second highlight-remapping path inside `TranscriptOverlay::consolidate_cells`.
 
 *Call graph*: 4 external calls (new, assert_eq!, transcript_overlay, vec!).
 
@@ -3674,11 +3682,11 @@ fn transcript_overlay_consolidation_remaps_highlight_after_range()
 fn static_overlay_snapshot_basic()
 ```
 
-**Purpose**: Captures a baseline snapshot of static overlay rendering with a few lines. It guards the shared pager chrome for static content.
+**Purpose**: Captures the basic appearance of a static overlay. It guards against accidental visual changes to fixed-content pages.
 
-**Data flow**: Builds a static overlay, renders it into a `TestBackend` terminal, and snapshots the backend output. It writes only to the test terminal buffer.
+**Data flow**: It creates a static overlay with three lines and a title, draws it in a test terminal, and compares the backend output with a snapshot.
 
-**Call relations**: Exercises `StaticOverlay::render` and the shared pager rendering path.
+**Call relations**: This test uses `tests::static_overlay` and the production `StaticOverlay::render` path.
 
 *Call graph*: 5 external calls (new, assert_snapshot!, new, static_overlay, vec!).
 
@@ -3689,11 +3697,11 @@ fn static_overlay_snapshot_basic()
 fn transcript_line_numbers(overlay: &mut TranscriptOverlay, area: Rect) -> Vec<usize>
 ```
 
-**Purpose**: Renders a transcript overlay and extracts visible `line-NN` numbers from the content area in order. It is a helper for paging continuity tests.
+**Purpose**: Extracts visible `line-NN` numbers from a rendered transcript overlay. It supports paging tests by turning rendered output into a simple list of visible line indexes.
 
-**Data flow**: Renders the overlay into a buffer, computes the transcript content area from the overlay's pager geometry, scans each visible row for tokens prefixed with `line-`, parses the numbers, and returns them as a vector. It mutates only the test buffer.
+**Data flow**: It renders the overlay into a buffer, calculates the pager content area, scans each visible row for words starting with `line-`, parses numbers, and returns them in display order.
 
-**Call relations**: Used by the paging round-trip test to compare visible content before and after page movements.
+**Call relations**: `tests::transcript_overlay_paging_is_continuous_and_round_trips` calls this repeatedly to inspect what page is visible after scroll changes.
 
 *Call graph*: calls 1 internal fn (render); 4 external calls (empty, new, new, new).
 
@@ -3704,11 +3712,11 @@ fn transcript_line_numbers(overlay: &mut TranscriptOverlay, area: Rect) -> Vec<u
 fn transcript_overlay_paging_is_continuous_and_round_trips()
 ```
 
-**Purpose**: Verifies that page-down/page-up behavior is continuous and reversible across several scenarios. It ensures paging uses the real content height and does not skip or duplicate lines unexpectedly.
+**Purpose**: Verifies that page up and page down move by exactly one visible page and can round-trip. This protects paging from skipping or repeating lines unexpectedly.
 
-**Data flow**: Creates a 50-line transcript overlay, renders once to populate `last_content_height`, computes `page_height`, then manually adjusts `scroll_offset` through several scenarios while collecting visible line numbers with `transcript_line_numbers`, asserting continuity and round-trip equality. It mutates the overlay and test buffer repeatedly.
+**Data flow**: It creates a 50-line transcript, renders once to prime layout, records visible line numbers at different scroll offsets, simulates page movements by changing offset, and asserts continuity and reversibility.
 
-**Call relations**: Exercises `PagerView::page_height`, content-area calculations, and the overall paging semantics of transcript overlays.
+**Call relations**: This test uses `tests::transcript_line_numbers` and indirectly checks `PagerView::page_height` and layout caching.
 
 *Call graph*: 5 external calls (empty, new, assert_eq!, transcript_line_numbers, transcript_overlay).
 
@@ -3719,11 +3727,11 @@ fn transcript_overlay_paging_is_continuous_and_round_trips()
 fn static_overlay_wraps_long_lines()
 ```
 
-**Purpose**: Captures a snapshot showing that long static-overlay lines wrap correctly in a narrow pager width. It guards wrapping behavior for static content.
+**Purpose**: Checks that long static overlay lines wrap correctly in a narrow terminal. This protects readability on small screens.
 
-**Data flow**: Builds a static overlay with one long line, renders it into a narrow `TestBackend` terminal, and snapshots the output. It writes only to the test terminal buffer.
+**Data flow**: It creates a static overlay with one long line, draws it in a narrow test terminal, and compares the result to a snapshot.
 
-**Call relations**: Exercises `StaticOverlay::render` and wrapped paragraph height calculation.
+**Call relations**: This test exercises `StaticOverlay::with_title`, paragraph wrapping, and `PagerView::render`.
 
 *Call graph*: 5 external calls (new, assert_snapshot!, new, static_overlay, vec!).
 
@@ -3734,11 +3742,11 @@ fn static_overlay_wraps_long_lines()
 fn pager_view_content_height_counts_renderables()
 ```
 
-**Purpose**: Verifies that pager content height is the sum of each renderable's desired height. It is a direct unit test of the pager's height accounting.
+**Purpose**: Verifies that pager content height is the sum of its renderable blocks. This is a basic layout rule used by scrolling.
 
-**Data flow**: Builds a pager view from two paragraph blocks of known heights, calls `content_height(80)`, and asserts that the result is 5. It mutates no state.
+**Data flow**: It builds a pager with two paragraph blocks of known heights, asks for content height, and asserts the total equals the expected sum.
 
-**Call relations**: Directly tests `PagerView::content_height`.
+**Call relations**: This test directly checks `PagerView::content_height` using renderables from `tests::paragraph_block`.
 
 *Call graph*: 3 external calls (assert_eq!, pager_view, vec!).
 
@@ -3749,11 +3757,11 @@ fn pager_view_content_height_counts_renderables()
 fn pager_view_ensure_chunk_visible_scrolls_down_when_needed()
 ```
 
-**Purpose**: Verifies that `ensure_chunk_visible` scrolls downward enough to bring a lower chunk fully into view. It checks the downward-adjustment branch.
+**Purpose**: Checks that the pager scrolls down enough to show a later content chunk. This protects highlighted-cell scrolling and similar navigation.
 
-**Data flow**: Builds a pager view with three chunks, computes the content area, calls `ensure_chunk_visible(2, content_area)`, renders the pager into a buffer, converts it to text, and asserts that all lines of chunk `c` are visible. It mutates the pager's `scroll_offset` and the test buffer.
+**Data flow**: It creates a pager with several chunks, asks it to ensure the third chunk is visible, renders, converts the buffer to text, and asserts all lines of that chunk are visible.
 
-**Call relations**: Directly exercises `PagerView::ensure_chunk_visible` and then validates the result through rendering.
+**Call relations**: This test calls `PagerView::ensure_chunk_visible` directly and then confirms the result through `PagerView::render` and `tests::buffer_to_text`.
 
 *Call graph*: 6 external calls (empty, new, assert!, buffer_to_text, pager_view, vec!).
 
@@ -3764,11 +3772,11 @@ fn pager_view_ensure_chunk_visible_scrolls_down_when_needed()
 fn pager_view_ensure_chunk_visible_scrolls_up_when_needed()
 ```
 
-**Purpose**: Verifies that `ensure_chunk_visible` scrolls upward when the requested chunk lies above the current viewport. It checks the upward-adjustment branch.
+**Purpose**: Checks that the pager scrolls upward when the desired chunk is above the current view. This complements the scroll-down case.
 
-**Data flow**: Builds a pager view, sets `scroll_offset = 6`, calls `ensure_chunk_visible(0, area)`, and asserts that the offset becomes 0. It mutates the pager under test.
+**Data flow**: It creates a pager, sets its scroll offset below the first chunk, asks for the first chunk to be visible, and asserts the scroll offset becomes zero.
 
-**Call relations**: Directly tests the upward branch of `PagerView::ensure_chunk_visible`.
+**Call relations**: This test directly targets the upward branch of `PagerView::ensure_chunk_visible`.
 
 *Call graph*: 4 external calls (new, assert_eq!, pager_view, vec!).
 
@@ -3779,11 +3787,11 @@ fn pager_view_ensure_chunk_visible_scrolls_up_when_needed()
 fn pager_view_is_scrolled_to_bottom_accounts_for_wrapped_height()
 ```
 
-**Purpose**: Verifies that bottom detection uses wrapped content height rather than only raw chunk count, and that the bottom sentinel is honored. This protects follow-bottom logic for wrapped content.
+**Purpose**: Verifies that bottom detection uses rendered content height, including wrapping. This prevents the overlay from wrongly thinking it is at the bottom.
 
-**Data flow**: Builds a pager view with one 10-line paragraph block, renders it once into a buffer, asserts that `is_scrolled_to_bottom()` is false at offset 0, then sets `scroll_offset = usize::MAX`, renders again, and asserts that bottom detection is true. It mutates the pager and test buffer.
+**Data flow**: It creates a pager with tall content, renders it, checks that offset zero is not bottom, then sets the offset to the special bottom marker, renders again, and checks that it is bottom.
 
-**Call relations**: Exercises `PagerView::is_scrolled_to_bottom` in both ordinary and sentinel-bottom cases.
+**Call relations**: This test exercises `PagerView::render` and `PagerView::is_scrolled_to_bottom` together, using cached layout height from the render.
 
 *Call graph*: 5 external calls (empty, new, assert!, pager_view, vec!).
 
@@ -3795,11 +3803,11 @@ These files define configurable keymap actions and build the picker, editor, deb
 
 `orchestration` · `request handling`
 
-This module is the `ChatWidget` side of keymap editing. It does not define picker models itself; instead it bridges between persisted config, runtime keymap derivation, bottom-pane view presentation, and the widget fields that cache active bindings. `open_keymap_picker` is the root entry: it validates `self.config.tui_keymap` by constructing a `RuntimeKeymap`, then builds filtered picker parameters using `keymap_action_filter`; invalid config is surfaced immediately as an error rather than letting the user edit against stale or partial bindings.
+This file is the bridge between the main chat widget and the keymap setup screens. A keymap is the list of keyboard shortcuts the terminal user interface responds to. The actual picker screens and editing rules live elsewhere, in `keymap_setup`; this file decides when to open those screens, what current shortcut data to pass in, and how to refresh the chat widget after a change.
 
-The remaining openers each target a specific step in the flow: action menu, capture view, debug inspector, and replace-binding menu. They all pass the already-resolved `RuntimeKeymap` through to `keymap_setup` builders so the UI reflects the exact binding state associated with the triggering event. `return_to_keymap_picker` is careful about navigation stack hygiene: it tries to replace known keymap-related active views in place so repeated edits do not accumulate obsolete submenus, and falls back to showing a fresh picker if the expected stack is no longer active.
+The main idea is consistency. If a user remaps a key, the program must not only change the stored configuration. It must also update the live shortcut tables that are already being used by the chat screen and bottom pane. Otherwise the interface could show the new shortcut while parts of the app still listen for the old one.
 
-`apply_keymap_update` enforces the file’s key invariant that a committed edit must update three places together: persisted in-memory config (`self.config.tui_keymap`), app-level shortcut caches (`copy_last_response_binding`, `chat_keymap`, and the derived queued-message edit hint), and the bottom pane’s runtime bindings. It also recomputes the queued-message edit hint using terminal capabilities from `terminal_info()` before requesting redraw.
+The methods here open the root keymap picker, action-specific menus, key-capture views, a debug inspector, and a replacement menu for actions that have more than one shortcut. They also guide the user back to the right row after an edit, like returning someone to the same shelf in a store after they changed an item. If the saved keymap is invalid, the file shows an error instead of building a picker from bad data.
 
 #### Function details
 
@@ -3809,11 +3817,11 @@ The remaining openers each target a specific step in the flow: action menu, capt
 fn open_keymap_picker(&mut self)
 ```
 
-**Purpose**: Opens the root `/keymap` picker using the current persisted keymap configuration after validating it into a runtime keymap.
+**Purpose**: Opens the main `/keymap` picker using the current saved shortcut settings. It first checks that those settings can be turned into a working runtime keymap, so the user does not edit from broken or stale shortcut data.
 
-**Data flow**: Reads `self.config.tui_keymap` and calls `RuntimeKeymap::from_config(...)`. On success it computes a `KeymapActionFilter` from `keymap_action_filter()`, builds selection params with `build_keymap_picker_params_with_filter`, and shows them in the bottom pane. On error it formats and emits an error message describing the invalid config.
+**Data flow**: It reads `self.config.tui_keymap`, tries to build a `RuntimeKeymap` from it, and then uses that working keymap plus a small action filter to build the picker rows. If that succeeds, the bottom pane changes to the selection view. If it fails, the chat widget adds an error message explaining that the `tui.keymap` configuration is invalid.
 
-**Call relations**: This is the entrypoint into the keymap-editing UI. It depends on `keymap_action_filter` so the picker can hide or show actions based on current widget capabilities such as fast mode.
+**Call relations**: This is the entry point when the chat widget needs to show the root keymap picker. It calls `keymap_action_filter` to include current widget state, asks `RuntimeKeymap::from_config` to validate and expand the saved settings, and then hands the prepared picker parameters to the bottom pane.
 
 *Call graph*: calls 2 internal fn (keymap_action_filter, from_config); 2 external calls (format!, build_keymap_picker_params_with_filter).
 
@@ -3829,11 +3837,11 @@ fn open_keymap_action_menu(
     )
 ```
 
-**Purpose**: Shows the per-action menu for a selected keymap action using the runtime keymap associated with that selection.
+**Purpose**: Opens the menu for one specific shortcut action, such as an action the user selected from the root picker. It shows the choices for that action using the already-resolved runtime keymap passed in by the caller.
 
-**Data flow**: Takes `context`, `action`, and `runtime_keymap`, builds selection params with `keymap_setup::build_keymap_action_menu_params(context, action, runtime_keymap, &self.config.tui_keymap)`, and passes them to `bottom_pane.show_selection_view`.
+**Data flow**: It receives a context name, an action name, and a `RuntimeKeymap`. It combines those with the saved keymap configuration to build menu parameters, then tells the bottom pane to show that selection menu.
 
-**Call relations**: Called after the user selects an action in the root picker. It intentionally uses the caller-provided runtime keymap rather than recomputing one.
+**Call relations**: This is used after a user chooses an action from the keymap picker. Instead of recalculating the keymap, it trusts the runtime keymap supplied with that app event, then calls `build_keymap_action_menu_params` to prepare the submenu shown in the bottom pane.
 
 *Call graph*: calls 1 internal fn (build_keymap_action_menu_params).
 
@@ -3850,11 +3858,11 @@ fn open_keymap_capture(
     )
 ```
 
-**Purpose**: Opens the key-capture view for a specific keymap edit intent and wires it back into the app-event path.
+**Purpose**: Opens a view that waits for the user to press a key for a shortcut edit. This is used when the user wants to set, replace, or add an alternate binding for an action.
 
-**Data flow**: Takes `context`, `action`, `intent`, and `runtime_keymap`, builds a capture view with `keymap_setup::build_keymap_capture_view(..., self.app_event_tx.clone())`, shows it via `bottom_pane.show_view(Box::new(view))`, and requests redraw.
+**Data flow**: It receives the action location, the edit intent, and the current runtime keymap. It also clones the chat widget’s app-event sender so the capture view can report the pressed key back through the normal event path. The resulting capture view is placed in the bottom pane, and the screen is marked for redraw.
 
-**Call relations**: Used from keymap menus when the next step is to capture a new key binding. The injected event sender ensures the captured key returns through the normal persistence/update flow.
+**Call relations**: This follows a menu choice that requires a new keypress from the user. It delegates the actual key interpretation to `build_keymap_capture_view`, then wraps the view for the bottom pane. By sending the captured key back through the app-event path, later persistence and live keymap refresh logic are not skipped.
 
 *Call graph*: calls 1 internal fn (build_keymap_capture_view); 1 external calls (new).
 
@@ -3865,11 +3873,11 @@ fn open_keymap_capture(
 fn open_keymap_debug(&mut self, runtime_keymap: &RuntimeKeymap)
 ```
 
-**Purpose**: Shows the keypress inspector/debug view for the current runtime keymap.
+**Purpose**: Opens a keypress inspector that shows how the current shortcut bindings are understood. This is useful for diagnosing what the terminal is sending and which bindings are active.
 
-**Data flow**: Builds a debug view with `keymap_setup::build_keymap_debug_view(runtime_keymap, &self.config.tui_keymap)`, shows it in the bottom pane, and requests redraw.
+**Data flow**: It receives the current runtime keymap and reads the saved keymap configuration. It builds a debug view from those two sources, places that view in the bottom pane, and requests a redraw so it appears immediately.
 
-**Call relations**: Used by keymap tooling to inspect how current bindings resolve without modifying them.
+**Call relations**: This is called when the keymap flow needs to show diagnostic information rather than an editing menu. It hands the current keymap data to `build_keymap_debug_view`, then displays the resulting view through the same bottom-pane mechanism as the other keymap screens.
 
 *Call graph*: 2 external calls (new, build_keymap_debug_view).
 
@@ -3885,11 +3893,11 @@ fn open_keymap_replace_binding_menu(
     )
 ```
 
-**Purpose**: Shows the menu for choosing which existing binding of a multi-bound action should be replaced.
+**Purpose**: Opens a menu that lets the user choose which existing shortcut binding should be replaced. This matters for actions that have multiple keys, because replacing one should not accidentally remove the others.
 
-**Data flow**: Takes `context`, `action`, and `runtime_keymap`, builds selection params with `build_keymap_replace_binding_menu_params`, and shows them in the bottom pane.
+**Data flow**: It receives a context, an action, and the current runtime keymap. It builds selection parameters for the replace-binding menu and asks the bottom pane to show that menu.
 
-**Call relations**: Used only in the branch of the keymap-edit flow where an action has multiple effective bindings and the user must choose one to replace.
+**Call relations**: This sits between choosing an action and capturing a new key when there is more than one existing binding. It calls `build_keymap_replace_binding_menu_params` so the next capture step can know exactly which old binding the user meant to replace.
 
 *Call graph*: calls 1 internal fn (build_keymap_replace_binding_menu_params).
 
@@ -3905,11 +3913,11 @@ fn return_to_keymap_picker(
     )
 ```
 
-**Purpose**: Navigates back to the root keymap picker with the edited action selected, replacing stale submenu views when possible.
+**Purpose**: Returns the user to the root keymap picker after an edit, with the edited action selected. It tries to replace old keymap submenus instead of piling up outdated screens in the bottom pane’s navigation stack.
 
-**Data flow**: Builds picker params for the selected action using `build_keymap_picker_params_for_selected_action_with_filter(runtime_keymap, &self.config.tui_keymap, self.keymap_action_filter(), context, action)`. It then asks `bottom_pane.replace_active_views_with_selection_view` to replace a known stack of keymap view ids with the new picker. If replacement fails, it rebuilds the same params and shows a fresh selection view instead. Finally it requests redraw.
+**Data flow**: It receives the edited context and action plus the current runtime keymap. It builds picker parameters that highlight that action, then asks the bottom pane to replace any active keymap picker or submenu views with the refreshed picker. If that replacement is not possible, it shows a fresh picker instead. Finally, it requests a redraw.
 
-**Call relations**: Called after a keymap edit completes so the user lands back on the relevant picker row. It uses `keymap_action_filter` and coordinates with bottom-pane view-stack replacement semantics.
+**Call relations**: This is used after a keymap edit has been applied or when navigation should return to the main picker. It calls `keymap_action_filter` and `build_keymap_picker_params_for_selected_action_with_filter`; then it either refreshes the existing keymap view stack or falls back to opening a new picker so the user does not remain on stale edit screens.
 
 *Call graph*: calls 1 internal fn (keymap_action_filter); 1 external calls (build_keymap_picker_params_for_selected_action_with_filter).
 
@@ -3920,11 +3928,11 @@ fn return_to_keymap_picker(
 fn keymap_action_filter(&self) -> keymap_setup::KeymapActionFilter
 ```
 
-**Purpose**: Builds the current action-filter settings used when generating keymap picker rows.
+**Purpose**: Builds a small filter describing which keymap actions should be shown for the chat widget’s current mode. Right now it records whether fast mode is enabled.
 
-**Data flow**: Reads `self.fast_mode_enabled()` and returns `keymap_setup::KeymapActionFilter { fast_mode_enabled: ... }`.
+**Data flow**: It reads `self.fast_mode_enabled()` from the chat widget and places that boolean value into a `KeymapActionFilter`. The returned filter is then used when building picker rows.
 
-**Call relations**: Used by both `open_keymap_picker` and `return_to_keymap_picker` so picker contents stay consistent with current widget capabilities.
+**Call relations**: This helper is called by `open_keymap_picker` and `return_to_keymap_picker`. In both cases, it gives the picker-building code just enough current widget state to decide which shortcut actions are relevant.
 
 *Call graph*: called by 2 (open_keymap_picker, return_to_keymap_picker).
 
@@ -3939,24 +3947,24 @@ fn apply_keymap_update(
     )
 ```
 
-**Purpose**: Applies a committed keymap edit to all live widget state that depends on key bindings, keeping config, cached shortcuts, and bottom-pane bindings synchronized.
+**Purpose**: Applies an already-committed shortcut update to the live chat widget. The caller is expected to have saved the configuration first; this method makes the running interface agree with that saved change.
 
-**Data flow**: Takes a new `TuiKeymap` config and a `RuntimeKeymap`. It writes `self.config.tui_keymap = keymap_config`, updates `self.copy_last_response_binding` from `runtime_keymap.app.copy`, updates `self.chat_keymap` from `runtime_keymap.chat`, recomputes `self.queued_message_edit_hint_binding` using `queued_message_edit_hint_binding(&self.chat_keymap.edit_queued_message, terminal_info())`, pushes that hint binding into the bottom pane, updates bottom-pane runtime bindings with `set_keymap_bindings(runtime_keymap)`, and requests redraw.
+**Data flow**: It receives the new `TuiKeymap` configuration and the matching `RuntimeKeymap`. It stores the new config in the widget, refreshes cached shortcut bindings such as copy-last-response and queued-message editing, updates the bottom pane’s shortcut bindings, and requests a redraw.
 
-**Call relations**: Called after config persistence succeeds for a keymap edit. It is the final synchronization step that makes the new bindings take effect immediately in both app-level and bottom-pane handlers.
+**Call relations**: This is called after a keymap edit has been accepted and persisted. It calls `queued_message_edit_hint_binding` with terminal information from `terminal_info` so the visible hint matches the current terminal, then pushes the updated bindings into the bottom pane. This keeps saved settings, cached app shortcuts, and active UI handlers in sync.
 
 *Call graph*: 2 external calls (terminal_info, queued_message_edit_hint_binding).
 
 
 ### `tui/src/keymap_setup.rs`
 
-`orchestration` · `interactive keymap editing in the bottom pane`
+`domain_logic` · `request handling`
 
-This module is the UI-side companion to `keymap.rs`. It starts from a resolved `RuntimeKeymap` plus the root `TuiKeymap` config and builds selection views for editing shortcuts. `build_keymap_action_menu_params` inspects both runtime bindings and root config state to decide which operations are available: unbound actions only offer “Set key”, single-binding actions offer replace/add, and multi-binding actions add a replace-one submenu. The menu header explicitly shows the active binding summary, whether the source is default or custom, and the exact `tui.keymap.<context>.<action>` path that will be written.
+This file is the guided remapping flow for keyboard shortcuts. Without it, users could see shortcuts elsewhere in the app, but they would not have an in-app way to safely change them. The flow works like a small wizard: first it shows the user a list of actions, then an action-specific menu, then a temporary screen that waits for exactly one keypress. The file does not write config files itself. Instead, it sends app events with enough information for the main app layer to validate, save, reload, and report errors.
 
-Actual edits are computed by `keymap_with_edit`. It reads the current effective bindings from the runtime map, applies `ReplaceAll`, `AddAlternate`, or `ReplaceOne`, rejects stale replace-one selections, de-duplicates replacements, and returns either `KeymapEditOutcome::Updated` with a new boxed `TuiKeymap` plus status message, or `Unchanged` when the effective set did not change. `keymap_with_bindings` and `keymap_without_custom_binding` mutate the concrete root config slot selected through `actions::binding_slot`.
+A key idea here is that the currently active shortcut may come from defaults, from a global fallback, or from user config. The menus show that resolved, current truth. But when the user edits, the result is written to a concrete root config slot such as `tui.keymap.composer.submit`.
 
-The transient `KeymapCaptureView` renders instructions, captures exactly one non-release `KeyEvent`, treats `Esc` as cancel, converts the event into a canonical config key string via `key_event_to_config_key_spec`, and emits `AppEvent::KeymapCaptured`. Serialization is strict: only ctrl/alt/shift modifiers, printable ASCII chars, supported named keys, and function keys up to `MAX_FUNCTION_KEY` are accepted. Uppercase chars are normalized into lowercase plus `shift`, and `-` is stored as `minus`.
+The file also converts terminal key events into config strings like `ctrl-alt-k` or `shift-page-down`. It rejects keys that cannot be stored. Conflict checking is intentionally left to the runtime keymap code, so the same rules are used everywhere instead of being copied into this UI.
 
 #### Function details
 
@@ -3966,11 +3974,11 @@ The transient `KeymapCaptureView` renders instructions, captures exactly one non
 fn key_binding_span(binding: &str) -> ratatui::text::Span<'static>
 ```
 
-**Purpose**: Formats one binding label for menu display, dimming the special `unbound` marker and coloring actual bindings cyan.
+**Purpose**: Formats a shortcut name for display in the terminal UI. It makes real bindings stand out and makes the word `unbound` look quieter.
 
-**Data flow**: Reads a binding string slice, compares it to `"unbound"`, and returns a styled `Span<'static>` built from an owned string.
+**Data flow**: It receives a binding string. If the string is `unbound`, it creates a dim display span; otherwise it creates a cyan display span. The returned span is later placed into menu text.
 
-**Call relations**: Used when building action-menu headers so the current binding summary is visually distinct.
+**Call relations**: This is a small display helper used while building keymap UI text. It supports the action menu by making the current binding easy to scan.
 
 
 ##### `keymap_action_menu_hint_line`  (lines 93–100)
@@ -3979,11 +3987,11 @@ fn key_binding_span(binding: &str) -> ratatui::text::Span<'static>
 fn keymap_action_menu_hint_line() -> Line<'static>
 ```
 
-**Purpose**: Builds the standard footer hint line for keymap action menus. It advertises Enter for selection and Esc for going back.
+**Purpose**: Builds the short footer hint shown at the bottom of keymap menus. It tells the user that Enter selects and Esc goes back.
 
-**Data flow**: Constructs and returns a `Line<'static>` from styled text fragments.
+**Data flow**: It takes no input. It creates a styled line made from the words `enter`, `select`, `esc`, and `back`. The line is returned for use by selection views.
 
-**Call relations**: Shared by both the main action menu and the replace-one binding picker.
+**Call relations**: The action menu and the replace-binding menu both call this when they prepare their footer. It keeps those menus using the same instructions.
 
 *Call graph*: called by 2 (build_keymap_action_menu_params, build_keymap_replace_binding_menu_params); 2 external calls (from, vec!).
 
@@ -3998,11 +4006,11 @@ fn open_capture_action(
 ) -> Box<dyn Fn(&AppEventSender) + Send + Sync>
 ```
 
-**Purpose**: Creates a reusable selection-item callback that opens the key-capture view for a specific context/action/intent triple.
+**Purpose**: Creates a menu action that opens the key-capture screen for a chosen shortcut edit. It packages the chosen context, action, and edit intent into an app event.
 
-**Data flow**: Captures owned `context`, `action`, and `KeymapEditIntent` values in a boxed closure; when invoked with an `AppEventSender`, the closure sends `AppEvent::OpenKeymapCapture` containing cloned copies.
+**Data flow**: It receives the shortcut context, action, and intent. It returns a boxed callback; when that callback is later run with an event sender, it sends an `OpenKeymapCapture` event using cloned copies of those values.
 
-**Call relations**: Used by `action_menu_item` to wire menu rows into the app event loop.
+**Call relations**: Menu rows use this helper when selecting a row should move the user into key capture. The actual opening is done later by the app event loop.
 
 *Call graph*: 1 external calls (new).
 
@@ -4020,11 +4028,11 @@ fn action_menu_item(
 ) -> SelectionItem
 ```
 
-**Purpose**: Constructs one standard `SelectionItem` row for the action menu. It packages labels, descriptions, and the callback that opens capture for a chosen edit intent.
+**Purpose**: Builds one selectable row in the action-specific shortcut menu. It is used for choices such as replacing a binding or adding an alternate binding.
 
-**Data flow**: Takes display strings plus context/action/intent, builds a `SelectionItem` with those texts and a single action closure from `open_capture_action`, and returns it.
+**Data flow**: It receives the row label, descriptions, target shortcut, and edit intent. It creates a `SelectionItem` with one action: open the key-capture view for that edit. The finished row is returned to the menu builder.
 
-**Call relations**: Called by `build_keymap_action_menu_params` for the common replace/add/set rows.
+**Call relations**: The main action-menu builder calls this several times so repeated row setup stays consistent. The row hands off to `open_capture_action` so selection becomes an app event.
 
 *Call graph*: called by 1 (build_keymap_action_menu_params); 2 external calls (default, vec!).
 
@@ -4040,11 +4048,11 @@ fn build_keymap_action_menu_params(
 ) -> SelectionViewParams
 ```
 
-**Purpose**: Builds the second-step menu shown after the user selects a shortcut action in `/keymap`. The menu adapts to the action’s current effective binding count and whether a root override exists.
+**Purpose**: Builds the menu shown after a user chooses one shortcut action. This menu decides whether the user can set, replace, add, replace one of many, or clear a custom binding.
 
-**Data flow**: Reads runtime bindings via `active_binding_specs`, checks root-config presence with `has_custom_binding`, looks up descriptor metadata in `KEYMAP_ACTIONS`, builds a `ColumnRenderable` header showing label, context, current binding summary, source, config path, and description, then assembles `SelectionItem`s for set/replace/add/remove/back and returns a populated `SelectionViewParams`.
+**Data flow**: It receives the selected context and action, the resolved runtime keymap, and the root keymap config. It reads the active bindings and whether a custom config value exists, builds a header explaining the current state, creates the right menu rows, and returns `SelectionViewParams` for the bottom-pane selection UI.
 
-**Call relations**: Opened by higher-level app code after the picker selection. It delegates binding introspection to `active_binding_specs`, descriptor labeling to `action_label`, and uses `action_menu_item` plus custom closures for replace-one and clear actions.
+**Call relations**: The app calls this when opening the action menu, and tests exercise it directly. It relies on helpers such as `active_binding_specs`, `has_custom_binding`, `action_menu_item`, and `keymap_action_menu_hint_line`; selected rows then emit events that continue the remapping flow.
 
 *Call graph*: calls 6 internal fn (action_menu_item, action_label, active_binding_specs, has_custom_binding, keymap_action_menu_hint_line, new); called by 6 (open_keymap_action_menu, action_menu_content_snapshot, action_menu_disables_clear_when_action_has_no_custom_binding, capture_completion_returns_to_selected_keymap_picker_row, clear_completion_returns_to_selected_keymap_picker_row, replace_one_completion_drops_focused_keymap_submenus); 6 external calls (new, default, from, new, format!, vec!).
 
@@ -4059,11 +4067,11 @@ fn build_keymap_replace_binding_menu_params(
 ) -> SelectionViewParams
 ```
 
-**Purpose**: Builds the submenu used when an action currently has multiple bindings and the user wants to replace exactly one of them.
+**Purpose**: Builds the submenu used when an action has multiple shortcuts and the user wants to replace just one. It lets the user choose which existing key should be swapped out.
 
-**Data flow**: Reads the active binding specs for the selected action, builds a header naming the action and context, maps each current binding string into a `SelectionItem` whose callback sends `AppEvent::OpenKeymapCapture` with `KeymapEditIntent::ReplaceOne { old_key }`, and returns `SelectionViewParams` for the submenu.
+**Data flow**: It receives a context, action, and runtime keymap. It looks up the active binding strings, turns each one into a selectable row, and returns menu parameters whose row actions open key capture with a `ReplaceOne` intent.
 
-**Call relations**: Opened from the main action menu when an action has more than one active binding.
+**Call relations**: The app opens this after the main action menu asks for `Replace one binding...`. Each row sends an `OpenKeymapCapture` event so the next step can capture the replacement key.
 
 *Call graph*: calls 4 internal fn (action_label, active_binding_specs, keymap_action_menu_hint_line, new); called by 3 (open_keymap_replace_binding_menu, action_menu_content_snapshot, replace_one_completion_drops_focused_keymap_submenus); 4 external calls (new, default, from, vec!).
 
@@ -4080,11 +4088,11 @@ fn build_keymap_conflict_params(
 ) -> SelectionViewParams
 ```
 
-**Purpose**: Builds a conflict dialog shown after capture when the proposed edit fails runtime keymap validation. It gives the user a retry path without losing the selected action and intent.
+**Purpose**: Builds the popup shown when a captured key cannot be used for the chosen shortcut. It gives the user a simple choice: try another key or cancel.
 
-**Data flow**: Takes the selected context/action, captured key string, edit intent, and error text; builds a `SelectionViewParams` with a title, subtitle, footer note containing the error, standard popup hints, and two items: retry capture or cancel.
+**Data flow**: It receives the shortcut identity, the attempted key, the original edit intent, and an error message. It creates selection parameters with a title, explanatory text, and two rows. The retry row sends another `OpenKeymapCapture` event.
 
-**Call relations**: Used by the app-layer capture-apply flow when `RuntimeKeymap::from_config` rejects the edited config.
+**Call relations**: The app calls this after applying a captured key fails validation. It keeps the user in the same editing story instead of leaving them with only an error.
 
 *Call graph*: calls 1 internal fn (standard_popup_hint_line); called by 1 (apply_keymap_capture); 4 external calls (default, from, format!, vec!).
 
@@ -4101,11 +4109,11 @@ fn build_keymap_capture_view(
 ) -> KeymapCaptureView
 ```
 
-**Purpose**: Creates the transient bottom-pane view that waits for one keypress for a pending edit. It shows the action label and current effective binding summary before capture.
+**Purpose**: Creates the temporary screen that waits for the user's next keypress. It shows the action being edited and its current binding before capture begins.
 
-**Data flow**: Looks up the selected action’s runtime bindings with `bindings_for_action`, formats them with `format_binding_summary`, derives a display label with `action_label`, and constructs a `KeymapCaptureView` with those values plus the app event sender.
+**Data flow**: It receives the target shortcut, edit intent, current runtime keymap, and app event sender. It looks up and formats the current binding summary, labels the action, and returns a new `KeymapCaptureView` ready to render and receive key events.
 
-**Call relations**: Opened by app code in response to `AppEvent::OpenKeymapCapture` from the action menu or replace-one submenu.
+**Call relations**: The app calls this when it handles an `OpenKeymapCapture` event. The returned view later sends a `KeymapCaptured` event after the user presses a valid key.
 
 *Call graph*: calls 4 internal fn (new, action_label, bindings_for_action, format_binding_summary); called by 2 (open_keymap_capture, capture_completion_returns_to_selected_keymap_picker_row).
 
@@ -4121,11 +4129,11 @@ fn keymap_with_replacement(
 ) -> Result<TuiKeymap, String>
 ```
 
-**Purpose**: Test-only convenience wrapper that replaces an action’s bindings with a single key string.
+**Purpose**: Test-only helper that creates a copy of a keymap with one action replaced by one key. It makes tests shorter and easier to read.
 
-**Data flow**: Passes the provided single key as a one-element slice into `keymap_with_bindings` and returns the resulting edited `TuiKeymap` or error.
+**Data flow**: It receives a keymap, context, action, and key string. It wraps the key in a one-item list and delegates to `keymap_with_bindings`. The result is either the edited keymap or an error for an unknown action.
 
-**Call relations**: Used by tests to build simple customized keymaps without repeating slice construction.
+**Call relations**: Many tests call this to prepare customized keymaps. It is a narrow wrapper around the more general `keymap_with_bindings` helper.
 
 *Call graph*: calls 1 internal fn (keymap_with_bindings); called by 9 (action_menu_content_snapshot, capture_completion_returns_to_selected_keymap_picker_row, clear_completion_returns_to_selected_keymap_picker_row, clear_removes_custom_binding, debug_view_uses_custom_binding_source, picker_custom_render_snapshot, picker_customized_tab_contains_root_overrides, replacement_rejects_unknown_action, replacement_sets_single_binding).
 
@@ -4143,11 +4151,11 @@ fn keymap_with_edit(
 ) -> Result<KeymapEditOutcome, Strin
 ```
 
-**Purpose**: Applies one logical edit operation—replace all, add alternate, or replace one—to a selected action and returns either an updated config snapshot or an unchanged result. It operates on effective runtime bindings so edits preserve defaults when needed.
+**Purpose**: Applies one captured key to one shortcut action and returns the edited root keymap config. It is the main editing rule engine for replace, add alternate, and replace-one operations.
 
-**Data flow**: Reads the current effective binding specs via `active_binding_specs`; computes `next_bindings` based on the `KeymapEditIntent`, rejecting stale `old_key` values and de-duplicating replace-one results with `dedup_bindings`; compares the new list to the current list; if unchanged returns `KeymapEditOutcome::Unchanged`, otherwise writes the new list into a cloned config via `keymap_with_bindings` and returns `KeymapEditOutcome::Updated` with the new boxed config, final binding strings, and a status message.
+**Data flow**: It receives the old root config, the current resolved runtime keymap, the selected action, the captured key, and the edit intent. It reads the active bindings, computes the next binding list, detects no-op changes and stale replace-one choices, then returns either an unchanged message or an updated config plus a user-facing message.
 
-**Call relations**: Called by the app-layer capture handler after a key is captured. It delegates slot mutation to `keymap_with_bindings` and relies on later runtime resolution to catch conflicts.
+**Call relations**: The app calls this after key capture. It relies on `active_binding_specs`, `dedup_bindings`, and `keymap_with_bindings`, while tests cover the important edit cases and stale-menu protection.
 
 *Call graph*: calls 3 internal fn (active_binding_specs, dedup_bindings, keymap_with_bindings); called by 8 (apply_keymap_capture, add_alternate_duplicate_is_noop, add_alternate_grows_default_multi_binding, add_alternate_grows_single_binding, replace_all_collapses_multi_binding_to_single, replace_one_deduplicates_replacement, replace_one_preserves_other_bindings, replace_one_rejects_stale_old_key); 3 external calls (new, format!, vec!).
 
@@ -4163,11 +4171,11 @@ fn keymap_with_bindings(
 ) -> Result<TuiKeymap, String>
 ```
 
-**Purpose**: Writes a concrete binding list into the root config slot for one action. It preserves the distinction between one binding and many bindings in the serialized config shape.
+**Purpose**: Writes a concrete list of key strings into one root keymap slot. It is the low-level helper that actually changes the copied config object.
 
-**Data flow**: Clones the input `TuiKeymap`, locates the mutable `Option<KeybindingsSpec>` slot with `binding_slot`, errors if the action is unknown, then writes `Some(KeybindingsSpec::One(...))` for a single key or `Some(KeybindingsSpec::Many(...))` for multiple keys and returns the cloned config.
+**Data flow**: It receives a keymap, context, action, and list of key strings. It clones the keymap, finds the matching config slot, stores either a single binding or many bindings, and returns the changed copy. If the action is unknown, it returns an error.
 
-**Call relations**: Used by `keymap_with_edit` and test helpers as the low-level config mutation primitive.
+**Call relations**: `keymap_with_edit` and test helpers call this when they need to materialize a new config value. It depends on `binding_slot` from the actions module to find the right field.
 
 *Call graph*: calls 1 internal fn (binding_slot); called by 6 (keymap_with_edit, keymap_with_replacement, action_menu_content_snapshot, replace_all_collapses_multi_binding_to_single, replace_one_deduplicates_replacement, replace_one_preserves_other_bindings); 4 external calls (new, Many, One, clone).
 
@@ -4182,11 +4190,11 @@ fn active_binding_specs(
 ) -> Result<Vec<String>, String>
 ```
 
-**Purpose**: Converts the currently active runtime bindings for one action back into canonical config strings. This lets the editor preserve effective defaults and alternates when building new root overrides.
+**Purpose**: Returns the active shortcuts for one action as config-style strings. This lets the UI show and preserve the same binding names that the config file uses.
 
-**Data flow**: Looks up the action’s `&[KeyBinding]` via `bindings_for_action`, errors if the action is unknown, maps each binding through `binding_to_config_key_spec`, and collects the resulting `Vec<String>`.
+**Data flow**: It receives the runtime keymap plus a context and action. It looks up the resolved bindings for that action, converts each terminal binding back into a config string, and returns the list. If the action is no longer known, it returns a stale-selection error.
 
-**Call relations**: Used by menus for display and by `keymap_with_edit` when computing edits against the effective runtime state.
+**Call relations**: The action menu, replace-binding menu, and edit application path all call this. It keeps display and editing based on the resolved runtime keymap instead of guessing from raw config.
 
 *Call graph*: calls 1 internal fn (bindings_for_action); called by 3 (build_keymap_action_menu_params, build_keymap_replace_binding_menu_params, keymap_with_edit).
 
@@ -4197,11 +4205,11 @@ fn active_binding_specs(
 fn dedup_bindings(bindings: Vec<String>) -> Vec<String>
 ```
 
-**Purpose**: Removes duplicate canonical key strings while preserving first-seen order.
+**Purpose**: Removes duplicate key strings while preserving the first occurrence. This prevents a replace-one edit from leaving the same shortcut listed twice.
 
-**Data flow**: Consumes a `Vec<String>`, folds it into a new vector, and only pushes keys not already present.
+**Data flow**: It receives a list of binding strings. It walks through them in order, keeps a new list, and only adds a key if it has not already appeared. The cleaned list is returned.
 
-**Call relations**: Used by `keymap_with_edit` for replace-one operations where the replacement may already exist elsewhere in the binding list.
+**Call relations**: `keymap_with_edit` calls this after replacing one binding, because the replacement key might already be used as another alternate for the same action.
 
 *Call graph*: called by 1 (keymap_with_edit); 1 external calls (new).
 
@@ -4216,11 +4224,11 @@ fn keymap_without_custom_binding(
 ) -> Result<TuiKeymap, String>
 ```
 
-**Purpose**: Clears the root-level override for one action so runtime resolution falls back to defaults or global fallback again.
+**Purpose**: Removes the explicit root-level shortcut override for one action. This restores default or fallback behavior instead of explicitly unbinding the action.
 
-**Data flow**: Clones the input `TuiKeymap`, locates the mutable slot with `binding_slot`, sets it to `None`, and returns the edited config or an unknown-action error.
+**Data flow**: It receives a keymap, context, and action. It clones the keymap, finds the matching slot, sets that slot to `None`, and returns the changed copy. Unknown actions produce an error.
 
-**Call relations**: Called by the app-layer clear action after the user chooses “Remove custom binding”.
+**Call relations**: The app calls this when handling a clear-keymap request. Tests verify that clearing is different from setting an empty binding list.
 
 *Call graph*: calls 1 internal fn (binding_slot); called by 2 (apply_keymap_clear, clear_removes_custom_binding); 1 external calls (clone).
 
@@ -4231,11 +4239,11 @@ fn keymap_without_custom_binding(
 fn has_custom_binding(keymap: &TuiKeymap, context: &str, action: &str) -> Result<bool, String>
 ```
 
-**Purpose**: Checks whether a selected action currently has a root-level override in config.
+**Purpose**: Checks whether one action currently has a root-level custom binding in the user config. It does not care what the resolved runtime shortcut is.
 
-**Data flow**: Clones the `TuiKeymap`, locates the slot with `binding_slot`, and returns `Ok(slot.is_some())` or an unknown-action error.
+**Data flow**: It receives a keymap, context, and action. It clones the keymap, finds the matching slot, and returns whether that slot contains a value. Unknown actions produce an error.
 
-**Call relations**: Used by action-menu construction and picker row generation to distinguish custom overrides from inherited defaults.
+**Call relations**: The action-menu builder calls this to decide whether the `Remove custom binding` row should be enabled or disabled.
 
 *Call graph*: calls 1 internal fn (binding_slot); called by 1 (build_keymap_action_menu_params); 1 external calls (clone).
 
@@ -4253,11 +4261,11 @@ fn new(
     ) -> Self
 ```
 
-**Purpose**: Constructs the transient capture view state for one pending keymap edit.
+**Purpose**: Creates a new key-capture view with all the information needed to show instructions and report the captured key. It starts incomplete and with no error message.
 
-**Data flow**: Stores the provided context, action, intent, label, current binding summary, and `AppEventSender` into a new `KeymapCaptureView`, initializing `complete` to `false` and `error_message` to `None`.
+**Data flow**: It receives the target action, edit intent, display label, current binding summary, and app event sender. It stores these values in a `KeymapCaptureView` and initializes `complete` to false. The view object is returned.
 
-**Call relations**: Called by `build_keymap_capture_view` and directly by snapshot tests.
+**Call relations**: `build_keymap_capture_view` uses this during normal app flow, while a snapshot test uses it directly to check the rendered screen.
 
 *Call graph*: called by 2 (build_keymap_capture_view, capture_view_snapshot).
 
@@ -4268,11 +4276,11 @@ fn new(
 fn lines(&self, width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Builds the rendered text lines for the capture view, including any wrapped validation error.
+**Purpose**: Builds the text lines displayed by the capture screen. If the user pressed an unsupported key, it includes a wrapped error message.
 
-**Data flow**: Computes a wrap width from the provided terminal width, creates base lines for title, action, current binding, and instructions, and if `error_message` is present wraps it with `textwrap` into additional red lines before returning the full `Vec<Line<'static>>`.
+**Data flow**: It receives the available width. It creates lines for the title, action, current binding, and instructions; if an error is stored, it wraps that error to fit the width and adds it in red. The list of lines is returned.
 
-**Call relations**: Used by both `render` and `desired_height` so layout and drawing stay consistent.
+**Call relations**: Both rendering and height calculation call this, so the screen draws exactly as tall as the text it produces.
 
 *Call graph*: called by 2 (desired_height, render); 5 external calls (from, new, wrap, from, vec!).
 
@@ -4283,11 +4291,11 @@ fn lines(&self, width: u16) -> Vec<Line<'static>>
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the capture view into the bottom-pane buffer.
+**Purpose**: Draws the key-capture view into the terminal UI buffer. It shows the lines produced by `KeymapCaptureView::lines`.
 
-**Data flow**: Calls `self.lines(area.width)` to build the content and passes it into a `Paragraph` rendered into the provided `Buffer` and `Rect`.
+**Data flow**: It receives a rectangle and a mutable screen buffer. It builds the display lines for the rectangle width, wraps them in a paragraph widget, and paints that paragraph into the buffer. It returns nothing but changes the buffer contents.
 
-**Call relations**: Implements the `Renderable` trait for the capture view.
+**Call relations**: The bottom-pane rendering system calls this through the `Renderable` trait. Tests also call it through a helper to compare snapshots.
 
 *Call graph*: calls 1 internal fn (lines); called by 1 (render_capture); 1 external calls (new).
 
@@ -4298,11 +4306,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Reports how many terminal rows the capture view needs at a given width.
+**Purpose**: Reports how many terminal rows the capture view wants. This lets the bottom pane reserve enough space for the instructions and any error.
 
-**Data flow**: Builds the line vector with `self.lines(width)` and returns its length as `u16`.
+**Data flow**: It receives a width, rebuilds the same lines that rendering would show, counts them, and returns that count as a height.
 
-**Call relations**: Used by layout code through the `Renderable` trait.
+**Call relations**: The layout system calls this before rendering. It shares `lines` with `render`, which keeps sizing and drawing in sync.
 
 *Call graph*: calls 1 internal fn (lines).
 
@@ -4313,11 +4321,11 @@ fn desired_height(&self, width: u16) -> u16
 fn handle_key_event(&mut self, key_event: KeyEvent)
 ```
 
-**Purpose**: Consumes one terminal key event for the pending edit. It ignores release events, treats `Esc` as cancel, and otherwise serializes the key into a config string and emits `AppEvent::KeymapCaptured`.
+**Purpose**: Responds to the user's keypress while the capture view is active. It either cancels, ignores release events, sends a captured-key event, or shows an error for unsupported keys.
 
-**Data flow**: Reads a `KeyEvent`; returns immediately on `KeyEventKind::Release`; if the code is `Esc`, marks `complete = true`; otherwise converts the event with `key_event_to_config_key_spec`, on success sends `AppEvent::KeymapCaptured { context, action, key, intent }` through `app_event_tx` and marks complete, and on failure stores the error string in `error_message`.
+**Data flow**: It receives one terminal key event. Key-release events are ignored; Esc marks the view complete; other keys are converted to config strings. A valid key sends a `KeymapCaptured` event and completes the view, while an invalid key stores an error message for display.
 
-**Call relations**: Called by the bottom-pane event loop while the capture view is active.
+**Call relations**: The bottom pane calls this when key input reaches the capture view. It hands successful captures back to the app layer by sending an event rather than editing config directly.
 
 *Call graph*: calls 2 internal fn (send, key_event_to_config_key_spec); 1 external calls (clone).
 
@@ -4328,11 +4336,11 @@ fn handle_key_event(&mut self, key_event: KeyEvent)
 fn is_complete(&self) -> bool
 ```
 
-**Purpose**: Reports whether the capture view should be dismissed.
+**Purpose**: Tells the bottom pane whether the capture view is done. A completed view can be dismissed.
 
-**Data flow**: Returns the current boolean `complete` flag.
+**Data flow**: It reads the view's `complete` flag and returns it unchanged.
 
-**Call relations**: Queried by the bottom-pane framework after key handling.
+**Call relations**: The bottom pane checks this after input. `handle_key_event` and `on_ctrl_c` are the methods that set the flag.
 
 
 ##### `KeymapCaptureView::on_ctrl_c`  (lines 694–697)
@@ -4341,11 +4349,11 @@ fn is_complete(&self) -> bool
 fn on_ctrl_c(&mut self) -> CancellationEvent
 ```
 
-**Purpose**: Handles Ctrl+C as an explicit cancellation of the capture view.
+**Purpose**: Handles Ctrl+C while capturing a shortcut by cancelling the capture. It marks the view complete and says the cancellation was handled.
 
-**Data flow**: Sets `complete = true` and returns `CancellationEvent::Handled`.
+**Data flow**: It mutates the view by setting `complete` to true, then returns a `Handled` cancellation result. No keymap event is sent.
 
-**Call relations**: Implements the `BottomPaneView` cancellation hook.
+**Call relations**: The bottom pane calls this when Ctrl+C is pressed. It gives the user a clean way to leave capture without changing the keymap.
 
 
 ##### `KeymapCaptureView::prefer_esc_to_handle_key_event`  (lines 699–701)
@@ -4354,11 +4362,11 @@ fn on_ctrl_c(&mut self) -> CancellationEvent
 fn prefer_esc_to_handle_key_event(&self) -> bool
 ```
 
-**Purpose**: Requests that Esc be delivered to this view instead of being intercepted by outer popup dismissal logic.
+**Purpose**: Tells the bottom pane that this view wants to receive Esc itself. That allows Esc to cancel capture instead of being intercepted by a parent popup first.
 
-**Data flow**: Returns `true` with no side effects.
+**Data flow**: It takes no meaningful input and always returns true.
 
-**Call relations**: Lets the capture view inspect Esc as a captured/cancel key.
+**Call relations**: The bottom pane uses this preference when routing Esc. The capture view then handles Esc in `handle_key_event`.
 
 
 ##### `key_event_to_config_key_spec`  (lines 704–706)
@@ -4367,11 +4375,11 @@ fn prefer_esc_to_handle_key_event(&self) -> bool
 fn key_event_to_config_key_spec(key_event: KeyEvent) -> Result<String, String>
 ```
 
-**Purpose**: Converts a raw terminal `KeyEvent` into the canonical string form stored in `tui.keymap`.
+**Purpose**: Converts one terminal key event into the string format used in `tui.keymap`. For example, a terminal Ctrl+K event can become `ctrl-k`.
 
-**Data flow**: Normalizes the event into a `KeyBinding` with `KeyBinding::from_event`, then delegates to `binding_to_config_key_spec` and returns `Result<String, String>`.
+**Data flow**: It receives a terminal `KeyEvent`, turns it into the app's `KeyBinding` type, and delegates to `binding_to_config_key_spec`. The result is either a config string or an explanatory error.
 
-**Call relations**: Used by `KeymapCaptureView::handle_key_event` during capture.
+**Call relations**: `KeymapCaptureView::handle_key_event` calls this after the user presses a key. It is the first step in making captured terminal input safe to store in config.
 
 *Call graph*: calls 2 internal fn (from_event, binding_to_config_key_spec); called by 1 (handle_key_event).
 
@@ -4382,11 +4390,11 @@ fn key_event_to_config_key_spec(key_event: KeyEvent) -> Result<String, String>
 fn binding_to_config_key_spec(binding: KeyBinding) -> Result<String, String>
 ```
 
-**Purpose**: Converts a `KeyBinding` into a canonical config key string.
+**Purpose**: Converts an internal key binding into the config-file spelling for that binding. It separates the key code from modifier keys before formatting.
 
-**Data flow**: Extracts `(KeyCode, KeyModifiers)` from the binding with `parts()` and passes them to `key_parts_to_config_key_spec`.
+**Data flow**: It receives a `KeyBinding`, extracts its key code and modifiers, and passes those pieces to `key_parts_to_config_key_spec`. It returns that function's success string or error.
 
-**Call relations**: Shared conversion helper used by event capture and runtime-binding display.
+**Call relations**: This is used by captured key conversion and by `active_binding_specs` through the same conversion path. It bridges the runtime key representation and stored config text.
 
 *Call graph*: calls 2 internal fn (parts, key_parts_to_config_key_spec); called by 1 (key_event_to_config_key_spec).
 
@@ -4400,11 +4408,11 @@ fn key_parts_to_config_key_spec(
 ) -> Result<String, String>
 ```
 
-**Purpose**: Serializes normalized key parts into the exact canonical syntax accepted by `tui.keymap`. It rejects unsupported modifiers, unsupported key codes, non-ASCII printable chars, and out-of-range function keys.
+**Purpose**: Turns a key code plus modifier keys into a valid keymap config string. It enforces which keys can be saved and normalizes things like uppercase letters into `shift-` forms.
 
-**Data flow**: Normalizes `(code, modifiers)` with `crate::key_hint::normalize_key_parts`, checks that only CONTROL/ALT/SHIFT remain, maps supported `KeyCode` variants to canonical names, converts uppercase chars into lowercase plus inserted SHIFT, special-cases `-` as `minus`, and returns either `Ok(format_key_spec(...))` or a descriptive `Err(String)`.
+**Data flow**: It receives a terminal key code and modifier flags. It normalizes them, rejects unsupported modifiers and unsupported keys, maps special keys to names such as `page-down` or `space`, adjusts uppercase characters to include Shift, and returns a formatted string.
 
-**Call relations**: This is the core serializer behind capture and debug display of config-compatible key specs.
+**Call relations**: `binding_to_config_key_spec` delegates the real conversion rules here. This function calls `format_key_spec` once it has a safe key name.
 
 *Call graph*: calls 2 internal fn (normalize_key_parts, format_key_spec); called by 1 (binding_to_config_key_spec); 3 external calls (difference, insert, format!).
 
@@ -4415,11 +4423,11 @@ fn key_parts_to_config_key_spec(
 fn format_key_spec(modifiers: KeyModifiers, key: &str) -> String
 ```
 
-**Purpose**: Formats a modifier bitset plus canonical key name into the stored `ctrl-alt-shift-key` string order.
+**Purpose**: Assembles modifier names and the base key name into the final config string. It keeps modifier order consistent.
 
-**Data flow**: Builds a `Vec<&str>` in fixed modifier order—control, alt, shift—appends the key name, joins with `-`, and returns the resulting `String`.
+**Data flow**: It receives modifier flags and a key name. It adds `ctrl`, `alt`, and `shift` in that order when present, appends the key, joins everything with hyphens, and returns the resulting string.
 
-**Call relations**: Used by `key_parts_to_config_key_spec` after key normalization and validation.
+**Call relations**: `key_parts_to_config_key_spec` calls this for all supported keys. Tests check that the ordering is stable.
 
 *Call graph*: called by 1 (key_parts_to_config_key_spec); 2 external calls (contains, new).
 
@@ -4430,11 +4438,11 @@ fn format_key_spec(modifiers: KeyModifiers, key: &str) -> String
 fn app_event_sender() -> AppEventSender
 ```
 
-**Purpose**: Creates a throwaway `AppEventSender` for UI tests.
+**Purpose**: Creates a throwaway app event sender for tests. It lets UI objects be built without needing a full running application.
 
-**Data flow**: Creates an unbounded channel, discards the receiver, wraps the sender in `AppEventSender`, and returns it.
+**Data flow**: It creates an unbounded channel, wraps the sender side in `AppEventSender`, ignores the receiver, and returns the sender.
 
-**Call relations**: Shared by rendering and capture-view tests.
+**Call relations**: Rendering tests and picker tests call this when they need a sender but do not care about received events.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (unbounded_channel).
 
@@ -4445,11 +4453,11 @@ fn app_event_sender() -> AppEventSender
 fn render_capture(view: &KeymapCaptureView, width: u16, height: u16) -> Buffer
 ```
 
-**Purpose**: Renders a `KeymapCaptureView` into a test buffer of fixed size.
+**Purpose**: Renders a capture view into a test buffer. This makes snapshot tests compare the exact terminal output.
 
-**Data flow**: Creates a `Rect`, allocates an empty `Buffer`, calls `view.render`, and returns the filled buffer.
+**Data flow**: It receives a capture view plus width and height. It creates an empty buffer, asks the view to render into it, and returns the filled buffer.
 
-**Call relations**: Used by snapshot tests for the capture view.
+**Call relations**: The capture-view snapshot test uses this helper to keep rendering setup out of the assertion.
 
 *Call graph*: calls 1 internal fn (render); 2 external calls (empty, new).
 
@@ -4460,11 +4468,11 @@ fn render_capture(view: &KeymapCaptureView, width: u16, height: u16) -> Buffer
 fn render_debug(view: &KeymapDebugView, width: u16) -> String
 ```
 
-**Purpose**: Renders a debug inspector view into a string snapshot.
+**Purpose**: Renders the debug keymap view into a plain string for tests. It sizes the buffer using the view's requested height.
 
-**Data flow**: Computes desired height, renders the view into a buffer, converts the buffer to text with `render_buffer`, and returns the string.
+**Data flow**: It receives a debug view and width. It asks for the height, renders into a buffer, converts that buffer to text, and returns the text.
 
-**Call relations**: Used by debug-view snapshot tests.
+**Call relations**: Debug-view tests use this to compare initial, delayed-hint, and key-detected displays.
 
 *Call graph*: calls 2 internal fn (desired_height, render); 3 external calls (empty, new, render_buffer).
 
@@ -4475,11 +4483,11 @@ fn render_debug(view: &KeymapDebugView, width: u16) -> String
 fn render_picker(params: SelectionViewParams, width: u16) -> String
 ```
 
-**Purpose**: Builds and renders a picker selection view from params for snapshot testing.
+**Purpose**: Renders picker parameters as a list selection view for snapshot tests. It supplies a default runtime key list and dummy sender.
 
-**Data flow**: Constructs a `ListSelectionView` with the provided params, a test sender, and default list keymap, then delegates to `render_picker_from_view`.
+**Data flow**: It receives selection parameters and width. It constructs a `ListSelectionView`, then delegates to `render_picker_from_view` to produce text.
 
-**Call relations**: Used by picker snapshot tests.
+**Call relations**: Several picker snapshot tests call this so they can test the final rendered menu rather than only the raw parameters.
 
 *Call graph*: calls 2 internal fn (new, defaults); 2 external calls (app_event_sender, render_picker_from_view).
 
@@ -4490,11 +4498,11 @@ fn render_picker(params: SelectionViewParams, width: u16) -> String
 fn render_picker_from_view(view: &ListSelectionView, width: u16) -> String
 ```
 
-**Purpose**: Renders an existing picker view into a string snapshot.
+**Purpose**: Renders an already-built list selection view into a string. This is the common lower-level picker rendering helper for tests.
 
-**Data flow**: Computes desired height, renders into a buffer, converts the buffer to text, and returns the string.
+**Data flow**: It receives a list selection view and width. It asks the view for its height, renders it into a buffer, converts the buffer into lines of text, and returns the string.
 
-**Call relations**: Shared by picker rendering tests.
+**Call relations**: `tests::render_picker` calls this, and it can also be used when a test wants to inspect a view that was built separately.
 
 *Call graph*: calls 2 internal fn (desired_height, render); 3 external calls (empty, new, render_buffer).
 
@@ -4505,11 +4513,11 @@ fn render_picker_from_view(view: &ListSelectionView, width: u16) -> String
 fn fast_mode_action_filter() -> KeymapActionFilter
 ```
 
-**Purpose**: Builds a `KeymapActionFilter` with fast mode enabled for tests that need gated actions visible.
+**Purpose**: Builds a test filter that enables fast-mode shortcut rows. It makes tests explicit about the feature being on.
 
-**Data flow**: Returns a `KeymapActionFilter { fast_mode_enabled: true }` value.
+**Data flow**: It takes no input and returns a `KeymapActionFilter` with `fast_mode_enabled` set to true.
 
-**Call relations**: Used by picker tests covering feature-gated actions.
+**Call relations**: Fast-mode picker tests pass this into the picker builder to check that the optional action appears when enabled.
 
 
 ##### `tests::render_buffer`  (lines 843–860)
@@ -4518,11 +4526,11 @@ fn fast_mode_action_filter() -> KeymapActionFilter
 fn render_buffer(buf: &Buffer) -> String
 ```
 
-**Purpose**: Converts a `ratatui::Buffer` into a trimmed multiline string for assertions and snapshots.
+**Purpose**: Converts a terminal buffer into a normal string for assertions. It trims empty space at the end of each line.
 
-**Data flow**: Iterates over every cell in the buffer area, concatenates symbols row by row, trims trailing spaces per line, joins lines with newlines, and returns the resulting string.
+**Data flow**: It receives a buffer, walks through every row and column, reads each cell's symbol, substitutes spaces for empty cells, trims the right side of each row, and joins rows with newlines.
 
-**Call relations**: Shared by capture, picker, and debug rendering tests.
+**Call relations**: Rendering helpers use this to turn UI output into snapshot-friendly text.
 
 *Call graph*: 1 external calls (area).
 
@@ -4533,11 +4541,11 @@ fn render_buffer(buf: &Buffer) -> String
 fn test_pane() -> (BottomPane, AppEventSender, UnboundedReceiver<AppEvent>)
 ```
 
-**Purpose**: Creates a fully wired `BottomPane` plus event channel for interaction tests.
+**Purpose**: Creates a bottom pane, event sender, and event receiver for interaction tests. It gives tests a small working UI environment.
 
-**Data flow**: Creates an unbounded `AppEvent` channel, wraps the sender, constructs `BottomPane` with test parameters and a dummy frame requester, and returns `(pane, sender, receiver)`.
+**Data flow**: It creates an event channel, wraps the sender, builds a `BottomPane` with test settings and focus enabled, and returns the pane, sender, and receiver.
 
-**Call relations**: Used by tests that simulate menu navigation and capture completion.
+**Call relations**: Completion-flow tests use this to simulate menu navigation, key capture, and view replacement without running the full app.
 
 *Call graph*: calls 3 internal fn (new, new, test_dummy); 1 external calls (new).
 
@@ -4548,11 +4556,11 @@ fn test_pane() -> (BottomPane, AppEventSender, UnboundedReceiver<AppEvent>)
 fn selection_tab(params: &'a SelectionViewParams, id: &str) -> &'a SelectionTab
 ```
 
-**Purpose**: Finds a tab by id inside `SelectionViewParams` during tests.
+**Purpose**: Finds one tab inside selection parameters by id. It fails the test clearly if the tab is missing.
 
-**Data flow**: Searches `params.tabs` for a matching `id` and returns a borrowed `SelectionTab`, panicking if absent.
+**Data flow**: It receives selection parameters and a tab id. It searches the tab list and returns a reference to the matching tab, or panics with `selection tab`.
 
-**Call relations**: Shared helper for picker tests.
+**Call relations**: Many picker tests use this to inspect a specific tab such as All, Common, Custom, or Debug.
 
 
 ##### `tests::selection_item`  (lines 886–892)
@@ -4561,11 +4569,11 @@ fn selection_tab(params: &'a SelectionViewParams, id: &str) -> &'a SelectionTab
 fn selection_item(params: &'a SelectionViewParams, name: &str) -> &'a SelectionItem
 ```
 
-**Purpose**: Finds a selection item by name inside `SelectionViewParams` during tests.
+**Purpose**: Finds one selection item by visible name. It keeps tests focused on the row they care about.
 
-**Data flow**: Searches `params.items` for a matching `name` and returns a borrowed `SelectionItem`, panicking if absent.
+**Data flow**: It receives selection parameters and an item name. It searches the item list and returns the matching item, or panics with `selection item`.
 
-**Call relations**: Used by action-menu tests.
+**Call relations**: Action-menu tests use this to check row behavior such as whether `Remove custom binding` is disabled.
 
 
 ##### `tests::action_menu_rows`  (lines 894–908)
@@ -4574,11 +4582,11 @@ fn selection_item(params: &'a SelectionViewParams, name: &str) -> &'a SelectionI
 fn action_menu_rows(params: &SelectionViewParams) -> String
 ```
 
-**Purpose**: Formats action-menu items into a compact text representation for snapshot assertions.
+**Purpose**: Summarizes action-menu rows into simple text. It makes snapshot output small and readable.
 
-**Data flow**: Maps each `SelectionItem` to `name | description | disabled_reason-or-enabled`, joins the rows with newlines, and returns the string.
+**Data flow**: It receives selection parameters. For each item, it collects the name, description, and disabled reason or `enabled`, then joins those summaries with newlines.
 
-**Call relations**: Used by the action-menu snapshot test.
+**Call relations**: The action-menu snapshot test uses this instead of snapshotting the full UI object.
 
 
 ##### `tests::picker_covers_every_replaceable_action`  (lines 911–937)
@@ -4587,11 +4595,11 @@ fn action_menu_rows(params: &SelectionViewParams) -> String
 fn picker_covers_every_replaceable_action()
 ```
 
-**Purpose**: Verifies the picker exposes every cataloged action and that each catalog entry is both writable in config and readable from runtime state.
+**Purpose**: Checks that the keymap picker includes every action that can be remapped. It also verifies that each action has both a config slot and runtime bindings.
 
-**Data flow**: Builds a filtered picker, inspects the All tab, checks item counts and dismissal behavior, and asserts every `KEYMAP_ACTIONS` descriptor has both a `binding_slot` and `bindings_for_action` mapping.
+**Data flow**: It builds the default runtime keymap and picker parameters with fast mode enabled. It inspects the All tab and asserts that all action descriptors are represented and selectable without dismissing the picker.
 
-**Call relations**: Cross-checks the picker against the action catalog and accessors.
+**Call relations**: This test protects the contract between the action catalog, config slots, runtime keymap, and picker UI.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params_with_filter); 5 external calls (assert!, assert_eq!, default, fast_mode_action_filter, selection_tab).
 
@@ -4602,11 +4610,11 @@ fn picker_covers_every_replaceable_action()
 fn picker_hides_fast_mode_action_when_feature_is_disabled()
 ```
 
-**Purpose**: Ensures the fast-mode action is omitted when the feature filter is off.
+**Purpose**: Verifies that the fast-mode shortcut is hidden when the feature is not enabled. This prevents users from seeing a shortcut for unavailable behavior.
 
-**Data flow**: Builds the default picker and asserts the All tab contains no item named `Toggle Fast Mode`.
+**Data flow**: It builds the default picker without the fast-mode filter. It inspects the All tab and asserts that no row is named `Toggle Fast Mode`.
 
-**Call relations**: Covers feature gating in picker construction.
+**Call relations**: This test complements the enabled-fast-mode test and checks the picker filter behavior.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params); 3 external calls (assert!, default, selection_tab).
 
@@ -4617,11 +4625,11 @@ fn picker_hides_fast_mode_action_when_feature_is_disabled()
 fn picker_shows_fast_mode_action_when_feature_is_enabled()
 ```
 
-**Purpose**: Ensures the fast-mode action appears in all relevant tabs when the feature filter is enabled.
+**Purpose**: Verifies that the fast-mode shortcut appears when the feature is enabled. It checks several tabs, not just the full list.
 
-**Data flow**: Builds a filtered picker and checks the All, Common, App, and Unbound tabs for an item named `Toggle Fast Mode`.
+**Data flow**: It builds picker parameters with a fast-mode-enabled filter. It reads the relevant tabs and asserts that each includes `Toggle Fast Mode`.
 
-**Call relations**: Another feature-gating picker test.
+**Call relations**: This test proves that the action filter feeds into tab construction consistently.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params_with_filter); 4 external calls (assert!, default, fast_mode_action_filter, selection_tab).
 
@@ -4632,11 +4640,11 @@ fn picker_shows_fast_mode_action_when_feature_is_enabled()
 fn keymap_picker_fast_mode_enabled_snapshot()
 ```
 
-**Purpose**: Captures a snapshot of the picker UI with fast mode enabled.
+**Purpose**: Captures the rendered picker when fast mode is enabled. The snapshot catches accidental UI changes.
 
-**Data flow**: Builds the filtered picker and renders it at width 120 for snapshot comparison.
+**Data flow**: It builds a default runtime keymap and picker with fast mode enabled, renders the picker at a wide width, and compares the result with a saved snapshot.
 
-**Call relations**: Regression coverage for picker presentation.
+**Call relations**: This test uses the same picker-building path as normal UI code, then relies on snapshot testing for visual regression coverage.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params_with_filter); 3 external calls (assert_snapshot!, default, fast_mode_action_filter).
 
@@ -4647,11 +4655,11 @@ fn keymap_picker_fast_mode_enabled_snapshot()
 fn picker_common_tab_lists_curated_actions()
 ```
 
-**Purpose**: Checks the curated ordering and membership of the Common tab.
+**Purpose**: Checks that the Common tab contains the intended hand-picked actions in the intended order. This keeps the shortcut editor useful for common tasks.
 
-**Data flow**: Builds the picker, extracts the first two search-value tokens from each Common-tab item, and compares the resulting action list to the expected sequence.
+**Data flow**: It builds default picker parameters, finds the Common tab, extracts each item's searchable context/action identity, and compares the sequence to the expected list.
 
-**Call relations**: Guards the curated common-action subset.
+**Call relations**: This test guards the curated tab definition used by the picker module.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params); 3 external calls (assert_eq!, default, selection_tab).
 
@@ -4662,11 +4670,11 @@ fn picker_common_tab_lists_curated_actions()
 fn picker_approval_tab_lists_all_approval_actions()
 ```
 
-**Purpose**: Checks that the Approval tab contains every approval action in the expected order.
+**Purpose**: Checks that the approval-related tab lists all approval shortcuts. This prevents approval controls from being accidentally omitted from remapping.
 
-**Data flow**: Builds the picker, extracts action identifiers from the Approval tab items, and compares them to the expected list.
+**Data flow**: It builds the default picker, finds the approval tab, extracts context/action identities from search values, and compares them with the expected approval action list.
 
-**Call relations**: Covers context-tab grouping for approval actions.
+**Call relations**: This test focuses on one action category and protects the picker tab grouping.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params); 3 external calls (assert_eq!, default, selection_tab).
 
@@ -4677,11 +4685,11 @@ fn picker_approval_tab_lists_all_approval_actions()
 fn picker_content_snapshot()
 ```
 
-**Purpose**: Captures a textual snapshot of tab counts and the first visible actions in the picker.
+**Purpose**: Snapshots a concise summary of picker tab counts and the first actions. This catches broad changes to picker contents without storing the whole render.
 
-**Data flow**: Builds the picker, formats tab labels plus selectable counts and the first 12 All-tab rows into a string, and snapshots it.
+**Data flow**: It builds default picker parameters, summarizes each tab's selectable count, adds details for the first All-tab rows, and compares the text with a snapshot.
 
-**Call relations**: Broad regression coverage for picker content.
+**Call relations**: This test sits between detailed structural tests and full rendered snapshots.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params); 3 external calls (assert_snapshot!, default, selection_tab).
 
@@ -4692,11 +4700,11 @@ fn picker_content_snapshot()
 fn picker_customized_tab_contains_root_overrides()
 ```
 
-**Purpose**: Ensures the Customized tab reflects root-level overrides and that the corresponding context tab shows the overridden binding summary.
+**Purpose**: Verifies that actions with root-level custom bindings appear in the Custom tab. It also checks that normal category tabs show the custom binding text.
 
-**Data flow**: Creates a config overriding `composer.submit`, resolves runtime state, builds the picker, and asserts the Customized tab contains only `Submit` while the Composer tab shows `ctrl-enter` in its description.
+**Data flow**: It creates a keymap where `composer.submit` is customized, builds a runtime keymap from it, builds picker parameters, and inspects the Custom and Composer tabs.
 
-**Call relations**: Tests interaction between root config state and picker row summaries.
+**Call relations**: This test confirms that picker content reflects both raw config overrides and resolved runtime bindings.
 
 *Call graph*: calls 3 internal fn (from_config, keymap_with_replacement, build_keymap_picker_params); 4 external calls (assert!, assert_eq!, default, selection_tab).
 
@@ -4707,11 +4715,11 @@ fn picker_customized_tab_contains_root_overrides()
 fn picker_unbound_tab_lists_default_unbound_actions()
 ```
 
-**Purpose**: Checks that actions with no active binding appear in the Unbound tab and remain selectable.
+**Purpose**: Checks that the Unbound tab lists actions that have no active default binding. It ensures those actions are still selectable for assignment.
 
-**Data flow**: Builds the default picker and asserts the Unbound tab contains `Toggle Vim Mode` and `Kill Whole Line`, both described as `unbound` and not disabled.
+**Data flow**: It builds the default picker, finds the Unbound tab, and asserts the expected two rows, their `unbound` descriptions, and that they are not disabled.
 
-**Call relations**: Covers unbound-row classification in picker construction.
+**Call relations**: This test protects the path for assigning shortcuts to actions that start without keys.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params); 4 external calls (assert!, assert_eq!, default, selection_tab).
 
@@ -4722,11 +4730,11 @@ fn picker_unbound_tab_lists_default_unbound_actions()
 fn picker_debug_tab_is_last_and_opens_inspector()
 ```
 
-**Purpose**: Ensures the Debug tab is appended last and contains the inspector launcher row plus a tab-specific footer hint.
+**Purpose**: Verifies that the Debug tab appears last and contains the keypress inspector entry. This gives users a way to diagnose what the terminal is sending.
 
-**Data flow**: Builds the picker, inspects the last tab and footer hints, and compares ids, labels, descriptions, and counts.
+**Data flow**: It builds default picker parameters, reads the last tab, and checks its id, label, item text, description, and footer hint.
 
-**Call relations**: Covers the special debug tab wiring.
+**Call relations**: This test ties the picker UI to the debug view exposed by this module.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params); 3 external calls (assert!, assert_eq!, default).
 
@@ -4737,11 +4745,11 @@ fn picker_debug_tab_is_last_and_opens_inspector()
 fn picker_selected_action_starts_on_matching_all_tab_row()
 ```
 
-**Purpose**: Checks that rebuilding the picker for a selected action restores focus to the matching row in the All tab.
+**Purpose**: Checks that reopening the picker after an edit returns focus to the edited action. This makes the user experience feel continuous.
 
-**Data flow**: Builds picker params for `composer.submit`, inspects `initial_tab_id` and `initial_selected_idx`, and compares them to the matching row position.
+**Data flow**: It builds picker parameters for a selected `composer.submit` action, finds the All tab, and asserts the initial tab and selected index match the Submit row.
 
-**Call relations**: Supports the UX of returning to the edited row after save/clear.
+**Call relations**: Completion-flow tests depend on this behavior after save or clear operations refresh the picker.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params_for_selected_action); 3 external calls (assert_eq!, default, selection_tab).
 
@@ -4752,11 +4760,11 @@ fn picker_selected_action_starts_on_matching_all_tab_row()
 fn picker_all_tab_items_remain_searchable()
 ```
 
-**Purpose**: Captures a snapshot proving All-tab rows include the expected search metadata and visible descriptions.
+**Purpose**: Ensures rows in the All tab keep useful search text. This protects keyboard searching inside the shortcut picker.
 
-**Data flow**: Builds the picker, formats the first 12 All-tab items into `name | description | search_value` lines, and snapshots the result.
+**Data flow**: It builds the default picker, extracts the first All-tab rows' names, descriptions, and search values, and compares that summary with a snapshot.
 
-**Call relations**: Regression coverage for picker search indexing.
+**Call relations**: This test watches the search metadata produced by the picker builder.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params); 3 external calls (assert_snapshot!, default, selection_tab).
 
@@ -4767,11 +4775,11 @@ fn picker_all_tab_items_remain_searchable()
 fn picker_wide_render_snapshot()
 ```
 
-**Purpose**: Captures a wide-layout snapshot of the picker.
+**Purpose**: Snapshots the keymap picker at a wide terminal width. It catches layout and content regressions in the full-width presentation.
 
-**Data flow**: Builds the picker and renders it at width 120 for snapshot comparison.
+**Data flow**: It builds default picker parameters, renders them at width 120, and compares the rendered text to a snapshot.
 
-**Call relations**: Presentation regression test.
+**Call relations**: This test uses the shared rendering helper and complements the narrow-width snapshot.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params); 2 external calls (assert_snapshot!, default).
 
@@ -4782,11 +4790,11 @@ fn picker_wide_render_snapshot()
 fn picker_narrow_render_snapshot()
 ```
 
-**Purpose**: Captures a narrow-layout snapshot of the picker.
+**Purpose**: Snapshots the keymap picker at a narrower terminal width. It protects the compact layout used in smaller terminals.
 
-**Data flow**: Builds the picker and renders it at width 78 for snapshot comparison.
+**Data flow**: It builds default picker parameters, renders them at width 78, and compares the result with a snapshot.
 
-**Call relations**: Presentation regression test for compact layouts.
+**Call relations**: Together with the wide snapshot, this checks that the picker adapts across terminal sizes.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params); 2 external calls (assert_snapshot!, default).
 
@@ -4797,11 +4805,11 @@ fn picker_narrow_render_snapshot()
 fn picker_custom_render_snapshot()
 ```
 
-**Purpose**: Captures a picker snapshot when a custom binding is present.
+**Purpose**: Snapshots the picker when a shortcut has been customized. This checks that custom bindings are displayed correctly.
 
-**Data flow**: Creates a customized keymap, resolves runtime state, builds the picker, renders it at width 120, and snapshots the output.
+**Data flow**: It creates a custom `composer.submit` binding, builds a runtime keymap and picker, renders the picker at a wide width, and compares the output to a snapshot.
 
-**Call relations**: Regression coverage for custom-binding indicators.
+**Call relations**: This test exercises the picker path with non-default config, using `keymap_with_replacement` as setup.
 
 *Call graph*: calls 3 internal fn (from_config, keymap_with_replacement, build_keymap_picker_params); 2 external calls (assert_snapshot!, default).
 
@@ -4812,11 +4820,11 @@ fn picker_custom_render_snapshot()
 fn picker_narrow_uses_compact_tabs()
 ```
 
-**Purpose**: Checks that narrow rendering uses the compact picker presentation rather than the wider detail-heavy layout.
+**Purpose**: Checks that the narrow picker render uses the compact tab layout. It ensures details that do not fit are omitted while key content remains.
 
-**Data flow**: Builds and renders the picker at width 78, then asserts the output contains compact essentials and omits wider-detail phrases.
+**Data flow**: It renders the default picker at narrow width and asserts that important text is present while wide-only details are absent.
 
-**Call relations**: Layout behavior test for narrow widths.
+**Call relations**: This test gives targeted assertions alongside the narrow snapshot, making the intended compact behavior clear.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_picker_params); 3 external calls (assert!, default, render_picker).
 
@@ -4827,11 +4835,11 @@ fn picker_narrow_uses_compact_tabs()
 fn action_menu_content_snapshot()
 ```
 
-**Purpose**: Captures snapshots of action-menu variants for unbound, single-binding, multi-binding, and replace-one states.
+**Purpose**: Snapshots the rows shown by action menus for unbound, single-binding, multi-binding, and replace-binding cases. It protects the menu choices users see.
 
-**Data flow**: Builds several keymap/runtime combinations, constructs the corresponding action and replace menus, formats their rows with `action_menu_rows`, and snapshots the combined text.
+**Data flow**: It prepares several keymap states, builds the corresponding action or replace menus, summarizes their rows with `action_menu_rows`, and compares the combined text to a snapshot.
 
-**Call relations**: Regression coverage for adaptive action-menu construction.
+**Call relations**: This test covers the branching logic in `build_keymap_action_menu_params` and `build_keymap_replace_binding_menu_params`.
 
 *Call graph*: calls 5 internal fn (from_config, build_keymap_action_menu_params, build_keymap_replace_binding_menu_params, keymap_with_bindings, keymap_with_replacement); 3 external calls (assert_snapshot!, default, action_menu_rows).
 
@@ -4842,11 +4850,11 @@ fn action_menu_content_snapshot()
 fn action_menu_disables_clear_when_action_has_no_custom_binding()
 ```
 
-**Purpose**: Ensures the remove-custom-binding row is disabled when the action only inherits defaults, and checks dismissal behavior of menu rows.
+**Purpose**: Verifies that `Remove custom binding` is disabled when there is no custom root override. It prevents a misleading clear action.
 
-**Data flow**: Builds the action menu for default `composer.submit`, finds specific rows, and asserts disabled reasons and `dismiss_on_select` flags.
+**Data flow**: It builds the action menu for a default binding, finds key rows, and asserts the remove row has the expected disabled reason while other row dismissal behavior is correct.
 
-**Call relations**: Covers menu-state logic tied to root config presence.
+**Call relations**: This test specifically checks the `has_custom_binding` decision inside the action-menu builder.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_action_menu_params); 4 external calls (assert!, assert_eq!, default, selection_item).
 
@@ -4857,11 +4865,11 @@ fn action_menu_disables_clear_when_action_has_no_custom_binding()
 fn capture_view_snapshot()
 ```
 
-**Purpose**: Captures a snapshot of the initial key-capture view.
+**Purpose**: Snapshots the key-capture screen. This protects the instructions and action display shown while waiting for a keypress.
 
-**Data flow**: Constructs a `KeymapCaptureView`, renders it into a buffer, formats the buffer with `Debug`, and snapshots the result.
+**Data flow**: It constructs a `KeymapCaptureView`, renders it into a buffer, formats that buffer for debugging, and compares it with a snapshot.
 
-**Call relations**: Presentation regression test for capture UI.
+**Call relations**: This test exercises `KeymapCaptureView::new`, `render`, and the line-building logic.
 
 *Call graph*: calls 1 internal fn (new); 2 external calls (assert_snapshot!, app_event_sender).
 
@@ -4872,11 +4880,11 @@ fn capture_view_snapshot()
 fn debug_view_initial_snapshot()
 ```
 
-**Purpose**: Captures the initial state of the keypress inspector view.
+**Purpose**: Snapshots the initial keymap debug view. This catches accidental changes to the keypress-inspector opening screen.
 
-**Data flow**: Builds a debug view from defaults, renders it, and snapshots the output.
+**Data flow**: It builds the debug view from default runtime and config keymaps, renders it, and compares it to a saved snapshot.
 
-**Call relations**: Regression coverage for the debug inspector UI.
+**Call relations**: This test covers the debug submodule re-exported by this file.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_debug_view); 2 external calls (assert_snapshot!, default).
 
@@ -4887,11 +4895,11 @@ fn debug_view_initial_snapshot()
 fn debug_view_shows_delayed_missing_key_hint()
 ```
 
-**Purpose**: Checks that the inspector switches from the short hint to the delayed explanatory hint after enough time passes without a keypress.
+**Purpose**: Checks that the debug view can show a delayed hint when no keypress arrives. This helps users troubleshoot terminals that are not sending events.
 
-**Data flow**: Builds a debug view, forces the delayed-hint state, renders it, asserts the hint text is present, and snapshots the output.
+**Data flow**: It builds the default debug view, forces the delayed hint for the test, renders it, checks for the hint text, and snapshots the result.
 
-**Call relations**: Covers time-based hint behavior in the debug view.
+**Call relations**: This test exercises debug-view state changes without needing real time to pass.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_debug_view); 4 external calls (assert!, assert_snapshot!, default, render_debug).
 
@@ -4902,11 +4910,11 @@ fn debug_view_shows_delayed_missing_key_hint()
 fn debug_view_reports_detected_key_and_matching_actions()
 ```
 
-**Purpose**: Ensures the inspector reports a captured key and the actions currently assigned to it.
+**Purpose**: Verifies that the debug view reports a pressed key and the actions that match it. This is the main diagnostic behavior of the inspector.
 
-**Data flow**: Builds a debug view, forces delayed-hint eligibility, feeds it `Ctrl+O`, renders, asserts the waiting hint disappeared, and snapshots the report.
+**Data flow**: It builds the debug view, forces the delayed hint, sends a Ctrl+O key event, renders the view, asserts the waiting hint is gone, and snapshots the match report.
 
-**Call relations**: Exercises debug matching against the runtime keymap.
+**Call relations**: This test connects terminal key input to runtime keymap lookup inside the debug view.
 
 *Call graph*: calls 2 internal fn (defaults, build_keymap_debug_view); 6 external calls (Char, new, assert!, assert_snapshot!, default, render_debug).
 
@@ -4917,11 +4925,11 @@ fn debug_view_reports_detected_key_and_matching_actions()
 fn debug_view_uses_custom_binding_source()
 ```
 
-**Purpose**: Checks that the inspector labels matches as `[Custom]` when the action has a root override.
+**Purpose**: Checks that the debug view labels a direct custom binding as custom. This helps users understand why a key maps to an action.
 
-**Data flow**: Creates a keymap overriding `global.copy`, resolves runtime state, feeds the inspector `Ctrl+X`, renders, and asserts the output names the action and source label.
+**Data flow**: It creates a keymap with `global.copy` set to `ctrl-x`, builds runtime and debug views, sends Ctrl+X, renders the output, and asserts that the action and `[Custom]` label appear.
 
-**Call relations**: Covers debug binding-source classification.
+**Call relations**: This test verifies that debug output reflects root-level override information.
 
 *Call graph*: calls 3 internal fn (from_config, build_keymap_debug_view, keymap_with_replacement); 5 external calls (Char, new, assert!, default, render_debug).
 
@@ -4932,11 +4940,11 @@ fn debug_view_uses_custom_binding_source()
 fn debug_view_labels_custom_global_fallback_source()
 ```
 
-**Purpose**: Checks that composer actions inherited from custom global fallback are labeled `[Custom global]` in the inspector.
+**Purpose**: Checks that the debug view distinguishes custom global fallback bindings. This matters when a global binding affects another context.
 
-**Data flow**: Sets `global.queue`, resolves runtime state, feeds the inspector `Ctrl+Q`, renders, and asserts the output names `composer.queue` and the custom-global source label.
+**Data flow**: It sets a custom global binding for queue, builds runtime and debug views, sends Ctrl+Q, renders the output, and checks for the composer action plus `[Custom global]`.
 
-**Call relations**: Exercises the debug source logic for global fallback.
+**Call relations**: This test protects the source-labeling behavior for fallback resolution.
 
 *Call graph*: calls 2 internal fn (from_config, build_keymap_debug_view); 7 external calls (Char, new, assert!, new, One, default, render_debug).
 
@@ -4947,11 +4955,11 @@ fn debug_view_labels_custom_global_fallback_source()
 fn capture_completion_returns_to_selected_keymap_picker_row()
 ```
 
-**Purpose**: Simulates the full replace-all capture flow and verifies the UI returns to the refreshed picker focused on the edited action.
+**Purpose**: Tests the full happy path after capturing a replacement key. It ensures the UI returns to the refreshed main picker with the edited row selected.
 
-**Data flow**: Creates a test pane and event channel, opens picker and action menu, triggers capture, feeds a key event, reads the emitted `OpenKeymapCapture` and `KeymapCaptured` events, applies the replacement to config, rebuilds picker params for the selected action, replaces active views, and asserts focus and popup stack behavior.
+**Data flow**: It creates a test pane, opens the picker and action menu, selects replace, receives the open-capture event, shows the capture view, sends a key, receives the captured event, applies a replacement in test setup, rebuilds picker parameters for the selected action, and replaces active views.
 
-**Call relations**: Integration-style test covering action menu, capture view, event emission, config editing, and picker restoration.
+**Call relations**: This interaction test ties together menu actions, capture view events, key conversion, keymap editing setup, and bottom-pane view replacement.
 
 *Call graph*: calls 7 internal fn (defaults, from_config, build_keymap_action_menu_params, build_keymap_capture_view, keymap_with_replacement, build_keymap_picker_params, build_keymap_picker_params_for_selected_action); 8 external calls (new, Char, new, assert!, assert_eq!, default, panic!, test_pane).
 
@@ -4962,11 +4970,11 @@ fn capture_completion_returns_to_selected_keymap_picker_row()
 fn clear_completion_returns_to_selected_keymap_picker_row()
 ```
 
-**Purpose**: Simulates clearing a custom binding and verifies the UI returns to the refreshed picker focused on the cleared action.
+**Purpose**: Tests the UI flow after clearing a custom binding. It ensures the refreshed picker is shown at the same action and old stacked popups are removed.
 
-**Data flow**: Builds a customized keymap, opens picker and action menu, navigates to the clear row, triggers it, reads `AppEvent::KeymapCleared`, rebuilds picker params for the selected action using defaults, replaces active views, and asserts focus restoration and popup cleanup.
+**Data flow**: It prepares a customized keymap, opens picker and action menu, selects clear, receives the clear event, rebuilds the default picker for the same action, replaces active views, and checks final navigation behavior.
 
-**Call relations**: Integration test for the clear-binding flow.
+**Call relations**: This test mirrors the real clear-completion flow used by the app after `keymap_without_custom_binding` succeeds.
 
 *Call graph*: calls 6 internal fn (defaults, from_config, build_keymap_action_menu_params, keymap_with_replacement, build_keymap_picker_params, build_keymap_picker_params_for_selected_action); 6 external calls (new, assert!, assert_eq!, default, panic!, test_pane).
 
@@ -4977,11 +4985,11 @@ fn clear_completion_returns_to_selected_keymap_picker_row()
 fn replace_one_completion_drops_focused_keymap_submenus()
 ```
 
-**Purpose**: Ensures that after a replace-one flow completes, both the replace submenu and its parent action menu are removed when returning to the picker.
+**Purpose**: Checks that completing a replace-one edit removes both the replace submenu and its parent action menu. This avoids leaving stale menus behind.
 
-**Data flow**: Opens picker, action menu, and replace-binding submenu, rebuilds picker params for the selected action, replaces the active view stack, and asserts only the picker remains active after dismissal.
+**Data flow**: It opens the picker, action menu, and replace-binding submenu in a test pane. It then rebuilds picker parameters for the edited action, replaces all keymap-related active views, and verifies only the picker remains.
 
-**Call relations**: Covers submenu-stack cleanup behavior.
+**Call relations**: This test protects bottom-pane cleanup after the deepest keymap editing path.
 
 *Call graph*: calls 5 internal fn (defaults, build_keymap_action_menu_params, build_keymap_replace_binding_menu_params, build_keymap_picker_params, build_keymap_picker_params_for_selected_action); 5 external calls (new, assert!, assert_eq!, default, test_pane).
 
@@ -4992,11 +5000,11 @@ fn replace_one_completion_drops_focused_keymap_submenus()
 fn key_capture_serializes_modifier_order_for_config()
 ```
 
-**Purpose**: Checks that captured uppercase modified characters serialize in canonical modifier order and include implied shift.
+**Purpose**: Checks that captured modifier keys are serialized in a stable order. Stable spelling avoids needless config churn and confusing output.
 
-**Data flow**: Creates a `KeyEvent` for uppercase `K` with CONTROL|ALT, converts it to a config key spec, and compares the result to `ctrl-alt-shift-k`.
+**Data flow**: It creates a Ctrl+Alt+uppercase K key event, converts it, and asserts the result is `ctrl-alt-shift-k`.
 
-**Call relations**: Exercises normalization and formatting in key capture serialization.
+**Call relations**: This test covers `key_event_to_config_key_spec`, uppercase normalization, and `format_key_spec` ordering.
 
 *Call graph*: 3 external calls (Char, new, assert_eq!).
 
@@ -5007,11 +5015,11 @@ fn key_capture_serializes_modifier_order_for_config()
 fn key_capture_serializes_special_keys()
 ```
 
-**Purpose**: Checks serialization of named non-character keys with modifiers.
+**Purpose**: Verifies that special keys such as Page Down can be saved with modifiers. This protects non-letter shortcut support.
 
-**Data flow**: Converts `Shift+PageDown` to a config key spec and compares it to `shift-page-down`.
+**Data flow**: It creates a Shift+PageDown event, converts it, and checks for `shift-page-down`.
 
-**Call relations**: Covers named-key serialization.
+**Call relations**: This test covers the special-key mapping branch in `key_parts_to_config_key_spec`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5022,11 +5030,11 @@ fn key_capture_serializes_special_keys()
 fn key_capture_serializes_function_keys_through_f24()
 ```
 
-**Purpose**: Verifies serialization of supported function keys and rejection of unsupported ones.
+**Purpose**: Checks the supported range for function keys. It allows F1 through F24 and rejects higher function keys with a clear message.
 
-**Data flow**: Converts `F13`, `F24`, and `F25` key events and compares the results to expected success or error strings.
+**Data flow**: It converts F13, F24, and F25 events. The first two must succeed, and F25 must return the expected error.
 
-**Call relations**: Covers function-key bounds in capture serialization.
+**Call relations**: This test protects the function-key limit based on `MAX_FUNCTION_KEY`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5037,11 +5045,11 @@ fn key_capture_serializes_function_keys_through_f24()
 fn key_capture_serializes_c0_control_chars_as_ctrl_bindings()
 ```
 
-**Purpose**: Checks that C0 control characters emitted by terminals normalize into canonical ctrl-letter bindings.
+**Purpose**: Verifies that low-level terminal control characters become normal Ctrl bindings. Some terminals report Ctrl keys this way.
 
-**Data flow**: Converts key events carrying `\u000a`, `\u0015`, and `\u0010` chars with no modifiers and compares them to `ctrl-j`, `ctrl-u`, and `ctrl-p`.
+**Data flow**: It creates key events for control characters corresponding to Ctrl+J, Ctrl+U, and Ctrl+P, converts each, and checks the resulting strings.
 
-**Call relations**: Exercises `normalize_key_parts` integration in serialization.
+**Call relations**: This test depends on key normalization before config formatting.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5052,11 +5060,11 @@ fn key_capture_serializes_c0_control_chars_as_ctrl_bindings()
 fn key_capture_serializes_minus_as_named_key()
 ```
 
-**Purpose**: Verifies that the hyphen key is stored as the named `minus` token with modifiers in canonical order.
+**Purpose**: Checks that the minus key is stored as `minus`, with modifiers when present. This avoids ambiguity with the hyphen separator used in key specs.
 
-**Data flow**: Converts plain, alt, and ctrl-alt `-` key events and compares them to `minus`, `alt-minus`, and `ctrl-alt-minus`.
+**Data flow**: It converts plain minus, Alt+minus, and Ctrl+Alt+minus events, then checks the returned strings.
 
-**Call relations**: Covers the serializer’s special-case handling for `-`.
+**Call relations**: This test protects the special minus handling in `key_parts_to_config_key_spec`.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -5067,11 +5075,11 @@ fn key_capture_serializes_minus_as_named_key()
 fn replacement_sets_single_binding()
 ```
 
-**Purpose**: Checks that replacing an action with one key writes `KeybindingsSpec::One` rather than a multi-binding list.
+**Purpose**: Verifies that replacing a binding writes a single binding value in the config. This checks the simplest config mutation shape.
 
-**Data flow**: Calls `keymap_with_replacement` for `composer.submit` and compares the resulting config slot to `Some(KeybindingsSpec::One(...))`.
+**Data flow**: It creates a replacement keymap for `composer.submit` and asserts that the config slot contains exactly one `ctrl-enter` binding.
 
-**Call relations**: Tests low-level config writing shape.
+**Call relations**: This test covers `keymap_with_replacement` and the single-binding branch of `keymap_with_bindings`.
 
 *Call graph*: calls 1 internal fn (keymap_with_replacement); 2 external calls (assert_eq!, default).
 
@@ -5082,11 +5090,11 @@ fn replacement_sets_single_binding()
 fn replace_all_collapses_multi_binding_to_single()
 ```
 
-**Purpose**: Ensures `ReplaceAll` on a multi-binding action produces a single binding in both the returned binding list and config shape.
+**Purpose**: Checks that replacing all bindings turns a multi-binding action into a single captured key. This matches the meaning of `Replace all`.
 
-**Data flow**: Builds a multi-binding config and runtime map, applies `keymap_with_edit` with `ReplaceAll`, destructures the `Updated` outcome, and compares both `bindings` and the resulting config slot.
+**Data flow**: It starts with two bindings for `composer.submit`, builds a runtime keymap, applies a ReplaceAll edit, and asserts both the returned binding list and config contain only the new key.
 
-**Call relations**: Covers replace-all edit semantics.
+**Call relations**: This test covers the ReplaceAll branch of `keymap_with_edit`.
 
 *Call graph*: calls 3 internal fn (from_config, keymap_with_bindings, keymap_with_edit); 3 external calls (assert_eq!, default, panic!).
 
@@ -5097,11 +5105,11 @@ fn replace_all_collapses_multi_binding_to_single()
 fn add_alternate_grows_single_binding()
 ```
 
-**Purpose**: Checks that adding an alternate to a single-binding action materializes both the existing effective binding and the new one into root config.
+**Purpose**: Checks that adding an alternate to a default single-binding action preserves the default and appends the new key. The default is materialized into config.
 
-**Data flow**: Starts from defaults, applies `AddAlternate` to `composer.submit`, destructures the `Updated` outcome, and compares the returned binding list and config slot to the expected two-entry `Many` list.
+**Data flow**: It uses the default runtime keymap, applies AddAlternate to `composer.submit` with `ctrl-enter`, and asserts the result contains `enter` plus `ctrl-enter` as a multi-binding config value.
 
-**Call relations**: Exercises add-alternate behavior against inherited defaults.
+**Call relations**: This test covers the AddAlternate path in `keymap_with_edit` when the current binding comes from defaults.
 
 *Call graph*: calls 2 internal fn (defaults, keymap_with_edit); 3 external calls (assert_eq!, default, panic!).
 
@@ -5112,11 +5120,11 @@ fn add_alternate_grows_single_binding()
 fn add_alternate_grows_default_multi_binding()
 ```
 
-**Purpose**: Checks that adding an alternate to an action with multiple default bindings preserves all effective defaults before appending the new key.
+**Purpose**: Checks that adding an alternate to an action with multiple default bindings keeps all existing defaults. The new key is appended after them.
 
-**Data flow**: Starts from defaults, applies `AddAlternate` to `editor.move_left`, and compares the resulting binding list and config slot to the expected three-entry list.
+**Data flow**: It applies AddAlternate to `editor.move_left`, then asserts the returned bindings and config include `left`, `ctrl-b`, and the new `ctrl-shift-b` key.
 
-**Call relations**: Covers add-alternate behavior for default multi-binding actions.
+**Call relations**: This test protects the behavior where default runtime bindings are copied into root config before adding another binding.
 
 *Call graph*: calls 2 internal fn (defaults, keymap_with_edit); 3 external calls (assert_eq!, default, panic!).
 
@@ -5127,11 +5135,11 @@ fn add_alternate_grows_default_multi_binding()
 fn add_alternate_duplicate_is_noop()
 ```
 
-**Purpose**: Ensures adding an already-present binding returns `Unchanged` instead of rewriting config.
+**Purpose**: Verifies that adding an alternate key already used by the action does not change the config. It should report a friendly no-change message.
 
-**Data flow**: Applies `AddAlternate` with `enter` to default `composer.submit` and compares the outcome to the expected `Unchanged` variant and message.
+**Data flow**: It applies AddAlternate with `enter` to `composer.submit`, which already uses `enter` by default, and asserts the outcome is `Unchanged` with the expected message.
 
-**Call relations**: Covers no-op detection in `keymap_with_edit`.
+**Call relations**: This test covers the duplicate check in `keymap_with_edit`.
 
 *Call graph*: calls 2 internal fn (defaults, keymap_with_edit); 2 external calls (assert_eq!, default).
 
@@ -5142,11 +5150,11 @@ fn add_alternate_duplicate_is_noop()
 fn replace_one_preserves_other_bindings()
 ```
 
-**Purpose**: Checks that replacing one binding in a multi-binding action leaves the other bindings untouched.
+**Purpose**: Checks that replacing one binding leaves the action's other bindings alone. Only the selected old key should change.
 
-**Data flow**: Builds a two-binding config and runtime map, applies `ReplaceOne` for `ctrl-enter`, destructures the `Updated` outcome, and compares the resulting binding list and config slot.
+**Data flow**: It starts with two bindings, applies ReplaceOne to swap `ctrl-enter` for `ctrl-shift-enter`, and asserts the other binding remains in the returned list and config.
 
-**Call relations**: Covers replace-one semantics.
+**Call relations**: This test covers the ReplaceOne mapping logic in `keymap_with_edit`.
 
 *Call graph*: calls 3 internal fn (from_config, keymap_with_bindings, keymap_with_edit); 3 external calls (assert_eq!, default, panic!).
 
@@ -5157,11 +5165,11 @@ fn replace_one_preserves_other_bindings()
 fn replace_one_deduplicates_replacement()
 ```
 
-**Purpose**: Ensures replace-one collapses duplicates when the replacement key already exists elsewhere in the binding list.
+**Purpose**: Checks that replacing one binding with a key already present collapses duplicates. The final action should not list the same key twice.
 
-**Data flow**: Builds a two-binding config where the replacement already exists, applies `ReplaceOne`, and asserts the result is a single-binding config and one-entry binding list.
+**Data flow**: It starts with `ctrl-enter` and `ctrl-shift-enter`, replaces `ctrl-enter` with `ctrl-shift-enter`, and asserts the final config has one binding.
 
-**Call relations**: Exercises `dedup_bindings` through replace-one.
+**Call relations**: This test specifically exercises the `dedup_bindings` call inside the ReplaceOne branch.
 
 *Call graph*: calls 3 internal fn (from_config, keymap_with_bindings, keymap_with_edit); 3 external calls (assert_eq!, default, panic!).
 
@@ -5172,11 +5180,11 @@ fn replace_one_deduplicates_replacement()
 fn replace_one_rejects_stale_old_key()
 ```
 
-**Purpose**: Checks that replace-one fails if the selected old binding is no longer active by the time the edit is applied.
+**Purpose**: Verifies that ReplaceOne fails if the selected old key is no longer active. This prevents stale menus from overwriting newer shortcut state.
 
-**Data flow**: Starts from defaults, applies `ReplaceOne { old_key: "alt-enter" }` to `composer.submit`, expects an error, and asserts the message mentions both the action and stale key.
+**Data flow**: It uses the default runtime keymap and asks to replace a non-active `alt-enter` binding for `composer.submit`. It expects an error mentioning the action and stale key.
 
-**Call relations**: Covers stale-menu protection in `keymap_with_edit`.
+**Call relations**: This test protects the stale-selection guard in `keymap_with_edit`.
 
 *Call graph*: calls 2 internal fn (defaults, keymap_with_edit); 2 external calls (assert!, default).
 
@@ -5187,11 +5195,11 @@ fn replace_one_rejects_stale_old_key()
 fn clear_removes_custom_binding()
 ```
 
-**Purpose**: Verifies that clearing a custom binding sets the root config slot back to `None` and updates `has_custom_binding` accordingly.
+**Purpose**: Checks that clearing a custom binding sets the config slot back to absent. That means defaults can take over again.
 
-**Data flow**: Creates a customized keymap, checks `has_custom_binding == true`, clears the binding with `keymap_without_custom_binding`, then asserts the slot is `None` and `has_custom_binding == false`.
+**Data flow**: It creates a custom binding, confirms `has_custom_binding` is true, clears it with `keymap_without_custom_binding`, then checks the slot is `None` and custom status is false.
 
-**Call relations**: Tests the clear-binding mutation path.
+**Call relations**: This test covers both the clear helper and the custom-binding detector.
 
 *Call graph*: calls 2 internal fn (keymap_with_replacement, keymap_without_custom_binding); 2 external calls (assert_eq!, default).
 
@@ -5202,24 +5210,26 @@ fn clear_removes_custom_binding()
 fn replacement_rejects_unknown_action()
 ```
 
-**Purpose**: Ensures attempts to edit an unknown context/action pair fail with a stale-selection style error.
+**Purpose**: Verifies that trying to edit an unknown action returns a useful error. This protects users from stale UI selections after config or code changes.
 
-**Data flow**: Calls `keymap_with_replacement` for `composer.nope`, expects an error, and asserts the message mentions the unknown action path.
+**Data flow**: It calls the replacement helper with context `composer` and action `nope`, expects an error, and checks that the unknown action name appears in it.
 
-**Call relations**: Covers unknown-action handling via `binding_slot` lookup failure.
+**Call relations**: This test covers the error path through `keymap_with_replacement` and `keymap_with_bindings`.
 
 *Call graph*: calls 1 internal fn (keymap_with_replacement); 2 external calls (assert!, default).
 
 
 ### `tui/src/keymap_setup/debug.rs`
 
-`orchestration` · `interactive `/keymap` debug inspector session`
+`domain_logic` · `active while the keymap debug bottom pane is open`
 
-This module defines `KeymapDebugView`, a bottom-pane inspector backed by a cloned `RuntimeKeymap` and `TuiKeymap`. Its state is intentionally small: `opened_at` tracks when the inspector started, `last_report` stores the most recent inspected keypress as a `KeymapDebugReport`, and `complete` marks Ctrl+C dismissal. The report captures four concrete pieces of data: the normalized `KeyBinding` detected from the event, the canonical config key string or serialization error, a raw debug summary of the original `KeyEvent`, and the list of matching actions returned by `actions::matching_actions_for_key_event`.
+This file exists to solve a very practical shortcut problem: terminals do not always send the keys people think they send. A key may be swallowed by the terminal, changed into another key code, or arrive with different modifier keys such as Ctrl or Alt. Without this view, users trying to customize shortcuts would have to guess why a key binding does not work.
 
-Rendering is line-oriented. `lines_at` builds a title, instructions, and either a short or delayed hint depending on how long the view has been waiting without any keypress. Once a key is captured, it renders the detected display label, the config key or wrapped unsupported-key error, the raw event summary, and a wrapped list of assigned actions including their source labels (`Custom`, `Custom global`, or `Default`). `push_wrapped_dim` centralizes wrapped dim styling for long explanatory lines.
+The main piece is `KeymapDebugView`, a small bottom-pane screen. When it opens, it shows instructions and waits for a keypress. If no key arrives after a few seconds, it changes the hint to explain that Codex can only inspect keys the terminal actually sends. This is like checking whether a doorbell is wired: if pressing the button produces no signal, the app cannot assign meaning to it.
 
-Input handling is simple and diagnostic-focused: release events are ignored, all other keypresses—including `Esc`—are inspected rather than dismissed, and Ctrl+C is the explicit exit path. `next_frame_delay` requests a redraw exactly when the delayed hint should appear, so the waiting message upgrades automatically without user input.
+When a key event does arrive, the view records a report. That report includes a friendly detected key label, the configuration spelling for that key if one exists, the raw terminal event for troubleshooting, and any Codex actions already assigned to that key. The view then renders those details as wrapped, dimmed terminal text so long messages still fit inside a narrow pane.
+
+The pane treats Esc as another inspectable key rather than an automatic close command. Ctrl+C is the explicit way to close it.
 
 #### Function details
 
@@ -5232,11 +5242,11 @@ fn build_keymap_debug_view(
 ) -> KeymapDebugView
 ```
 
-**Purpose**: Constructs a fresh keypress inspector view from the current runtime keymap and root config snapshot.
+**Purpose**: Creates a fresh keypress inspector view from the current runtime keymap and keymap configuration. It takes a snapshot of those settings so the debug screen can compare incoming keys against the bindings that are active when the view opens.
 
-**Data flow**: Clones the provided `RuntimeKeymap` and `TuiKeymap`, records `Instant::now()` as `opened_at`, initializes `last_report` to `None` and `complete` to `false`, and returns the new `KeymapDebugView`.
+**Data flow**: It receives references to the active keymap and the saved keymap configuration. It clones both, records the current time as the opening time, starts with no key report, and marks the view as not complete. The result is a ready-to-render `KeymapDebugView`.
 
-**Call relations**: Opened from the picker’s Debug tab and used directly by debug-view tests.
+**Call relations**: Tests call this to create the debug pane in known states. In normal use, this is the constructor other keymap setup code would call when the user asks to inspect shortcut keys.
 
 *Call graph*: called by 5 (debug_view_initial_snapshot, debug_view_labels_custom_global_fallback_source, debug_view_reports_detected_key_and_matching_actions, debug_view_shows_delayed_missing_key_hint, debug_view_uses_custom_binding_source); 3 external calls (now, clone, clone).
 
@@ -5247,11 +5257,11 @@ fn build_keymap_debug_view(
 fn lines(&self, width: u16) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Builds the current rendered lines using the real current time.
+**Purpose**: Builds the text lines that should be shown right now in the debug pane. It is the everyday rendering helper used by both drawing and height calculation.
 
-**Data flow**: Calls `lines_at(width, Instant::now())` and returns the resulting `Vec<Line<'static>>`.
+**Data flow**: It takes the pane width, reads the current clock time, and passes both to `KeymapDebugView::lines_at`. It returns a list of styled terminal text lines ready to display.
 
-**Call relations**: Shared by `render` and `desired_height`.
+**Call relations**: `render` uses this to draw the pane, and `desired_height` uses it to know how much vertical space the pane needs. It delegates the actual content choices to `lines_at`.
 
 *Call graph*: calls 1 internal fn (lines_at); called by 2 (desired_height, render); 1 external calls (now).
 
@@ -5262,11 +5272,11 @@ fn lines(&self, width: u16) -> Vec<Line<'static>>
 fn lines_at(&self, width: u16, now: Instant) -> Vec<Line<'static>>
 ```
 
-**Purpose**: Builds the full textual report for the inspector at a specific instant, including waiting hints, captured key details, and matching actions.
+**Purpose**: Assembles the full visible text for the keypress inspector. It decides whether to show the waiting message or the latest key report, and formats the report in a readable way.
 
-**Data flow**: Computes wrap width, creates title and instruction lines, chooses either `SHORT_MISSING_KEY_HINT` or `DELAYED_MISSING_KEY_HINT` via `should_show_delayed_hint`, wraps that hint with `push_wrapped_dim`, and then either renders a waiting message when `last_report` is `None` or renders detected key, config key or wrapped error, raw event summary, and wrapped matched-action lines from `last_report`.
+**Data flow**: It receives a width and a time. It starts with the title and instructions, chooses either the short or delayed hint, wraps that hint to fit the width, and then checks whether a key has been recorded. If no key has been recorded, it adds a waiting message. If a report exists, it adds the detected key, configuration key or error, raw terminal event, and any matching assigned actions. It returns all of those as styled lines.
 
-**Call relations**: This is the core rendering routine behind the inspector UI.
+**Call relations**: `lines` calls this whenever the UI needs the current text. It calls `should_show_delayed_hint` to decide which hint to show, and `push_wrapped_dim` whenever a line may be too long for the pane.
 
 *Call graph*: calls 2 internal fn (should_show_delayed_hint, push_wrapped_dim); called by 1 (lines); 4 external calls (from, format!, from, vec!).
 
@@ -5277,11 +5287,11 @@ fn lines_at(&self, width: u16, now: Instant) -> Vec<Line<'static>>
 fn should_show_delayed_hint(&self, now: Instant) -> bool
 ```
 
-**Purpose**: Determines whether the longer explanatory hint should replace the short waiting hint.
+**Purpose**: Decides whether the waiting hint should become more explicit. It helps users understand that if no key appears after a short wait, the terminal may not be sending that key to Codex at all.
 
-**Data flow**: Returns `true` only when `last_report` is still `None` and `now.duration_since(opened_at)` is at least `MISSING_KEY_HINT_DELAY`.
+**Data flow**: It receives the current time and reads when the view was opened and whether any key report exists. If no key has been received and at least three seconds have passed, it returns true. Otherwise it returns false.
 
-**Call relations**: Used by `lines_at` and mirrored by `next_frame_delay` scheduling.
+**Call relations**: `lines_at` calls this while building the visible message. Its answer changes the text from a short tip to a fuller explanation.
 
 *Call graph*: called by 1 (lines_at); 1 external calls (duration_since).
 
@@ -5292,11 +5302,11 @@ fn should_show_delayed_hint(&self, now: Instant) -> bool
 fn show_delayed_hint_for_test(&mut self)
 ```
 
-**Purpose**: Test-only helper that forces the view into the delayed-hint state without waiting in real time.
+**Purpose**: For tests only, forces the view into the state where the delayed missing-key hint should appear. This avoids making tests actually wait for several seconds.
 
-**Data flow**: Sets `opened_at` to `Instant::now() - MISSING_KEY_HINT_DELAY`.
+**Data flow**: It changes the stored opening time to appear as though the pane opened at least three seconds ago. It does not return anything; it only updates the view’s internal clock marker.
 
-**Call relations**: Used by tests that snapshot the delayed hint.
+**Call relations**: Test code can call this before rendering the view. Then the normal `lines_at` path will show the delayed hint without any special testing branch in the display code.
 
 *Call graph*: 1 external calls (now).
 
@@ -5307,11 +5317,11 @@ fn show_delayed_hint_for_test(&mut self)
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the inspector view into the bottom-pane buffer.
+**Purpose**: Draws the keypress inspector into the terminal screen area assigned to it. This is the bridge between the view’s text model and the terminal UI drawing system.
 
-**Data flow**: Builds the current lines with `self.lines(area.width)` and renders them through a `Paragraph` into the provided `Buffer` and `Rect`.
+**Data flow**: It receives a rectangle describing where to draw and a buffer representing the terminal screen being prepared. It asks `lines` for the current text, puts those lines into a paragraph widget, and renders that paragraph into the buffer. The buffer is changed; no separate value is returned.
 
-**Call relations**: Implements the `Renderable` trait for the inspector.
+**Call relations**: The broader terminal rendering code calls this through the `Renderable` interface. It depends on `lines` for the content and on the UI library’s paragraph widget to paint that content.
 
 *Call graph*: calls 1 internal fn (lines); called by 1 (render_debug); 1 external calls (new).
 
@@ -5322,11 +5332,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, width: u16) -> u16
 ```
 
-**Purpose**: Reports how many terminal rows the inspector needs at a given width.
+**Purpose**: Reports how many terminal rows the debug pane would like to use at a given width. This lets the layout code reserve enough space for the wrapped text.
 
-**Data flow**: Calls `self.lines(width)`, takes the vector length, and returns it as `u16`.
+**Data flow**: It receives the available width, builds the current display lines with `lines`, counts them, and returns that count as a height. It does not change the view.
 
-**Call relations**: Used by layout code and rendering tests.
+**Call relations**: The rendering flow calls this before or during layout. Because it uses the same `lines` helper as `render`, the requested height matches what will actually be drawn.
 
 *Call graph*: calls 1 internal fn (lines); called by 1 (render_debug).
 
@@ -5337,11 +5347,11 @@ fn desired_height(&self, width: u16) -> u16
 fn handle_key_event(&mut self, key_event: KeyEvent)
 ```
 
-**Purpose**: Captures one inspected keypress and stores a full debug report for rendering. It ignores release events and inspects all press events, including Esc.
+**Purpose**: Records what happened when the user pressed a key inside the inspector. It turns the raw terminal key event into a useful report for humans.
 
-**Data flow**: Reads a `KeyEvent`; returns immediately on `KeyEventKind::Release`; otherwise builds a `KeymapDebugReport` containing `KeyBinding::from_event(key_event)`, `key_event_to_config_key_spec(key_event)`, `key_event_debug_summary(key_event)`, and `matching_actions_for_key_event(&runtime_keymap, &keymap_config, key_event)`, then stores it in `last_report`.
+**Data flow**: It receives a key event from the terminal. If the event is only a key release, it ignores it because releases are not useful for shortcut binding. Otherwise it builds a new report: a friendly detected key label, the configuration spelling or an unsupported-key error, a raw debug summary, and the list of actions currently matched by that key. It stores that report as the latest report shown by the pane.
 
-**Call relations**: Called by the bottom-pane event loop while the inspector is active.
+**Call relations**: The bottom-pane input system calls this when key events arrive. It hands off to `KeyBinding::from_event`, `key_event_to_config_key_spec`, `key_event_debug_summary`, and `matching_actions_for_key_event` to translate the raw event into the pieces shown by `lines_at`.
 
 *Call graph*: calls 3 internal fn (from_event, matching_actions_for_key_event, key_event_debug_summary); 1 external calls (key_event_to_config_key_spec).
 
@@ -5352,11 +5362,11 @@ fn handle_key_event(&mut self, key_event: KeyEvent)
 fn is_complete(&self) -> bool
 ```
 
-**Purpose**: Reports whether the inspector should be dismissed.
+**Purpose**: Tells the surrounding UI whether this debug pane has finished and can be closed. In this view, completion means the user pressed Ctrl+C.
 
-**Data flow**: Returns the `complete` flag.
+**Data flow**: It reads the view’s internal `complete` flag and returns it. It does not change anything.
 
-**Call relations**: Queried by the bottom-pane framework.
+**Call relations**: The bottom-pane controller can call this after input handling or during its update loop. `on_ctrl_c` is the function that changes the flag this function reports.
 
 
 ##### `KeymapDebugView::on_ctrl_c`  (lines 174–177)
@@ -5365,11 +5375,11 @@ fn is_complete(&self) -> bool
 fn on_ctrl_c(&mut self) -> CancellationEvent
 ```
 
-**Purpose**: Handles Ctrl+C as the explicit exit path for the inspector.
+**Purpose**: Closes the keypress inspector when the user presses Ctrl+C. This gives the view a clear exit key while still allowing Esc to be inspected as a normal key.
 
-**Data flow**: Sets `complete = true` and returns `CancellationEvent::Handled`.
+**Data flow**: It changes the internal `complete` flag to true and returns a cancellation result saying the Ctrl+C was handled by this pane. After this, `is_complete` will report that the view is done.
 
-**Call relations**: Implements the `BottomPaneView` cancellation hook.
+**Call relations**: The bottom-pane input system calls this for Ctrl+C. It works together with `prefer_esc_to_handle_key_event`, which keeps Esc available for inspection instead of using it as the close action.
 
 
 ##### `KeymapDebugView::prefer_esc_to_handle_key_event`  (lines 179–181)
@@ -5378,11 +5388,11 @@ fn on_ctrl_c(&mut self) -> CancellationEvent
 fn prefer_esc_to_handle_key_event(&self) -> bool
 ```
 
-**Purpose**: Requests that Esc be delivered to the inspector as an inspected key rather than dismissing the popup.
+**Purpose**: Says that Esc should be passed into the inspector as a key to examine. This is important because users may want to know what Esc looks like and whether it is bound to anything.
 
-**Data flow**: Returns `true` with no side effects.
+**Data flow**: It takes no outside data beyond the view itself and always returns true. It does not change any state.
 
-**Call relations**: Allows the inspector to debug Esc itself.
+**Call relations**: The bottom-pane input system uses this preference when deciding whether Esc should close the pane or be delivered to `handle_key_event`. Because it returns true, Esc goes through the same reporting path as other keys.
 
 
 ##### `KeymapDebugView::next_frame_delay`  (lines 183–192)
@@ -5391,11 +5401,11 @@ fn prefer_esc_to_handle_key_event(&self) -> bool
 fn next_frame_delay(&self) -> Option<Duration>
 ```
 
-**Purpose**: Schedules a redraw exactly when the delayed waiting hint should appear, but only while no key has been inspected yet.
+**Purpose**: Tells the UI when it should redraw next while waiting for the first keypress. This is needed so the short waiting hint can turn into the longer hint after three seconds even if the user does nothing.
 
-**Data flow**: If `last_report` is already present, returns `None`; otherwise computes `opened_at + MISSING_KEY_HINT_DELAY`, subtracts `Instant::now()`, filters out zero delays, and returns the remaining `Duration` if any.
+**Data flow**: It checks whether a key report already exists. If a key has been received, it returns no delay because there is no timed hint left to show. If no key has been received, it calculates how long remains until the delayed hint should appear and returns that duration if it is still in the future.
 
-**Call relations**: Used by the bottom-pane framework to refresh the inspector without user input.
+**Call relations**: The UI loop can call this to schedule a future redraw. It supports the hint timing used by `should_show_delayed_hint` and `lines_at`.
 
 *Call graph*: 1 external calls (checked_add).
 
@@ -5412,11 +5422,11 @@ fn push_wrapped_dim(
 )
 ```
 
-**Purpose**: Wraps a long string into one or more dim-styled `Line`s with configurable initial and subsequent indentation.
+**Purpose**: Adds one or more dimmed text lines to the display, wrapping long text so it fits the pane width. It keeps messages readable in narrow terminal windows.
 
-**Data flow**: Builds `textwrap::Options` from the provided width and indents, wraps the text, converts each wrapped segment into a dim `Line<'static>`, and appends them to the mutable output vector.
+**Data flow**: It receives the growing list of lines, the text to add, the wrap width, and indentation strings for the first and following lines. It breaks the text into wrapped pieces, applies dim styling to each piece, and appends them to the line list. It changes the supplied list and returns nothing.
 
-**Call relations**: Used by `lines_at` for hints, raw-event summaries, unsupported-key messages, and matched-action descriptions.
+**Call relations**: `lines_at` calls this for hints, raw event text, unsupported-key messages, and action descriptions. It is the shared formatting helper that keeps the debug view from overflowing horizontally.
 
 *Call graph*: called by 1 (lines_at); 2 external calls (new, wrap).
 
@@ -5427,11 +5437,11 @@ fn push_wrapped_dim(
 fn key_event_debug_summary(key_event: KeyEvent) -> String
 ```
 
-**Purpose**: Formats a raw `KeyEvent` into a concise debug string showing code, modifiers, and kind.
+**Purpose**: Creates a compact raw summary of a terminal key event for troubleshooting. This is useful when the friendly key name is not enough to explain what the terminal sent.
 
-**Data flow**: Reads `key_event.code`, formats modifiers through `key_modifiers_debug_label`, includes `key_event.kind`, and returns the assembled `String`.
+**Data flow**: It receives a key event and reads its key code, modifier keys, and event kind. It formats those pieces into a single string, using `key_modifiers_debug_label` to make the modifiers readable. The string is returned for display in the report.
 
-**Call relations**: Stored in `KeymapDebugReport` by `handle_key_event`.
+**Call relations**: `handle_key_event` calls this while building the latest report. The resulting text is later shown by `lines_at` under “Raw event.”
 
 *Call graph*: called by 1 (handle_key_event); 1 external calls (format!).
 
@@ -5442,24 +5452,24 @@ fn key_event_debug_summary(key_event: KeyEvent) -> String
 fn key_modifiers_debug_label(modifiers: KeyModifiers) -> String
 ```
 
-**Purpose**: Formats a `KeyModifiers` bitset into a human-readable debug label, preserving unknown modifier bits when present.
+**Purpose**: Turns modifier-key flags into a readable label such as `ctrl|alt` or `none`. Modifier keys are keys like Ctrl, Alt, and Shift that change the meaning of another keypress.
 
-**Data flow**: Returns `"none"` for an empty set; otherwise appends `ctrl`, `alt`, and `shift` labels for known bits, computes any remaining bits with `difference`, appends their debug representation if non-empty, joins parts with `|`, and returns the string.
+**Data flow**: It receives the set of modifier flags from a key event. If no modifiers are present, it returns `none`. Otherwise it checks for Ctrl, Alt, and Shift, adds their names, and also includes any unusual modifier flags in debug form. It returns the names joined with vertical bars.
 
-**Call relations**: Used by `key_event_debug_summary` to make raw event output readable.
+**Call relations**: `key_event_debug_summary` uses this helper when building the raw event string. It keeps modifier formatting in one place so the summary stays simple and consistent.
 
 *Call graph*: 5 external calls (contains, difference, is_empty, new, format!).
 
 
 ### `tui/src/keymap_setup/actions.rs`
 
-`domain_logic` · `used whenever `/keymap` builds menus, edits config, or inspects key matches`
+`domain_logic` · `active during /keymap setup, shortcut display, and key-event debugging`
 
-This file is the authoritative inventory of editable shortcuts. `KeymapActionDescriptor` stores the stable config `context` and `action` segments, a human-facing `context_label`, a short description, and an optional feature gate. The large `KEYMAP_ACTIONS` constant enumerates every action exposed by `/keymap`, including app/global, chat, composer, editor, Vim, pager, list, and approval actions. The small `action` and `gated_action` constructors keep that table concise, while `KeymapActionFilter` and `KeymapActionDescriptor::is_visible` hide gated entries such as `toggle_fast_mode` unless the relevant feature is enabled.
+This file is like the index at the front of a keyboard-shortcut manual. It lists every configurable action, such as submitting a message, scrolling a pager, or approving a request, and gives each one a stable config name plus a friendly label and description for the UI.
 
-Two long match-based accessors keep the catalog aligned with actual data structures. `binding_slot` maps `(context, action)` to the mutable `Option<KeybindingsSpec>` field inside `TuiKeymap`, preserving the distinction between `None` (inherit), `Some(One/Many)` (custom binding), and `Some(Many([]))` (explicit unbind). `bindings_for_action` maps the same identifiers to the resolved `&[KeyBinding]` slice inside `RuntimeKeymap`, so UI code always displays effective bindings after fallback and validation.
+The key problem it solves is consistency. A shortcut appears in several places: in the user-facing `/keymap` picker, in the editable configuration file, and in the resolved runtime keymap that the app actually uses while running. If these drift apart, the UI could show an action that cannot be edited, or edit a setting that does not affect the running app. This file keeps those links together.
 
-The file also provides `action_label`, which turns stable snake_case action names into title-cased UI labels without changing the underlying identifiers, and `format_binding_summary`, which converts runtime bindings back into canonical config strings while de-duplicating normalized equivalents. For the debug inspector, `matching_actions_for_key_event` finds all descriptors whose runtime bindings match a `KeyEvent`, and `debug_binding_source` classifies each match as `Custom`, `CustomGlobal`, or `Default` by inspecting root config and composer global-fallback slots.
+It also handles a few user-facing details. It can hide actions that require a feature flag, turn an internal name like `open_transcript` into `Open Transcript`, summarize active bindings as text, and tell the debug UI whether a matching key came from a custom setting, a custom global fallback, or the default. The global fallback is important for composer actions: some old or shared global settings can still supply bindings for submit, queue, and shortcut toggling.
 
 #### Function details
 
@@ -5474,11 +5484,11 @@ fn action(
 ) -> KeymapActionDescriptor
 ```
 
-**Purpose**: Builds a non-gated `KeymapActionDescriptor` constant entry.
+**Purpose**: Creates a normal keymap action descriptor for an action that is always available. It is used to keep each catalog entry short and consistent.
 
-**Data flow**: Takes static context, context label, action name, and description strings and returns a `KeymapActionDescriptor` with `required_feature: None`.
+**Data flow**: It takes the config context, the friendly group label, the action name, and the description. It packs those into a `KeymapActionDescriptor` and marks it as not requiring any special feature. The result is a descriptor ready to be placed in the action catalog.
 
-**Call relations**: Used only in the `KEYMAP_ACTIONS` constant to define always-visible actions.
+**Call relations**: This helper feeds the `KEYMAP_ACTIONS` table. Later code reads those descriptors when building keymap menus, looking up bindings, or checking which action a pressed key matches.
 
 
 ##### `gated_action`  (lines 52–66)
@@ -5493,11 +5503,11 @@ fn gated_action(
 ) -> KeymapActionDescri
 ```
 
-**Purpose**: Builds a feature-gated `KeymapActionDescriptor` constant entry.
+**Purpose**: Creates a keymap action descriptor for an action that should only appear when a feature is enabled. In this file, that is used for actions such as Fast mode.
 
-**Data flow**: Takes the same descriptor fields as `action` plus a `KeymapActionFeature`, and returns a descriptor with `required_feature: Some(feature)`.
+**Data flow**: It receives the same action details as `action`, plus the required feature. It returns a descriptor that carries that feature requirement, so visibility can be checked later.
 
-**Call relations**: Used in `KEYMAP_ACTIONS` for actions like fast mode that should only appear when enabled.
+**Call relations**: This helper is used when filling the action catalog with feature-gated entries. `KeymapActionDescriptor::is_visible` later reads the stored requirement to decide whether the UI should show the action.
 
 
 ##### `KeymapActionDescriptor::is_visible`  (lines 79–84)
@@ -5506,11 +5516,11 @@ fn gated_action(
 fn is_visible(self, filter: KeymapActionFilter) -> bool
 ```
 
-**Purpose**: Determines whether a catalog entry should be shown under the current feature filter.
+**Purpose**: Decides whether one catalog action should be shown to the user under the current feature settings. This keeps unavailable actions out of the `/keymap` UI.
 
-**Data flow**: Reads `self.required_feature` and the provided `KeymapActionFilter`; returns `true` for ungated actions and checks `filter.fast_mode_enabled` for `FastMode`-gated entries.
+**Data flow**: It takes a descriptor and a `KeymapActionFilter`, which currently says whether Fast mode is enabled. If the descriptor has no required feature, it returns `true`. If it requires Fast mode, it returns the filter’s Fast mode setting.
 
-**Call relations**: Called by picker construction when filtering `KEYMAP_ACTIONS` into visible rows.
+**Call relations**: Menu-building code can call this while walking through the action catalog. It uses the feature requirement recorded by `action` or `gated_action` and turns it into a simple yes-or-no display decision.
 
 
 ##### `action_label`  (lines 205–217)
@@ -5519,11 +5529,11 @@ fn is_visible(self, filter: KeymapActionFilter) -> bool
 fn action_label(action: &str) -> String
 ```
 
-**Purpose**: Converts a stable snake_case action identifier into a title-cased display label for menus and headers.
+**Purpose**: Turns a stable internal action name into text that looks good in menus. For example, it changes an underscore-separated name into title-like words.
 
-**Data flow**: Splits the input string on underscores, uppercases the first character of each segment, concatenates the untouched remainder, joins the words with spaces, and returns the resulting `String`.
+**Data flow**: It receives a string such as `open_transcript`. It splits the string on underscores, capitalizes the first letter of each part, and joins the parts with spaces. It returns a display string such as `Open Transcript` without changing the original config name.
 
-**Call relations**: Used by action menus, capture views, replace-binding menus, and debug matches for presentation only.
+**Call relations**: Keymap menu and capture screens call this when they need a friendly label. The important rule is one-way use: the display label is for humans, while the original action name remains the reliable config identifier.
 
 *Call graph*: called by 3 (build_keymap_action_menu_params, build_keymap_capture_view, build_keymap_replace_binding_menu_params).
 
@@ -5538,11 +5548,11 @@ fn binding_slot(
 ) -> Option<&'a mut Option<KeybindingsSpec>>
 ```
 
-**Purpose**: Maps a catalog `(context, action)` pair to the mutable root-config slot that stores that action’s override in `TuiKeymap`.
+**Purpose**: Finds the editable configuration field for a given action. This is what lets the `/keymap` editor read, change, remove, or explicitly unbind a shortcut in the user’s `TuiKeymap` settings.
 
-**Data flow**: Pattern-matches on the provided context and action strings and returns `Some(&mut Option<KeybindingsSpec>)` for known actions or `None` for unknown pairs.
+**Data flow**: It receives a mutable `TuiKeymap`, plus a context name and action name. It matches that pair against the known catalog and returns a mutable pointer to the matching optional binding setting. If the pair is not recognized, it returns nothing.
 
-**Call relations**: This is the write-side bridge used by keymap editing, custom-binding checks, and debug source classification.
+**Call relations**: Editing helpers call this when checking whether a binding is custom, adding or replacing bindings, or removing a custom binding. `debug_binding_source` also uses it to tell whether a matching key came from an action-specific custom setting.
 
 *Call graph*: called by 4 (debug_binding_source, has_custom_binding, keymap_with_bindings, keymap_without_custom_binding).
 
@@ -5557,11 +5567,11 @@ fn bindings_for_action(
 ) -> Option<&'a [KeyBinding]>
 ```
 
-**Purpose**: Maps a catalog `(context, action)` pair to the resolved runtime binding slice for that action.
+**Purpose**: Looks up the active runtime bindings for one action. Unlike `binding_slot`, this reads the already-resolved keymap, so it reflects defaults, fallbacks, unbindings, and validation.
 
-**Data flow**: Pattern-matches on the provided context and action strings and returns `Some(&[KeyBinding])` borrowed from the appropriate field inside `RuntimeKeymap`, or `None` for unknown pairs.
+**Data flow**: It receives a `RuntimeKeymap`, a context, and an action name. It matches the pair to the corresponding runtime binding list and returns that list as a slice. If the action is unknown, it returns nothing.
 
-**Call relations**: This is the read-side bridge used by picker rows, action menus, capture views, and debug matching.
+**Call relations**: Screens that display current shortcuts call this so the UI shows what will actually work right now. `matching_actions_for_key_event` also relies on it while checking whether a pressed key activates any catalog action.
 
 *Call graph*: called by 2 (active_binding_specs, build_keymap_capture_view).
 
@@ -5572,11 +5582,11 @@ fn bindings_for_action(
 fn format_binding_summary(bindings: &[KeyBinding]) -> String
 ```
 
-**Purpose**: Formats a runtime binding slice into a compact comma-separated summary suitable for menus. It hides duplicate normalized variants so compatibility aliases do not look like separate user choices.
+**Purpose**: Turns a list of active key bindings into a compact string for menu display. It also avoids showing duplicate-looking bindings that come from compatibility variants.
 
-**Data flow**: Iterates over the input bindings, converts each to a canonical config string with `super::binding_to_config_key_spec`, inserts unseen strings into a `BTreeSet`, collects them into a vector, and returns either `"unbound"` or the joined summary string.
+**Data flow**: It receives a list of `KeyBinding` values. Each binding is converted back into a config-style key string when possible, duplicates are removed in sorted-set order, and the remaining strings are joined with commas. If nothing remains, it returns `unbound`.
 
-**Call relations**: Used by picker rows and capture-view headers to display effective bindings.
+**Call relations**: The keymap capture view calls this after it gets active bindings. It depends on the shared binding-to-config conversion so the text shown to users matches the format they would write in configuration.
 
 *Call graph*: called by 1 (build_keymap_capture_view); 2 external calls (new, iter).
 
@@ -5587,11 +5597,11 @@ fn format_binding_summary(bindings: &[KeyBinding]) -> String
 fn label(&self) -> &'static str
 ```
 
-**Purpose**: Returns the short UI label for a debug binding source classification.
+**Purpose**: Provides a short human-readable name for where a binding came from. This is useful in debug views that explain why a key press matches an action.
 
-**Data flow**: Matches `self` and returns one of the static strings `Custom`, `Custom global`, or `Default`.
+**Data flow**: It reads the enum value: custom action binding, custom global fallback, or default. It returns the matching label text: `Custom`, `Custom global`, or `Default`.
 
-**Call relations**: Used by the debug inspector when rendering matched actions.
+**Call relations**: Code that presents keymap debug matches can call this after `matching_actions_for_key_event` has identified the source. It turns the internal source category into text suitable for the UI.
 
 
 ##### `matching_actions_for_key_event`  (lines 515–537)
@@ -5604,11 +5614,11 @@ fn matching_actions_for_key_event(
 ) -> Vec<KeymapDebugActionMatch>
 ```
 
-**Purpose**: Finds every cataloged action whose resolved runtime bindings match a captured `KeyEvent`, and annotates each match with display metadata and source classification.
+**Purpose**: Finds every catalog action that would respond to a specific key press. This supports debugging or explaining keyboard behavior when a user presses a key.
 
-**Data flow**: Iterates over `KEYMAP_ACTIONS`, looks up each action’s runtime bindings with `bindings_for_action`, checks whether any binding reports `is_press(event)`, and collects matching descriptors into `KeymapDebugActionMatch` values containing context, action, label, description, and `debug_binding_source(...)`.
+**Data flow**: It receives the resolved runtime keymap, the original editable keymap config, and a terminal key event. It walks through the action catalog, gets each action’s active bindings, checks whether any binding matches the key press, and builds a list of matches with labels, descriptions, and source information.
 
-**Call relations**: Called by the debug inspector view whenever the user presses a key to inspect.
+**Call relations**: The key-event handler calls this when it needs to explain what a key does. Inside, it uses `bindings_for_action` to check the actual active bindings, `action_label` for display text, and `debug_binding_source` to say whether the match came from custom or default configuration.
 
 *Call graph*: called by 1 (handle_key_event).
 
@@ -5622,11 +5632,11 @@ fn debug_binding_source(
 ) -> KeymapDebugBindingSource
 ```
 
-**Purpose**: Classifies where a matched runtime binding came from: a direct custom override, a composer global fallback override, or the built-in defaults.
+**Purpose**: Figures out why a matched binding exists: because the user customized that exact action, because a composer action inherited a custom global fallback, or because it came from defaults.
 
-**Data flow**: Clones the `TuiKeymap`, looks up the direct slot with `binding_slot`, returns `Custom` if that slot is `Some`, otherwise checks `global_fallback_slot` for composer actions and returns `CustomGlobal` if present, falling back to `Default` in all other cases.
+**Data flow**: It receives the editable keymap config and an action descriptor. It clones the config so it can reuse mutable slot-finding helpers without changing the caller’s data. It first checks the action’s own config slot; if that is set, it returns `Custom`. If not, it checks a possible global fallback slot; if that is set, it returns `CustomGlobal`. Otherwise it returns `Default`.
 
-**Call relations**: Used by `matching_actions_for_key_event` to enrich debug matches with source labels.
+**Call relations**: Only `matching_actions_for_key_event` calls this in this file’s flow. It delegates the exact field lookups to `binding_slot` and `global_fallback_slot`, then hands back a simple source category for the debug match record.
 
 *Call graph*: calls 2 internal fn (binding_slot, global_fallback_slot); 1 external calls (clone).
 
@@ -5640,24 +5650,26 @@ fn global_fallback_slot(
 ) -> Option<&'a mut Option<KeybindingsSpec>>
 ```
 
-**Purpose**: Returns the relevant global fallback config slot for composer actions that support global reuse.
+**Purpose**: Finds the older or shared global setting that can act as a fallback for certain composer actions. This preserves expected behavior for submit, queue, and shortcut-toggle bindings.
 
-**Data flow**: Checks whether the descriptor context is `composer`; if so, matches the action name and returns the corresponding mutable `keymap.global.submit`, `queue`, or `toggle_shortcuts` slot, otherwise returns `None`.
+**Data flow**: It receives a mutable `TuiKeymap` and an action descriptor. If the descriptor is not in the `composer` context, it returns nothing. For the supported composer actions, it returns the matching mutable global config slot; otherwise it returns nothing.
 
-**Call relations**: Used only by `debug_binding_source` to distinguish direct custom bindings from inherited custom-global ones.
+**Call relations**: `debug_binding_source` calls this only after an action has no direct custom binding. Its answer lets the debug view distinguish a true default from a user-provided global binding that is being reused.
 
 *Call graph*: called by 1 (debug_binding_source).
 
 
 ### `tui/src/keymap_setup/picker.rs`
 
-`orchestration` · `interactive `/keymap` picker display and refresh`
+`orchestration` · `when the /keymap picker is opened or refreshed`
 
-This module turns the action catalog plus current runtime/config state into `SelectionViewParams` for the main `/keymap` picker. The internal `KeymapActionRow` stores the normalized row data needed for display: stable context/action identifiers, human-facing labels, the short description, a formatted binding summary, and whether the action has a root-level custom override. `build_keymap_rows` derives those rows by filtering `KEYMAP_ACTIONS` through `KeymapActionFilter`, reading effective bindings from `RuntimeKeymap` via `bindings_for_action`, formatting them with `format_binding_summary`, and checking root overrides with `has_custom_binding`.
+When a user opens `/keymap`, they need a clear way to see every configurable shortcut, find the one they care about, and open its edit menu. This file prepares that whole picker screen. Think of it like arranging a store directory: it gathers all shortcut “products,” marks which ones are customized or missing a key, groups them into useful aisles, and gives the screen the text it needs to guide the user.
 
-`build_keymap_picker_params_for_action` is the main assembler. It computes counts for total, customized, and unbound actions; optionally finds the selected row index for focus restoration; calculates a name-column width using Unicode display width; and then builds a tab set. Tabs include All, Common (a curated subset from `KEYMAP_COMMON_ACTIONS`), Customized, Unbound, several context-group tabs from `KEYMAP_CONTEXT_TABS`, and a final Debug tab that launches the keypress inspector. Empty tabs get a disabled placeholder row instead of an empty list.
+The file starts from the known list of configurable actions. For each action, it looks up the active key bindings from the runtime keymap, checks whether the user has overridden that shortcut in configuration, and creates a `KeymapActionRow`. Each row carries the action’s context, friendly label, description, current binding text, and whether it is custom.
 
-Each action row becomes a `SelectionItem` with a prefixed context label and indicator: `*` in accent style for custom bindings, `-` dimmed for unbound actions, and blank otherwise. The row’s action sends `AppEvent::OpenKeymapActionMenu { context, action }`, keeping the picker open underneath. Footer hints explain tab switching, editing, and the meaning of the custom/unbound indicators.
+The main builder then creates tabs: all shortcuts, common shortcuts, customized shortcuts, unbound shortcuts, context-specific groups like Editor or Vim, and a Debug tab for inspecting raw keypresses. It also sets search behavior, column sizing, footer hints, and which row should be selected when returning from editing a shortcut.
+
+Without this file, the shortcut editing feature would still have raw data, but no organized picker screen for users to browse, search, understand, or act on it.
 
 #### Function details
 
@@ -5667,11 +5679,11 @@ Each action row becomes a `SelectionItem` with a prefixed context label and indi
 fn is_unbound(&self) -> bool
 ```
 
-**Purpose**: Reports whether a picker row currently has no active binding.
+**Purpose**: This small check answers whether a shortcut action currently has no active key assigned to it. The picker uses that to mark the row as unbound.
 
-**Data flow**: Compares `self.binding_summary` to the literal string `"unbound"` and returns the resulting boolean.
+**Data flow**: It reads the row’s `binding_summary` text. If that text is exactly `"unbound"`, it returns true; otherwise it returns false. It does not change anything.
 
-**Call relations**: Used when building row prefixes and unbound-tab membership.
+**Call relations**: When a row is being decorated for display, `keymap_row_prefix` calls this check to decide whether to show the unbound marker. That marker helps the user spot actions that have no shortcut.
 
 *Call graph*: called by 1 (keymap_row_prefix).
 
@@ -5685,11 +5697,11 @@ fn build_keymap_picker_params(
 ) -> SelectionViewParams
 ```
 
-**Purpose**: Builds the default picker params with no feature gates enabled.
+**Purpose**: This test-only helper builds the normal keymap picker with no special filtering. Tests use it to check what the picker would show in the usual case.
 
-**Data flow**: Delegates to `build_keymap_picker_params_with_filter` using `KeymapActionFilter::default()` and returns the resulting `SelectionViewParams`.
+**Data flow**: It receives the current runtime keymap and the configured keymap. It adds the default action filter, then passes everything onward. The result is a complete `SelectionViewParams` value, which is the recipe for drawing and operating the picker.
 
-**Call relations**: Used by most picker call sites and tests when fast-mode gating is not needed.
+**Call relations**: Snapshot and behavior tests call this when they want the standard picker. It hands the work to `build_keymap_picker_params_with_filter`, which then moves into the shared picker-building path.
 
 *Call graph*: calls 1 internal fn (build_keymap_picker_params_with_filter); called by 15 (capture_completion_returns_to_selected_keymap_picker_row, clear_completion_returns_to_selected_keymap_picker_row, picker_all_tab_items_remain_searchable, picker_approval_tab_lists_all_approval_actions, picker_common_tab_lists_curated_actions, picker_content_snapshot, picker_custom_render_snapshot, picker_customized_tab_contains_root_overrides, picker_debug_tab_is_last_and_opens_inspector, picker_hides_fast_mode_action_when_feature_is_disabled (+5 more)); 1 external calls (default).
 
@@ -5704,11 +5716,11 @@ fn build_keymap_picker_params_with_filter(
 ) -> SelectionViewParams
 ```
 
-**Purpose**: Builds picker params using an explicit action-visibility filter.
+**Purpose**: This builds the keymap picker while allowing some actions to be included or hidden by a filter. It is useful when feature flags or test cases need a slightly different action list.
 
-**Data flow**: Passes the runtime keymap, root config, filter, and no selected action into `build_keymap_picker_params_for_action` and returns the result.
+**Data flow**: It receives the runtime keymap, the configured keymap, and an action filter. It does not choose a starting row, so it passes `None` for the selected action. It returns the completed picker parameters.
 
-**Call relations**: Used when the caller needs feature-gated actions like fast mode to appear.
+**Call relations**: The plain builder calls this with the default filter. Some tests call it directly to check filtered versions of the picker. It delegates to `build_keymap_picker_params_for_action`, the central builder.
 
 *Call graph*: calls 1 internal fn (build_keymap_picker_params_for_action); called by 4 (build_keymap_picker_params, keymap_picker_fast_mode_enabled_snapshot, picker_covers_every_replaceable_action, picker_shows_fast_mode_action_when_feature_is_enabled).
 
@@ -5724,11 +5736,11 @@ fn build_keymap_picker_params_for_selected_action(
 ) -> SelectionViewParams
 ```
 
-**Purpose**: Builds picker params that restore focus to a specific action using the default feature filter.
+**Purpose**: This test-only helper builds the normal picker but asks it to start with a particular action selected. It is used to verify that the interface returns focus to the right shortcut after editing.
 
-**Data flow**: Delegates to `build_keymap_picker_params_for_selected_action_with_filter` with `KeymapActionFilter::default()` and the provided context/action.
+**Data flow**: It receives the keymaps plus a context and action name that identify the desired row. It adds the default filter and forwards that selected action request. The output is picker parameters with an initial selected row if the action is found.
 
-**Call relations**: Used after successful edits or clears so the picker reopens focused on the edited row.
+**Call relations**: Tests call this when they simulate returning from a shortcut edit flow. It hands the request to `build_keymap_picker_params_for_selected_action_with_filter`.
 
 *Call graph*: calls 1 internal fn (build_keymap_picker_params_for_selected_action_with_filter); called by 4 (capture_completion_returns_to_selected_keymap_picker_row, clear_completion_returns_to_selected_keymap_picker_row, picker_selected_action_starts_on_matching_all_tab_row, replace_one_completion_drops_focused_keymap_submenus); 1 external calls (default).
 
@@ -5744,11 +5756,11 @@ fn build_keymap_picker_params_for_selected_action_with_filter(
     action:
 ```
 
-**Purpose**: Builds picker params that restore focus to a specific action under an explicit feature filter.
+**Purpose**: This builds a filtered keymap picker and asks it to select a specific shortcut row at startup. It combines filtering with focus restoration.
 
-**Data flow**: Calls `build_keymap_picker_params_for_action` with `Some((context, action))` as the selected action and returns the resulting params.
+**Data flow**: It receives the runtime keymap, configuration, filter, context, and action. It wraps the context and action as the requested selection and passes them into the shared builder. The returned picker parameters include the matching row index when available.
 
-**Call relations**: Used by focus-restoration flows when feature-gated actions may be visible.
+**Call relations**: The selected-action test helper calls this. It then uses `build_keymap_picker_params_for_action` so all picker variants share the same tab and row construction.
 
 *Call graph*: calls 1 internal fn (build_keymap_picker_params_for_action); called by 1 (build_keymap_picker_params_for_selected_action).
 
@@ -5764,11 +5776,11 @@ fn build_keymap_picker_params_for_action(
 ) -> Sele
 ```
 
-**Purpose**: Assembles the full tabbed `/keymap` picker view from current runtime/config state. It computes row data, tab contents, counts, search metadata, and initial selection.
+**Purpose**: This is the main assembly function for the keymap picker. It gathers rows, counts important categories, builds every tab, sets search and display options, and chooses the initial selected row if one was requested.
 
-**Data flow**: Builds all visible rows with `build_keymap_rows`, computes total/custom/unbound counts and optional selected-row index, derives `name_column_width` from Unicode widths, constructs All, Common, Customized, Unbound, context-group, and Debug tabs using `keymap_header`, `keymap_selection_items`, `keymap_common_rows`, `action_count_line`, and `keymap_debug_tab`, then returns a populated `SelectionViewParams` with search enabled and footer hints configured.
+**Data flow**: It starts with the runtime keymap, user keymap configuration, an action filter, and optionally a target action to select. It builds all shortcut rows, counts customized and unbound actions, creates tab contents, prepares headers and footer hints, calculates a useful name-column width, and returns a `SelectionViewParams` object. That object is the complete set of instructions the selection UI needs.
 
-**Call relations**: This is the central picker-construction routine used by all public picker builders.
+**Call relations**: Both public picker-building paths flow into this function. It calls helpers such as `build_keymap_rows`, `keymap_common_rows`, `keymap_selection_items`, `keymap_header`, `action_count_line`, `keymap_debug_tab`, and `keymap_picker_hint_line` to assemble smaller pieces into the final picker.
 
 *Call graph*: calls 7 internal fn (action_count_line, build_keymap_rows, keymap_common_rows, keymap_debug_tab, keymap_header, keymap_picker_hint_line, keymap_selection_items); called by 2 (build_keymap_picker_params_for_selected_action_with_filter, build_keymap_picker_params_with_filter); 5 external calls (new, default, new, format!, vec!).
 
@@ -5779,11 +5791,11 @@ fn build_keymap_picker_params_for_action(
 fn keymap_debug_tab() -> SelectionTab
 ```
 
-**Purpose**: Builds the special Debug tab that launches the keypress inspector instead of editing a specific action.
+**Purpose**: This creates the special Debug tab, where users can inspect what keypresses the terminal sends and which shortcuts match them. This is helpful because terminal key names can be surprising or different across environments.
 
-**Data flow**: Constructs a `SelectionTab` with a header from `keymap_header` and a single `SelectionItem` whose callback sends `AppEvent::OpenKeymapDebug`, plus a search string describing the inspector.
+**Data flow**: It builds one tab with a header, one selectable item, explanatory text, and an action. When that item is activated, it sends an app event asking to open the keymap debug inspector.
 
-**Call relations**: Appended by `build_keymap_picker_params_for_action` as the final tab.
+**Call relations**: `build_keymap_picker_params_for_action` adds this tab after the normal shortcut groups. The tab uses `keymap_header` for the same visual style as the other tabs, then hands off to the app event system when the user starts inspection.
 
 *Call graph*: calls 1 internal fn (keymap_header); called by 1 (build_keymap_picker_params_for_action); 1 external calls (vec!).
 
@@ -5798,11 +5810,11 @@ fn build_keymap_rows(
 ) -> Vec<KeymapActionRow>
 ```
 
-**Purpose**: Normalizes the visible action catalog into picker row data with effective binding summaries and custom-binding flags.
+**Purpose**: This turns the project’s catalog of configurable actions into rows the picker can show. Each row combines human-friendly action information with the user’s current binding state.
 
-**Data flow**: Iterates over `KEYMAP_ACTIONS`, filters descriptors with `descriptor.is_visible(action_filter)`, reads runtime bindings with `bindings_for_action`, formats them with `format_binding_summary`, checks root overrides with `has_custom_binding`, and collects `KeymapActionRow` values.
+**Data flow**: It reads the known shortcut action list, keeps only actions allowed by the filter, looks up each action’s active bindings in the runtime keymap, formats those bindings as display text, and checks the configuration for a custom override. It outputs a list of `KeymapActionRow` values.
 
-**Call relations**: Used only by the main picker builder as the source row set for all tabs.
+**Call relations**: The main builder calls this first, because every tab is based on these rows. The rows it returns are later filtered into groups like Common, Customized, Unbound, and context-specific tabs.
 
 *Call graph*: called by 1 (build_keymap_picker_params_for_action).
 
@@ -5813,11 +5825,11 @@ fn build_keymap_rows(
 fn keymap_common_rows(rows: &[KeymapActionRow]) -> Vec<&KeymapActionRow>
 ```
 
-**Purpose**: Extracts the curated Common-tab subset from the full row list while preserving the explicit order defined in `KEYMAP_COMMON_ACTIONS`.
+**Purpose**: This picks out a curated set of commonly used or commonly customized shortcuts. It makes the Common tab useful instead of forcing users to search the full list.
 
-**Data flow**: Iterates over the `(context, action)` pairs in `KEYMAP_COMMON_ACTIONS`, finds the matching row in the provided slice for each pair, and collects the found row references.
+**Data flow**: It receives all built shortcut rows. It walks through the predefined common-action list and finds matching rows by context and action name. It returns references to those matching rows, in the curated order.
 
-**Call relations**: Used by `build_keymap_picker_params_for_action` when constructing the Common tab.
+**Call relations**: `build_keymap_picker_params_for_action` calls this while creating the Common tab. The returned rows are then passed to `keymap_selection_items` to become clickable picker entries.
 
 *Call graph*: called by 1 (build_keymap_picker_params_for_action).
 
@@ -5832,11 +5844,11 @@ fn keymap_selection_items(
 ) -> Vec<SelectionItem>
 ```
 
-**Purpose**: Converts a row iterator into picker `SelectionItem`s, or emits a disabled placeholder row when the iterator is empty.
+**Purpose**: This converts shortcut rows into selection-list items for a tab. It also creates a friendly disabled placeholder when a tab has no real rows.
 
-**Data flow**: Maps each input row through `keymap_selection_item` into a vector; if the vector is empty, returns a one-item disabled placeholder list using the provided empty-state texts.
+**Data flow**: It receives rows plus the placeholder title and description to use if there are none. For each row, it creates a selectable item. If the resulting list is empty, it returns one disabled item explaining that there is nothing in that tab.
 
-**Call relations**: Used for every picker tab so empty tabs still render explanatory content.
+**Call relations**: The main builder calls this for the All, Common, Customized, Unbound, and context tabs. It relies on `keymap_selection_item` to turn each real shortcut row into one interactive entry.
 
 *Call graph*: called by 1 (build_keymap_picker_params_for_action); 2 external calls (into_iter, vec!).
 
@@ -5847,11 +5859,11 @@ fn keymap_selection_items(
 fn keymap_selection_item(row: &KeymapActionRow) -> SelectionItem
 ```
 
-**Purpose**: Builds one picker row item for a configurable action, including its prefix, binding summary, search text, and action-menu callback.
+**Purpose**: This builds one clickable row in the shortcut picker. Activating the row opens the action menu where the user can edit or inspect that shortcut.
 
-**Data flow**: Copies the row’s context and action into owned strings for closure capture, derives a source label (`Custom` or `Default`), builds a searchable text blob from context/action/label/description/binding/source, constructs prefix spans with `keymap_row_prefix`, and returns a `SelectionItem` whose callback sends `AppEvent::OpenKeymapActionMenu { context, action }`.
+**Data flow**: It receives a `KeymapActionRow`. It copies the row’s label and binding summary for display, builds a searchable text string from the context, action, description, binding, and source, adds a visual prefix, and stores an action closure. When the closure runs, it sends an app event with the row’s context and action.
 
-**Call relations**: Used by `keymap_selection_items` for all non-placeholder picker rows.
+**Call relations**: `keymap_selection_items` uses this for every real row. It calls `keymap_row_prefix` to create the left-side context and status marker, then connects the row to the wider app by sending `OpenKeymapActionMenu` when selected.
 
 *Call graph*: calls 1 internal fn (keymap_row_prefix); 3 external calls (default, format!, vec!).
 
@@ -5862,11 +5874,11 @@ fn keymap_selection_item(row: &KeymapActionRow) -> SelectionItem
 fn keymap_row_prefix(row: &KeymapActionRow) -> Vec<Span<'static>>
 ```
 
-**Purpose**: Builds the left-side prefix shown before each picker row name: padded context label plus a custom/unbound indicator.
+**Purpose**: This creates the small label shown before each shortcut name. It shows the shortcut’s area, such as Editor or Vim, and marks custom or unbound rows.
 
-**Data flow**: Chooses an indicator span based on `row.custom_binding` and `row.is_unbound()`, formats the context label to `KEYMAP_CONTEXT_LABEL_WIDTH`, dims the label and spacing, and returns the resulting `Vec<Span<'static>>`.
+**Data flow**: It receives a shortcut row. It formats the context label to a fixed width, then chooses an indicator: `*` for custom bindings, `-` for unbound actions, or a blank marker otherwise. It returns styled text spans ready for display.
 
-**Call relations**: Used by `keymap_selection_item` to visually encode row state.
+**Call relations**: `keymap_selection_item` calls this while building each row. It calls `KeymapActionRow::is_unbound` to decide whether the unbound marker should appear, and uses the shared accent style so markers match the rest of the interface.
 
 *Call graph*: calls 2 internal fn (is_unbound, accent_style); called by 1 (keymap_selection_item); 1 external calls (vec!).
 
@@ -5877,11 +5889,11 @@ fn keymap_row_prefix(row: &KeymapActionRow) -> Vec<Span<'static>>
 fn keymap_header(description: String, summary: String) -> Box<dyn Renderable>
 ```
 
-**Purpose**: Builds a standard three-line header block for picker tabs.
+**Purpose**: This builds the header shown above a keymap picker tab. The header tells the user what section they are viewing and gives a short summary.
 
-**Data flow**: Creates a `ColumnRenderable`, pushes a bold `Keymap` title plus dimmed description and summary lines, boxes it as `Box<dyn Renderable>`, and returns it.
+**Data flow**: It receives a description line and a summary line. It creates a small column of three lines: the title `Keymap`, the description, and the summary. It returns that column as a renderable object the UI can draw.
 
-**Call relations**: Used by all picker tabs, including the Debug tab.
+**Call relations**: The main picker builder uses this for normal tabs, and `keymap_debug_tab` uses it for the Debug tab. This keeps all tab headers visually consistent.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (build_keymap_picker_params_for_action, keymap_debug_tab); 2 external calls (new, from).
 
@@ -5892,11 +5904,11 @@ fn keymap_header(description: String, summary: String) -> Box<dyn Renderable>
 fn action_count_line(count: usize) -> String
 ```
 
-**Purpose**: Formats a singular or plural action-count summary for tab headers.
+**Purpose**: This formats a count of shortcut actions into a readable sentence. It exists so tab summaries say `1 action.` instead of the awkward `1 actions.`
 
-**Data flow**: Matches the provided count and returns either `"1 action."` or `"{count} actions."`.
+**Data flow**: It receives a number. If the number is one, it returns `"1 action."`; otherwise it returns a plural sentence with the count. It does not change anything else.
 
-**Call relations**: Used by the main picker builder for Common, Customized, Unbound, and context-group tab summaries.
+**Call relations**: `build_keymap_picker_params_for_action` calls this while preparing tab headers. The resulting text is passed into `keymap_header` as the summary line.
 
 *Call graph*: called by 1 (build_keymap_picker_params_for_action); 1 external calls (format!).
 
@@ -5907,11 +5919,11 @@ fn action_count_line(count: usize) -> String
 fn keymap_picker_hint_line() -> Line<'static>
 ```
 
-**Purpose**: Builds the standard footer hint line for the main picker, including tab navigation, edit action, and indicator legend.
+**Purpose**: This creates the footer help text for the main keymap picker. It reminds users how to switch groups, edit a shortcut, read the custom and unbound markers, and close the picker.
 
-**Data flow**: Uses `accent_style()` to style key tokens, assembles the hint fragments into a `Line<'static>`, and returns it.
+**Data flow**: It uses the app’s accent style and builds a single line made from styled text pieces. The output is a `Line` ready to be shown in the picker footer.
 
-**Call relations**: Attached to the picker by `build_keymap_picker_params_for_action`.
+**Call relations**: `build_keymap_picker_params_for_action` includes this line in the returned picker parameters. The selection UI then displays it while the user browses shortcut tabs.
 
 *Call graph*: calls 1 internal fn (accent_style); called by 1 (build_keymap_picker_params_for_action); 2 external calls (from, vec!).
 
@@ -5922,11 +5934,11 @@ fn keymap_picker_hint_line() -> Line<'static>
 fn keymap_debug_hint_line() -> Line<'static>
 ```
 
-**Purpose**: Builds the footer hint line shown specifically on the Debug tab.
+**Purpose**: This creates the footer help text for the Debug tab. It tells users that Enter starts the key inspector and Escape closes the picker.
 
-**Data flow**: Uses `accent_style()` to style Enter and Esc tokens, assembles the fragments into a `Line<'static>`, and returns it.
+**Data flow**: It uses the app’s accent style and combines the key names and explanations into one styled line. The output is a footer hint line for the debug view.
 
-**Call relations**: Registered as a tab-specific footer hint for the Debug tab.
+**Call relations**: The picker setup supplies this as the special footer hint for the Debug tab. That way the instructions change when the user moves from browsing shortcuts to inspecting keypresses.
 
 *Call graph*: calls 1 internal fn (accent_style); 2 external calls (from, vec!).
 
@@ -5936,15 +5948,13 @@ These files cover pet runtime animation state, preview data, picker construction
 
 ### `tui/src/pets/picker.rs`
 
-`orchestration` · `request handling`
+`domain_logic` · `active when the `/pets` picker is opened`
 
-This file is the orchestration layer for the pet picker dialog. Its central job is to turn several pet sources into a single ordered list of `SelectionItem`s: bundled pets from `catalog::BUILTIN_PETS`, a synthetic `DISABLED_PET_ID` entry, and custom pets loaded from the user's `codex_home`. Internally it uses a private `PetPickerEntry` struct to normalize those sources into a common shape with `selector`, optional `legacy_selector`, display name, and optional description.
+When a user types `/pets`, the app needs to show a friendly picker instead of making them remember pet IDs by hand. This file creates that picker: its title, list items, search text, preview area, and the actions that happen when the user chooses something. Think of it like preparing a menu for a café: it gathers the regular menu items, adds a “no thanks” option, includes any custom items the customer brought in, then marks the right starting choice.
 
-`build_pet_picker_params` performs the full assembly. It chooses `DEFAULT_PET_ID` as the preferred selection when no pet is configured, sorts entries by `display_name`, then forcibly moves the disable entry to index 0 so it remains easy to find regardless of alphabetical order. While converting entries into `SelectionItem`s, it computes both `is_current` and `initial_selected_idx`, with explicit compatibility for legacy custom-pet identifiers via `legacy_selector`. Search behavior is also specialized: the disable row gets a synonym-rich search string (`disable disabled hide hidden off none`), while normal pets search by selector.
+The picker intentionally does not load preview images itself. Instead, when the highlighted row changes, it sends an app event asking another part of the TUI to load the preview. When the user selects a row, it sends either a “pet selected” event or a “pets disabled” event. This keeps the picker focused on building the menu, while the surrounding chat interface handles downloading assets, drawing previews, and saving the final setting.
 
-The picker itself does not load images. Instead, it wires `on_selection_changed` to emit `AppEvent::PetPreviewRequested` for the currently highlighted pet, and each selectable row emits either `AppEvent::PetSelected` or `AppEvent::PetDisabled`. Side content comes from `PetPickerPreviewState::renderable()`, so preview rendering can be updated asynchronously outside the popup widget tree.
-
-Custom pet discovery scans both modern `pets/<id>/pet.json` and legacy `avatars/<id>/avatar.json` layouts. Entries are deduplicated by normalized selector in a `HashMap`, skip reserved names like `DISABLED_PET_ID` and already-prefixed custom IDs, and silently ignore unreadable directories or invalid manifests by continuing rather than surfacing errors in the picker.
+Custom pets are found under the user’s Codex home directory. The file supports both the newer `pets/<name>/pet.json` layout and an older `avatars/<name>/avatar.json` layout, so older user content still appears. It also normalizes custom pet names into the modern `custom:<id>` selector format.
 
 #### Function details
 
@@ -5958,11 +5968,11 @@ fn build_pet_picker_params(
 ) -> SelectionViewParams
 ```
 
-**Purpose**: Constructs the full `SelectionViewParams` for the pet picker, including sorted items, current/preselected state, footer text, search metadata, preview side pane, and event callbacks for both selection and preview changes.
+**Purpose**: Builds the full set of instructions the bottom-pane selection widget needs to show the pet picker. It decides which rows to show, which row starts selected, what search text each row uses, what preview panel to attach, and what event to send when the user moves or chooses.
 
-**Data flow**: Inputs are the currently configured pet ID as `Option<&str>`, the `codex_home` path used for custom pet discovery, and a `PetPickerPreviewState`. It reads built-in and custom pet metadata via `available_pet_entries`, sorts and reorders entries, derives `initial_selected_idx`, converts each entry into a `SelectionItem` with `SelectionAction` closures that send `AppEvent::PetSelected` or `AppEvent::PetDisabled`, and builds an `on_selection_changed` callback that sends `AppEvent::PetPreviewRequested`. It returns a populated `SelectionViewParams` containing the item list and preview renderable; it does not mutate external state directly.
+**Data flow**: It receives the currently configured pet, the user’s Codex home folder, and the current preview state. It gathers all available pet entries, sorts them by display name, moves the “disable terminal pets” entry to the top, and turns each entry into a selectable UI item. It returns a `SelectionViewParams` value, which is the finished recipe for drawing and operating the popup.
 
-**Call relations**: This is the file's top-level constructor and is exercised by all picker tests. In its internal flow it first delegates source collection to `available_pet_entries`, then delegates side-pane creation to `PetPickerPreviewState::renderable`, and uses the standard popup hint helper for footer text. The surrounding UI is expected to consume the returned actions/callbacks rather than mutating pet state directly.
+**Call relations**: The test functions call this directly to verify the picker behavior. Inside the real flow, it asks `available_pet_entries` for the raw pet list, asks the preview state for something renderable for the side panel, uses `standard_popup_hint_line` for the footer help text, and creates callbacks that send app events when the selection changes or when a row is chosen.
 
 *Call graph*: calls 3 internal fn (standard_popup_hint_line, available_pet_entries, renderable); called by 4 (picker_imports_legacy_avatar_manifests, picker_lists_app_bundled_and_custom_pets, picker_marks_disabled_pet_as_current, picker_preselects_codex_without_marking_it_current_when_no_pet_is_configured); 3 external calls (new, default, Fixed).
 
@@ -5973,11 +5983,11 @@ fn build_pet_picker_params(
 fn available_pet_entries(codex_home: &Path) -> Vec<PetPickerEntry>
 ```
 
-**Purpose**: Builds the unified list of picker entries by combining bundled pets, the synthetic disable row, and custom pets discovered under the user's home directory.
+**Purpose**: Creates the combined list of pets that can appear in the picker. This includes bundled pets, the special disable option, and any custom pets found on disk.
 
-**Data flow**: It takes `codex_home`, reads `catalog::BUILTIN_PETS` into `PetPickerEntry` values, appends a hard-coded disable entry using `DISABLED_PET_ID`, then extends the vector with the result of `custom_pet_entries`. It returns the combined `Vec<PetPickerEntry>` without sorting.
+**Data flow**: It starts with the built-in pet catalog and turns each catalog pet into a picker entry with an ID, display name, and description. It then adds one extra entry for disabling terminal pets. Finally, it appends the custom entries found under the supplied Codex home path and returns the whole list.
 
-**Call relations**: This helper is only used by `build_pet_picker_params` as the source-gathering phase before sorting and item conversion. It delegates all filesystem-backed discovery and legacy compatibility logic to `custom_pet_entries`.
+**Call relations**: This is called by `build_pet_picker_params` before the picker rows are sorted and converted into UI items. It delegates the filesystem search for user-created pets to `custom_pet_entries`, keeping the main picker builder from needing to know those folder details.
 
 *Call graph*: calls 1 internal fn (custom_pet_entries); called by 1 (build_pet_picker_params).
 
@@ -5988,11 +5998,11 @@ fn available_pet_entries(codex_home: &Path) -> Vec<PetPickerEntry>
 fn custom_pet_entries(codex_home: &Path) -> Vec<PetPickerEntry>
 ```
 
-**Purpose**: Discovers user-managed pets from both current and legacy on-disk layouts and converts valid manifests into picker entries with normalized selectors.
+**Purpose**: Finds user-managed custom pets in the Codex home directory and turns them into picker entries. It also supports legacy avatar folders so older custom content can still be selected.
 
-**Data flow**: It takes `codex_home`, iterates over `avatars/avatar.json` and `pets/pet.json` directory conventions, reads child directories with `fs::read_dir`, filters out entries lacking the expected manifest file, extracts the folder name as an ID, skips reserved IDs and already-prefixed custom IDs, converts the raw ID with `custom_pet_selector`, and attempts to load a `Pet` via `Pet::load_with_codex_home`. Successful loads are inserted into a `HashMap<String, PetPickerEntry>` keyed by selector, with `legacy_selector` set to the raw folder name and empty descriptions normalized to `None`. It returns the map's values as a vector.
+**Data flow**: It looks in two places: `avatars` folders containing `avatar.json`, and `pets` folders containing `pet.json`. For each valid folder, it skips reserved or already-prefixed IDs, converts the folder name into a modern custom selector such as `custom:name`, then loads the pet manifest to get its display name and description. It returns the successfully loaded custom pets, de-duplicated by selector.
 
-**Call relations**: This function is called only from `available_pet_entries` to supply the custom portion of the picker. It delegates selector normalization to `custom_pet_selector` and manifest parsing/validation to `Pet::load_with_codex_home`, using a map so duplicate discoveries across legacy and current directories collapse to one selector.
+**Call relations**: `available_pet_entries` calls this while building the full picker list. This function hands off manifest parsing to `Pet::load_with_codex_home` and uses `custom_pet_selector` to produce the selector format that the rest of the pet system expects.
 
 *Call graph*: calls 2 internal fn (load_with_codex_home, custom_pet_selector); called by 1 (available_pet_entries); 3 external calls (new, join, read_dir).
 
@@ -6003,11 +6013,11 @@ fn custom_pet_entries(codex_home: &Path) -> Vec<PetPickerEntry>
 fn write_pet(dir: &Path, folder_name: &str, display_name: &str)
 ```
 
-**Purpose**: Creates a minimal modern custom pet fixture on disk for picker tests.
+**Purpose**: Creates a temporary modern custom pet folder for tests. It gives the picker something realistic to discover under `pets/<folder_name>/pet.json`.
 
-**Data flow**: It receives a temp root directory, folder name, and display name; creates `pets/<folder_name>`, writes a `pet.json` manifest containing ID, display name, description, and spritesheet path, then writes a test spritesheet file. It returns no value and mutates the filesystem under the provided temp directory.
+**Data flow**: It receives a temporary root directory, a folder name, and a display name. It creates the pet directory, writes a small `pet.json` manifest, and writes a test spritesheet file beside it. It does not return a value; it changes the temporary filesystem used by the test.
 
-**Call relations**: This helper is used by `tests::picker_lists_app_bundled_and_custom_pets` to seed a valid custom pet before invoking `build_pet_picker_params`.
+**Call relations**: The `picker_lists_app_bundled_and_custom_pets` test calls this before building picker parameters. It uses `catalog::write_test_spritesheet` so the generated manifest points to an image file that the pet loader accepts.
 
 *Call graph*: calls 1 internal fn (write_test_spritesheet); 4 external calls (join, format!, create_dir_all, write).
 
@@ -6018,11 +6028,11 @@ fn write_pet(dir: &Path, folder_name: &str, display_name: &str)
 fn write_legacy_avatar(dir: &Path, folder_name: &str, display_name: &str)
 ```
 
-**Purpose**: Creates a minimal legacy avatar-style custom pet fixture so the picker's backward-compatibility path can be tested.
+**Purpose**: Creates a temporary legacy custom avatar folder for tests. This checks that old-style `avatars/<folder_name>/avatar.json` content still appears in the pet picker.
 
-**Data flow**: It takes a temp root directory, folder name, and display name; creates `avatars/<folder_name>`, writes an `avatar.json` manifest with display name, description, and spritesheet path, and writes a test spritesheet asset. It returns no value and changes the temp filesystem layout.
+**Data flow**: It receives a temporary root directory, a folder name, and a display name. It creates the avatar directory, writes an `avatar.json` manifest, and writes a test spritesheet file. Its result is the changed test directory structure.
 
-**Call relations**: This helper is used by `tests::picker_imports_legacy_avatar_manifests` to exercise the legacy discovery branch inside `custom_pet_entries` and the legacy-selector matching logic in `build_pet_picker_params`.
+**Call relations**: The `picker_imports_legacy_avatar_manifests` test calls this before building picker parameters. Like `tests::write_pet`, it uses `catalog::write_test_spritesheet` to make the fake custom asset loadable.
 
 *Call graph*: calls 1 internal fn (write_test_spritesheet); 4 external calls (join, format!, create_dir_all, write).
 
@@ -6033,11 +6043,11 @@ fn write_legacy_avatar(dir: &Path, folder_name: &str, display_name: &str)
 fn picker_lists_app_bundled_and_custom_pets()
 ```
 
-**Purpose**: Verifies that the picker merges bundled pets with a custom pet, sorts them by display name while pinning the disable row first, and preselects the current custom pet correctly.
+**Purpose**: Verifies that the picker shows both built-in pets and a modern custom pet, in the expected order. It also checks that a custom pet can be treated as the current selection.
 
-**Data flow**: It creates a temporary codex home, writes a custom pet fixture, calls `build_pet_picker_params` with `Some("chefito")` and a default preview state, then inspects the returned `SelectionViewParams` to assert item ordering, selected index, and custom search value. It writes only test fixtures and performs assertions on the returned data.
+**Data flow**: It creates a temporary Codex home, writes one custom pet named Chefito, then builds the picker with Chefito as the current pet. It inspects the returned picker parameters to confirm the item names, the initially selected row, and the custom pet’s search value.
 
-**Call relations**: This test drives the main constructor path through custom discovery and item assembly, relying on `tests::write_pet` to prepare the filesystem.
+**Call relations**: This test uses `tests::write_pet` to prepare the filesystem and then calls `build_pet_picker_params`, exercising the normal path through `available_pet_entries` and `custom_pet_entries`.
 
 *Call graph*: calls 1 internal fn (build_pet_picker_params); 4 external calls (assert_eq!, tempdir, write_pet, default).
 
@@ -6048,11 +6058,11 @@ fn picker_lists_app_bundled_and_custom_pets()
 fn picker_preselects_codex_without_marking_it_current_when_no_pet_is_configured()
 ```
 
-**Purpose**: Checks the special-case UX where no configured pet still preselects the default pet entry without claiming it is already active.
+**Purpose**: Verifies the picker’s default starting point when the user has not configured any pet. It should highlight Codex as a sensible default, but not falsely mark it as already active.
 
-**Data flow**: It creates a temporary codex home, calls `build_pet_picker_params` with `current_pet` set to `None`, and asserts that the returned params select the Codex row by index and name while leaving `is_current` false. It does not mutate state beyond tempdir creation.
+**Data flow**: It creates an empty temporary Codex home and builds the picker with no current pet. It then checks that the initial selection points to the Codex row and that this row is not marked as current.
 
-**Call relations**: This test exercises the `preferred_pet = current_pet.unwrap_or(DEFAULT_PET_ID)` branch in `build_pet_picker_params` and confirms that preselection and current-state marking are intentionally separate.
+**Call relations**: This test calls `build_pet_picker_params` directly. It protects an important distinction in the picker: “highlight this as the default choice” is not the same as “this is already the user’s active setting.”
 
 *Call graph*: calls 1 internal fn (build_pet_picker_params); 4 external calls (assert!, assert_eq!, tempdir, default).
 
@@ -6063,11 +6073,11 @@ fn picker_preselects_codex_without_marking_it_current_when_no_pet_is_configured(
 fn picker_marks_disabled_pet_as_current()
 ```
 
-**Purpose**: Ensures the synthetic disable entry behaves like a real current selection, including index placement, lack of description, and custom search synonyms.
+**Purpose**: Verifies that the special disable option behaves like a real selectable setting. If pets are currently disabled, the picker should show that row as current.
 
-**Data flow**: It creates a temporary codex home, calls `build_pet_picker_params` with `Some(DISABLED_PET_ID)`, and asserts properties of the first returned item: selected index 0, expected label, `None` description, `is_current = true`, and the disable-specific search string. It only reads the returned params.
+**Data flow**: It creates an empty temporary Codex home and builds the picker with the disabled pet ID as the current value. It checks that the disable row is first, selected, has no description, is marked current, and has helpful search keywords such as “off” and “none.”
 
-**Call relations**: This test validates the reorder-to-front logic and the special-case item construction branch for `DISABLED_PET_ID` inside `build_pet_picker_params`.
+**Call relations**: This test calls `build_pet_picker_params` and checks the special row that `available_pet_entries` adds. It guards the user experience for people who want to turn terminal pets off.
 
 *Call graph*: calls 1 internal fn (build_pet_picker_params); 4 external calls (assert!, assert_eq!, tempdir, default).
 
@@ -6078,22 +6088,26 @@ fn picker_marks_disabled_pet_as_current()
 fn picker_imports_legacy_avatar_manifests()
 ```
 
-**Purpose**: Confirms that legacy avatar manifests are imported into the picker and matched against the normalized custom selector.
+**Purpose**: Verifies that older custom avatar manifests are still imported into the pet picker. This prevents existing user-created avatars from disappearing after the system moved to the newer pet format.
 
-**Data flow**: It creates a temporary codex home, writes a legacy avatar fixture, calls `build_pet_picker_params` with `Some("custom:legacy")`, finds the resulting item by display name, and asserts that it is marked current and searchable by the normalized selector. It mutates only the temp fixture directory.
+**Data flow**: It creates a temporary Codex home, writes a legacy avatar named Legacy, and builds the picker with `custom:legacy` as the current pet. It finds the Legacy row and checks that it is marked current and uses the modern `custom:legacy` search value.
 
-**Call relations**: This test covers the legacy `avatars` scan in `custom_pet_entries` and the `legacy_selector` compatibility checks used by `build_pet_picker_params` when determining current and preferred entries.
+**Call relations**: This test uses `tests::write_legacy_avatar` to prepare old-style test data, then calls `build_pet_picker_params`. That call reaches `custom_pet_entries`, which is responsible for recognizing `avatars/<name>/avatar.json` and translating it into the current selector format.
 
 *Call graph*: calls 1 internal fn (build_pet_picker_params); 5 external calls (assert!, assert_eq!, tempdir, write_legacy_avatar, default).
 
 
 ### `tui/src/app/pets.rs`
 
-`orchestration` · `interactive settings changes and background asset loading during UI runtime`
+`orchestration` · `main loop, request handling, and shutdown`
 
-This module centralizes the TUI app's pet-specific control flow. Two error handlers distinguish terminal failures from asset failures: terminal errors are escalated as `Err(...)` because they indicate TUI rendering infrastructure problems, while asset errors merely disable or clear the affected pet UI and log warnings. `disable_ambient_pet_before_shutdown` proactively disables the session pet and tries to clear the terminal image before shutdown feedback is shown. `handle_ambient_pet_image_render_error` disables ambient pets for the session after an asset-render failure and attempts to clear the stale image; `handle_pet_picker_preview_image_render_error` instead marks the preview as failed in the widget and clears the preview image slot.
+The terminal app can show a small “ambient pet” image and a pet picker preview. This file is the app-level traffic controller for those pet features. It does not define what a pet is or how images are drawn. Instead, it reacts to events and keeps the chat widget, terminal drawing layer, saved configuration, and background loading work in sync.
 
-Selection and loading are split into asynchronous phases. `handle_pet_selected` immediately shows a loading popup, schedules a frame, clones the needed config and sender state, and spawns blocking work that ensures the builtin pet pack exists and then loads `crate::pets::AmbientPet`; the result is sent back as `AppEvent::PetSelectionLoaded`. `handle_pet_selection_loaded` consumes that event, ignores stale request IDs by checking whether the popup is still active, persists the chosen pet via `ConfigEditsBuilder` and `tui_pet_edit`, updates `self.config.tui_pet`, and installs the loaded pet into the widget. `handle_pet_disabled` persists the disabled sentinel pet ID and synchronizes widget/config state. Preview and configured-pet completion handlers update the widget only when the result still matches the current configured pet, preventing stale background loads from overwriting newer choices.
+The main job is to make pet changes feel safe and responsive. For example, choosing a pet may require reading files from disk and loading image assets, which could be slow. So the file starts that work in a blocking background task and sends an app event back when it finishes. While that is happening, it shows a loading popup and asks the terminal to redraw.
+
+It also separates two kinds of image failures. A terminal error means the drawing system itself had a serious problem, so the error is returned upward. An asset error means a pet image file or resource failed, so the app logs a warning, disables or clears the affected pet display, and keeps running.
+
+When a user disables or selects a pet, this file also writes that choice into the app configuration, so the choice survives future runs. In short, it is the glue that makes pet UI actions become visible changes, saved settings, and redraw requests.
 
 #### Function details
 
@@ -6103,11 +6117,11 @@ Selection and loading are split into asynchronous phases. `handle_pet_selected` 
 fn disable_ambient_pet_before_shutdown(&mut self, tui: &mut tui::Tui) -> Result<()>
 ```
 
-**Purpose**: Turns off the ambient pet for the current session and clears any rendered pet image before shutdown UI proceeds. It treats terminal-clear failures as fatal but only logs asset-clear failures.
+**Purpose**: Turns off the ambient pet just before the app shuts down, so the terminal is left clean. This is like wiping a whiteboard before leaving the room.
 
-**Data flow**: Mutates `chat_widget` by calling `disable_ambient_pet_for_session()`, then calls `tui.clear_ambient_pet_image()`. If clearing fails with `PetImageRenderError::Terminal`, it converts and returns that error; if it fails with `Asset`, it logs a warning and still returns `Ok(())`.
+**Data flow**: It receives the app state and the terminal drawing object. It tells the chat widget not to use the pet for the rest of this session, then asks the terminal layer to clear the pet image. If clearing fails because the terminal itself failed, it returns an error. If clearing fails because of a pet asset problem, it logs a warning and still allows shutdown to continue.
 
-**Call relations**: Used during shutdown-related flow before terminal feedback is shown. It delegates image clearing to the TUI layer and keeps session-level pet state aligned with the cleared terminal.
+**Call relations**: This runs during shutdown cleanup. It hands the actual screen-clearing work to the terminal layer, and only escalates problems that mean the terminal drawing system itself is in trouble.
 
 *Call graph*: 2 external calls (clear_ambient_pet_image, warn!).
 
@@ -6122,11 +6136,11 @@ fn handle_ambient_pet_image_render_error(
     ) -> Result<()>
 ```
 
-**Purpose**: Handles failures while rendering the ambient pet image. Terminal failures propagate upward, while asset failures disable pets for the session and attempt to clear the broken image.
+**Purpose**: Responds when drawing the normal ambient pet image fails. It decides whether the app must stop with an error or can recover by disabling the pet for the current session.
 
-**Data flow**: Consumes a `PetImageRenderError`. For `Terminal(err)`, it returns `Err(err.into())`. For `Asset(err)`, it logs a warning, disables ambient pets in `chat_widget`, calls `tui.clear_ambient_pet_image()`, and again propagates terminal clear failures while only warning on asset clear failures. Successful asset-error handling returns `Ok(())`.
+**Data flow**: It receives an image-rendering error. If the error came from the terminal system, it turns that into the app’s normal error type and returns it. If the error came from a missing or bad pet asset, it logs the problem, disables the pet in the chat widget, and tries to clear any leftover pet image from the terminal. The result is either successful recovery or a returned terminal error.
 
-**Call relations**: Called when ambient pet rendering fails elsewhere in the app. It is the recovery path that prevents repeated asset-render failures from continuing to affect the session.
+**Call relations**: This is called after a failed ambient pet render attempt. It asks the terminal layer to clear the image when recovery is possible, and it updates the chat widget so the same broken pet is not repeatedly drawn during this session.
 
 *Call graph*: 3 external calls (clear_ambient_pet_image, warn!, into).
 
@@ -6141,11 +6155,11 @@ fn handle_pet_picker_preview_image_render_error(
     ) -> Result<()>
 ```
 
-**Purpose**: Handles failures while rendering the pet picker's preview image. It records preview failure text in the widget and clears the preview slot when the failure is asset-related.
+**Purpose**: Responds when the pet picker preview image cannot be drawn. It records the preview failure in the UI and tries to remove the broken preview from the terminal.
 
-**Data flow**: Matches on `PetImageRenderError`: terminal errors are converted into `Err`, while asset errors are logged, converted to a string for `chat_widget.fail_pet_picker_preview_render`, and followed by `tui.draw_pet_picker_preview_image(None)` to clear the preview. Terminal failures during clearing are returned; asset failures during clearing are only warned about.
+**Data flow**: It receives the app state, terminal drawing object, and the render error. A terminal-level error is returned upward. An asset-level error is logged, converted into a readable message for the chat widget, and the preview area is cleared by asking the terminal to draw no preview image. If clearing also hits only an asset problem, that is logged and ignored; if it hits a terminal problem, that error is returned.
 
-**Call relations**: Used by pet-picker preview rendering flow. It differs from ambient-pet error handling by preserving the rest of pet functionality and only marking the preview request as failed.
+**Call relations**: This is used while the pet picker is open and a preview image fails. It passes a user-facing failure message to the chat widget and relies on the terminal layer to remove the failed preview from the display.
 
 *Call graph*: 4 external calls (draw_pet_picker_preview_image, warn!, into, to_string).
 
@@ -6156,11 +6170,11 @@ fn handle_pet_picker_preview_image_render_error(
 fn handle_pet_selected(&mut self, tui: &mut tui::Tui, pet_id: String)
 ```
 
-**Purpose**: Starts asynchronous loading of a newly selected pet and shows immediate loading UI. It offloads filesystem/asset work to a blocking task and arranges for completion to come back as an app event.
+**Purpose**: Starts the work needed after the user chooses a pet. It shows a loading popup immediately, then loads the pet in the background so the interface does not freeze.
 
-**Data flow**: Reads the selected `pet_id`, asks `chat_widget` to show a pet-selection loading popup and capture its `request_id`, schedules a frame, clones `codex_home`, a frame requester, the animations flag, and `app_event_tx`, then spawns a blocking closure. That closure ensures the builtin pack exists, loads `crate::pets::AmbientPet::load(...)`, wraps success as `Some(ambient_pet)` or stringifies errors, and sends `AppEvent::PetSelectionLoaded { request_id, pet_id, result }` through the app event channel.
+**Data flow**: It receives the chosen pet ID. It asks the chat widget to show a loading popup and gets a request ID for matching the later result. It copies the needed configuration values, frame requester, and event sender into a background task. That task makes sure the built-in pet pack exists, loads the pet, converts any failure into text, and sends a PetSelectionLoaded event back to the app.
 
-**Call relations**: Triggered when the user chooses a pet in the UI. It does not finish the selection itself; instead it kicks off background work whose result is later consumed by `handle_pet_selection_loaded`.
+**Call relations**: This is the first step in the pet-selection flow. It schedules a redraw so the loading state appears, then hands slow file and asset work to a blocking background task. The result later returns through the app event channel and is handled by App::handle_pet_selection_loaded.
 
 *Call graph*: 3 external calls (frame_requester, drop, spawn_blocking).
 
@@ -6171,11 +6185,11 @@ fn handle_pet_selected(&mut self, tui: &mut tui::Tui, pet_id: String)
 async fn handle_pet_disabled(&mut self, tui: &mut tui::Tui)
 ```
 
-**Purpose**: Persists the disabled-pet setting and updates in-memory/UI state accordingly. It is the explicit disable action rather than a transient session-only suppression.
+**Purpose**: Saves the user’s choice to disable pets and updates the current interface. This makes the setting persist instead of only hiding the pet temporarily.
 
-**Data flow**: Builds a config edit with `tui_pet_edit(crate::pets::DISABLED_PET_ID)`, applies it asynchronously through `ConfigEditsBuilder::new(&self.config.codex_home).with_edits([edit]).apply().await`, and on success calls `self.sync_tui_pet_disabled()` and schedules a frame. On failure it appends an error message to the chat widget.
+**Data flow**: It builds a configuration edit that sets the pet value to the special disabled-pet ID, then applies that edit to the app’s configuration files. If saving succeeds, it updates the running app state to match and asks for a redraw. If saving fails, it adds an error message to the chat widget so the user can see what went wrong.
 
-**Call relations**: Called when the user disables pets from the UI. It bridges the UI action into persistent config storage and then refreshes visible state.
+**Call relations**: This is called when the user chooses to disable pets. It uses the configuration edit system to write the setting, then either refreshes the UI state or reports the failure in the chat area.
 
 *Call graph*: calls 2 internal fn (new, tui_pet_edit); 2 external calls (frame_requester, format!).
 
@@ -6191,11 +6205,11 @@ fn handle_pet_preview_loaded(
     )
 ```
 
-**Purpose**: Completes a pet preview load request by handing the result to the chat widget and redrawing. It is the lightweight completion path for preview-only loads.
+**Purpose**: Finishes a pet preview load in the picker. It gives the loaded preview, or its error, back to the chat widget and asks the screen to update.
 
-**Data flow**: Consumes a `request_id` and `Result<AmbientPet, String>`, passes them to `chat_widget.finish_pet_picker_preview_load`, and schedules a frame via the TUI frame requester. It returns no value.
+**Data flow**: It receives a request ID and either a loaded AmbientPet or an error message. It passes both to the chat widget, which can match the result to the preview request that started it. Then it schedules a terminal frame so the preview success or failure becomes visible.
 
-**Call relations**: Called when background preview loading finishes. It delegates stale-request handling and UI update details to the chat widget.
+**Call relations**: This is called after background preview loading completes. It is the return path from asynchronous loading back into the visible pet picker UI.
 
 *Call graph*: 1 external calls (frame_requester).
 
@@ -6211,11 +6225,11 @@ async fn handle_pet_selection_loaded(
         result: Result<Option<crate::pets::AmbientPet>, String>,
 ```
 
-**Purpose**: Finalizes a pet selection after background loading completes, persisting the chosen pet and installing the loaded ambient pet into the widget. It ignores stale completion events whose loading popup is no longer active.
+**Purpose**: Completes the pet-selection flow after the background load finishes. It closes the loading popup, saves the selected pet if loading succeeded, and updates the UI.
 
-**Data flow**: Consumes the popup `request_id`, selected `pet_id`, and `Result<Option<AmbientPet>, String>`. It first asks `chat_widget.finish_pet_selection_loading_popup(request_id)` whether this completion is still current; if not, it returns `Ok(AppRunControl::Continue)` immediately. On successful pet load it persists the selection with `ConfigEditsBuilder` and `tui_pet_edit`, updates `self.config.tui_pet`, and calls `chat_widget.set_tui_pet_loaded(Some(pet_id), ambient_pet)`. On persistence or load failure it adds an error message. It always schedules a frame before returning `Continue`.
+**Data flow**: It receives the loading request ID, selected pet ID, and either a loaded pet result or an error message. First it asks the chat widget to finish the matching loading popup; if the request is no longer current, it does nothing more. If loading succeeded, it writes the selected pet into the configuration and, on success, updates the in-memory config and chat widget with the loaded pet. If saving fails or loading failed, it adds an error message. It then schedules a redraw and tells the app to keep running.
 
-**Call relations**: Consumes the `AppEvent::PetSelectionLoaded` emitted by `handle_pet_selected`'s background task. It is the authoritative completion step that commits the selection to config and visible UI.
+**Call relations**: This is called in response to the PetSelectionLoaded event sent by App::handle_pet_selected’s background task. It connects the completed load to saved configuration and visible UI state, then returns control to the main app loop.
 
 *Call graph*: calls 2 internal fn (new, tui_pet_edit); 2 external calls (frame_requester, format!).
 
@@ -6231,22 +6245,24 @@ fn handle_configured_pet_loaded(
     )
 ```
 
-**Purpose**: Applies the result of loading the pet currently configured in app settings, but only if the completion still matches the active configured pet ID. This prevents stale background loads from overwriting newer config changes.
+**Purpose**: Applies a pet that was loaded from the saved configuration, but only if it still matches the current configuration. This prevents an old background result from overwriting a newer choice.
 
-**Data flow**: Reads `self.config.tui_pet` and compares it to the supplied `pet_id`; if they differ, it returns early. If they match and the result is `Ok(ambient_pet)`, it calls `chat_widget.set_tui_pet_loaded(Some(pet_id), ambient_pet)` and schedules a frame. If the result is `Err(err)`, it adds a warning message instead of an error.
+**Data flow**: It receives the pet ID that was loaded and either the loaded pet or an error message. It first checks whether the app’s current configured pet is still the same ID. If not, it ignores the result. If the load succeeded, it gives the pet to the chat widget and schedules a redraw. If it failed, it adds a warning message instead of treating it as a fatal error.
 
-**Call relations**: Used when loading the configured pet outside the explicit selection flow, such as startup or config refresh. Its early-return guard is the key stale-result protection.
+**Call relations**: This is used when the app is loading the pet named in the configuration, usually around startup or configuration refresh. It protects the UI from stale background results and only updates the chat widget when the result still belongs to the active setting.
 
 *Call graph*: 2 external calls (frame_requester, format!).
 
 
 ### `tui/src/pets/ambient.rs`
 
-`domain_logic` · `request handling and main UI redraw loop for ambient pet state`
+`domain_logic` · `rendering and animation updates during the main TUI loop`
 
-This module is the behavioral core of ambient pet rendering. `AmbientPet` owns a loaded `Pet` model, terminal image support snapshot, extracted PNG frame paths, a sixel cache directory, a `FrameRequester`, optional transient notification state, and the `Instant` from which the current animation timeline is measured. Notifications are represented by `PetNotificationKind` plus `PetNotification`; each kind maps to a specific animation name (`running`, `waiting`, `review`, `failed`), UI label, fallback body text, and expiration lifetime ranging from minutes to days.
+The ambient pet is the small animated companion that sits near the bottom of the terminal while the main text interface remains controlled by ratatui, the library that draws the text user interface. This file is the bridge between those two worlds. It does not decide which pet the user picked, and it does not directly paint pixels itself. Instead, it prepares a clear request that says: use this image frame, draw it at this terminal position, and leave these rows clear.
 
-`load` resolves the selected pet id, computes a cache path under `CODEX_HOME/cache/tui-pets/frame-cache/<pet-id>/<frame-cache-key>/`, extracts per-frame PNGs, snapshots protocol support, and initializes animation timing. Rendering is split into two request builders: `draw_request` anchors the sprite above the composer while reserving vertical space for notification text and refusing to draw if the image would overlap reserved UI; `preview_draw_request` instead centers a stable first idle frame in the picker pane. Animation selection prefers the visible notification’s animation, falls back to `idle`, and for non-looping animations switches to the animation named by `fallback` once total duration elapses. Frame timing is computed in nanoseconds, including loop-prefix handling and per-frame remaining delay, so `schedule_next_frame` can request the next repaint only when protocol support and animation settings allow it. The module also includes compact test helpers and regression tests for vocabulary, frame timing, and reduced-motion behavior.
+The main object, AmbientPet, loads the selected pet, extracts its sprite frames into a cache, remembers what image protocol the terminal supports, and tracks the current notification state. A notification is the pet’s mood-like status, such as running, waiting for input, ready for review, or blocked. Each status maps to an animation name, a short label, fallback text, and a lifetime so stale messages eventually disappear.
+
+During each render pass, this file calculates the pet’s size in terminal rows and columns, checks whether there is enough room above the composer, and picks the correct frame based on elapsed time. Think of it like a flipbook: the code knows how long each page should stay visible and schedules the next page turn. It also supports reduced motion by freezing on the first frame and scheduling no follow-up animation frames.
 
 #### Function details
 
@@ -6256,11 +6272,11 @@ This module is the behavioral core of ambient pet rendering. `AmbientPet` owns a
 fn animation_name(self) -> &'static str
 ```
 
-**Purpose**: Maps each semantic notification kind to the animation track name expected in `Pet.animations`. This is the bridge from high-level pet state to animation lookup keys.
+**Purpose**: Returns the animation name that matches a pet status, such as using the running animation while Codex is thinking.
 
-**Data flow**: It takes `self` as a `PetNotificationKind` and returns a static string literal: `running`, `waiting`, `review`, or `failed`. It reads no external state and writes nothing.
+**Data flow**: It takes one notification kind → matches it to a fixed text name used in the pet animation data → returns that name.
 
-**Call relations**: Used indirectly by animation selection when `AmbientPet::current_animation` decides which track should be active for a visible notification.
+**Call relations**: This is used when AmbientPet::current_animation decides which animation should play for the visible notification.
 
 
 ##### `PetNotificationKind::label`  (lines 64–71)
@@ -6269,11 +6285,11 @@ fn animation_name(self) -> &'static str
 fn label(self) -> &'static str
 ```
 
-**Purpose**: Returns the short UI-facing label associated with a notification kind. These labels are also used to decide whether the notification occupies one or two terminal rows.
+**Purpose**: Returns the short human-readable label for a notification kind, using the same wording as the wider Codex app.
 
-**Data flow**: It takes a `PetNotificationKind` and returns one of the fixed strings `Running`, `Needs input`, `Ready`, or `Blocked`. No state is read or mutated.
+**Data flow**: It takes a notification kind → converts it to display text like “Running” or “Blocked” → returns that text.
 
-**Call relations**: Consumed by notification layout logic and tested to keep terminology aligned with the broader app vocabulary.
+**Call relations**: The notification_height helper uses this label to decide whether the notification can be shown as one line or needs extra space. A test also protects these labels from drifting away from app vocabulary.
 
 
 ##### `PetNotificationKind::fallback_body`  (lines 73–80)
@@ -6282,11 +6298,11 @@ fn label(self) -> &'static str
 fn fallback_body(self) -> &'static str
 ```
 
-**Purpose**: Provides default body text when a notification is created without an explicit message. The defaults mostly mirror the label, except `Running` falls back to `Thinking`.
+**Purpose**: Provides default notification text when the caller does not supply a custom message.
 
-**Data flow**: Input is the enum variant; output is a static string literal for the default body. It has no side effects.
+**Data flow**: It takes a notification kind → chooses a simple fallback phrase → returns that phrase.
 
-**Call relations**: Called from `PetNotification::new` so notification creation can always populate a body string.
+**Call relations**: PetNotification::new calls this when it creates a notification without a provided body.
 
 
 ##### `PetNotificationKind::lifetime`  (lines 82–89)
@@ -6295,11 +6311,11 @@ fn fallback_body(self) -> &'static str
 fn lifetime(self) -> Duration
 ```
 
-**Purpose**: Defines how long each notification kind remains visible before expiring. Different states intentionally persist for very different durations.
+**Purpose**: Defines how long each kind of pet notification should remain visible before it is considered stale.
 
-**Data flow**: It maps the enum variant to one of the module constants: 3 minutes for running, 24 hours for waiting, 7 days for review, and 1 hour for failed. It returns a `Duration` and touches no mutable state.
+**Data flow**: It takes a notification kind → maps it to a fixed duration, from minutes to days depending on importance → returns that duration.
 
-**Call relations**: This is used by `PetNotification::is_expired` to decide whether the current notification should still influence animation and layout.
+**Call relations**: PetNotification::is_expired calls this when deciding whether an old notification should still affect the pet.
 
 *Call graph*: called by 1 (is_expired).
 
@@ -6310,11 +6326,11 @@ fn lifetime(self) -> Duration
 fn new(kind: PetNotificationKind, body: Option<String>) -> Self
 ```
 
-**Purpose**: Constructs a notification record with a concrete body string and a fresh timestamp. It normalizes absent bodies to the kind-specific fallback text.
+**Purpose**: Creates a fresh pet notification and records the time it was created.
 
-**Data flow**: Inputs are a `PetNotificationKind` and an `Option<String>` body. It chooses the provided body or allocates a new `String` from `fallback_body`, stamps `updated_at` with `Instant::now()`, and returns a new `PetNotification` value.
+**Data flow**: It receives a notification kind and optional body text → fills in fallback text if needed and stores the current time → returns a PetNotification ready to display.
 
-**Call relations**: Called only from `AmbientPet::set_notification`, which resets the animation timeline whenever a new notification arrives.
+**Call relations**: AmbientPet::set_notification calls this whenever the pet’s status changes.
 
 *Call graph*: called by 1 (set_notification); 1 external calls (now).
 
@@ -6325,11 +6341,11 @@ fn new(kind: PetNotificationKind, body: Option<String>) -> Self
 fn is_expired(&self, now: Instant) -> bool
 ```
 
-**Purpose**: Checks whether a notification has outlived its configured visibility window. It uses saturating time arithmetic so clock/timestamp anomalies do not panic.
+**Purpose**: Checks whether a notification has lived longer than its allowed lifetime.
 
-**Data flow**: It takes `&self` and a `now: Instant`, computes `now.saturating_duration_since(self.updated_at)`, compares that duration against `self.kind.lifetime()`, and returns a boolean. No state is modified.
+**Data flow**: It receives the current time → compares it with the notification’s saved update time and lifetime → returns true if the notification should no longer be shown.
 
-**Call relations**: Used by `AmbientPet::visible_notification` to filter stale notifications before animation or layout decisions are made.
+**Call relations**: AmbientPet::visible_notification relies on this check before letting a notification influence layout or animation.
 
 *Call graph*: calls 1 internal fn (lifetime); 1 external calls (saturating_duration_since).
 
@@ -6345,11 +6361,11 @@ fn load(
     ) -> Result<Self>
 ```
 
-**Purpose**: Loads the selected pet definition, prepares its extracted PNG frame cache, and initializes ambient-rendering state. It is the constructor that turns persisted selection plus `CODEX_HOME` into a ready-to-draw `AmbientPet`.
+**Purpose**: Loads the active pet and prepares the image frames needed for ambient rendering.
 
-**Data flow**: Inputs are an optional selected pet id, the `codex_home` path, a `FrameRequester`, and an `animations_enabled` flag. It resolves the pet via `Pet::load_with_codex_home`, computes a cache directory keyed by pet id and `frame_cache_key`, prepares PNG frames into `<cache>/frames`, stores `<cache>/sixel` for later sixel caching, snapshots `default_image_support`, sets `notification` to `None`, stamps `animation_started_at` with `Instant::now()`, and returns `Result<AmbientPet>`.
+**Data flow**: It receives the selected pet id, the Codex home folder, a frame scheduler, and the animation setting → loads the pet definition, builds cache paths, extracts PNG frames, detects image support, and records startup time → returns a ready AmbientPet or an error.
 
-**Call relations**: Called by higher-level pet-loading orchestration. It delegates pet resolution to the model layer and frame extraction to `frames::prepare_png_frames`, then becomes the long-lived state object used by draw and scheduling methods.
+**Call relations**: The higher-level load_ambient_pet flow calls this during pet setup. It hands off pet loading to Pet::load_with_codex_home, frame extraction to frames::prepare_png_frames, and image capability detection to default_image_support.
 
 *Call graph*: calls 3 internal fn (default_image_support, prepare_png_frames, load_with_codex_home); called by 1 (load_ambient_pet); 2 external calls (now, join).
 
@@ -6360,11 +6376,11 @@ fn load(
 fn set_notification(&mut self, kind: PetNotificationKind, body: Option<String>)
 ```
 
-**Purpose**: Installs a new semantic notification and restarts the animation timeline from the beginning. This ensures state-change animations begin at frame zero when the notification changes.
+**Purpose**: Updates the pet’s current status message and restarts the animation timing for that status.
 
-**Data flow**: Inputs are `&mut self`, a `PetNotificationKind`, and an optional body string. It replaces `self.notification` with `Some(PetNotification::new(...))`, resets `self.animation_started_at` to `Instant::now()`, and returns unit.
+**Data flow**: It receives a notification kind and optional body text → builds a PetNotification and resets the animation start time to now → changes the AmbientPet’s stored notification state.
 
-**Call relations**: Invoked by surrounding UI/application state transitions when the pet should reflect running, waiting, review, or failed status. It delegates notification construction to `PetNotification::new`.
+**Call relations**: Other parts of the TUI call this when Codex starts running, needs input, finishes work, or hits a blocked state. Later draw and animation functions read the stored notification.
 
 *Call graph*: calls 1 internal fn (new); 1 external calls (now).
 
@@ -6375,11 +6391,11 @@ fn set_notification(&mut self, kind: PetNotificationKind, body: Option<String>)
 fn image_enabled(&self) -> bool
 ```
 
-**Purpose**: Reports whether the current terminal support snapshot exposes any usable image protocol. It is a simple capability check for callers deciding whether to attempt pet rendering.
+**Purpose**: Reports whether the current terminal can show the pet as an image.
 
-**Data flow**: It reads `self.support`, calls `protocol()`, and returns `true` if that yields `Some(_)` and `false` otherwise. No state changes occur.
+**Data flow**: It reads the stored terminal image support → checks whether a usable protocol is available → returns true or false.
 
-**Call relations**: Used by higher layers that need a yes/no answer rather than the specific protocol. It depends on `PetImageSupport::protocol` from the image-protocol module.
+**Call relations**: Callers can use this as a quick gate before expecting pet images to appear.
 
 *Call graph*: calls 1 internal fn (protocol).
 
@@ -6390,11 +6406,11 @@ fn image_enabled(&self) -> bool
 fn image_columns(&self) -> u16
 ```
 
-**Purpose**: Returns the computed terminal-cell width of the pet image at the fixed target pixel height. This lets layout code reserve horizontal space without building a full draw request.
+**Purpose**: Tells callers how many terminal text columns the pet image will occupy.
 
-**Data flow**: It reads pet geometry through `self.image_size()` and returns the `columns` field from the resulting `ImageSize`. No mutation occurs.
+**Data flow**: It reads the pet’s frame shape → computes the terminal-sized image dimensions → returns only the column count.
 
-**Call relations**: Called by layout code that needs the pet’s width estimate; it delegates the actual aspect-ratio math to `AmbientPet::image_size`.
+**Call relations**: This is a small wrapper around AmbientPet::image_size for layout code that only needs width.
 
 *Call graph*: calls 1 internal fn (image_size).
 
@@ -6405,11 +6421,11 @@ fn image_columns(&self) -> u16
 fn set_image_support_for_tests(&mut self, support: PetImageSupport)
 ```
 
-**Purpose**: Overrides the detected image support in test builds so unit tests can force supported or unsupported protocol scenarios. It exists only behind `#[cfg(test)]`.
+**Purpose**: Lets tests replace the detected terminal image support with a controlled value.
 
-**Data flow**: It takes `&mut self` and a `PetImageSupport`, assigns that value into `self.support`, and returns unit.
+**Data flow**: It receives a PetImageSupport value → stores it on the AmbientPet → later rendering decisions use that test-provided support.
 
-**Call relations**: Used by tests to bypass environment-based protocol detection and exercise draw/scheduling branches deterministically.
+**Call relations**: This is only compiled for tests, where code needs predictable behavior instead of depending on the developer’s real terminal.
 
 
 ##### `AmbientPet::schedule_next_frame`  (lines 196–200)
@@ -6418,11 +6434,11 @@ fn set_image_support_for_tests(&mut self, support: PetImageSupport)
 fn schedule_next_frame(&self)
 ```
 
-**Purpose**: Requests a future redraw at the exact delay needed for the next animation frame, if animation is active. It is the outward-facing scheduling hook used after a frame is rendered.
+**Purpose**: Asks the TUI to redraw when the next animation frame should appear.
 
-**Data flow**: It reads `self.next_frame_delay()`. If that returns `Some(delay)`, it forwards the delay to `self.frame_requester.schedule_frame_in(delay)`; otherwise it does nothing.
+**Data flow**: It asks next_frame_delay for the time until the next frame → if there is a delay, it passes that delay to the frame requester → the UI will be prompted to render again later.
 
-**Call relations**: Called by the UI loop after drawing or state updates. It delegates all timing decisions to `AmbientPet::next_frame_delay` and only performs the side effect of scheduling when a delay exists.
+**Call relations**: This connects animation timing to the broader rendering loop by calling FrameRequester::schedule_frame_in.
 
 *Call graph*: calls 2 internal fn (next_frame_delay, schedule_frame_in).
 
@@ -6433,11 +6449,11 @@ fn schedule_next_frame(&self)
 fn next_frame_delay(&self) -> Option<Duration>
 ```
 
-**Purpose**: Computes how long until the current animation should advance to its next frame. It suppresses scheduling entirely when images are unsupported or reduced-motion mode is active.
+**Purpose**: Calculates how long to wait before the pet animation needs another redraw.
 
-**Data flow**: It reads `self.support.protocol()` and `self.animations_enabled`; if either disables animation, it returns `None`. Otherwise it obtains the current animation via `self.current_animation()`, computes the active frame tick with `current_animation_frame(animation, self.animation_started_at.elapsed())`, and returns that tick’s optional `delay`.
+**Data flow**: It checks whether images and animations are enabled → finds the current animation and current frame from elapsed time → returns the remaining time for this frame, or nothing if no follow-up is needed.
 
-**Call relations**: Used only by `AmbientPet::schedule_next_frame`. It depends on `current_animation` to choose the active track and on `current_animation_frame` to convert elapsed time into per-frame timing.
+**Call relations**: AmbientPet::schedule_next_frame calls this. It delegates frame timing to current_animation_frame after choosing the active animation.
 
 *Call graph*: calls 3 internal fn (current_animation, current_animation_frame, protocol); called by 1 (schedule_next_frame); 1 external calls (elapsed).
 
@@ -6452,11 +6468,11 @@ fn draw_request(
     ) -> Option<AmbientPetDraw>
 ```
 
-**Purpose**: Builds a concrete `AmbientPetDraw` describing where and how to render the ambient sprite above the composer, or returns `None` when rendering would overlap reserved UI or no protocol is available. It is the main layout-to-image bridge for live ambient pets.
+**Purpose**: Builds the draw instructions for the live ambient pet, anchored above the composer area.
 
-**Data flow**: Inputs are the available `Rect` and the composer’s bottom Y coordinate. It reads the active protocol from `self.support`, computes image size, checks for a visible non-expired notification and its row cost, derives the sprite bottom position by subtracting `composer_gap_rows()`, rejects layouts that are too short or too narrow, computes right-aligned `x` and top `y`, resolves the current frame path, clones `self.sixel_dir`, and returns `Some(AmbientPetDraw)` or `None`.
+**Data flow**: It receives the available screen rectangle and composer bottom row → checks image support, computes image size, accounts for notification height and the safety gap, picks the current frame, and calculates x/y position → returns an AmbientPetDraw request or None if the pet would not fit.
 
-**Call relations**: Called by the TUI rendering path when deciding whether to emit an ambient image after the ratatui frame. It delegates notification filtering to `visible_notification`, geometry math to `image_size` and `composer_gap_rows`, and frame selection to `current_frame_path`.
+**Call relations**: The main renderer calls this after normal layout decisions. It uses current_frame_path for the image, visible_notification for extra space needs, and composer_gap_rows to avoid crowding the input composer.
 
 *Call graph*: calls 5 internal fn (current_frame_path, image_size, visible_notification, composer_gap_rows, protocol); 2 external calls (now, clone).
 
@@ -6467,11 +6483,11 @@ fn draw_request(
 fn preview_draw_request(&self, area: Rect) -> Option<AmbientPetDraw>
 ```
 
-**Purpose**: Builds a centered preview image request for the `/pets` picker side pane using a stable idle frame instead of the live animation state. This keeps browsing deterministic and avoids coupling previews to ambient animation timing.
+**Purpose**: Builds a centered draw request for showing a stable pet preview in the /pets picker.
 
-**Data flow**: Input is a `Rect` for the preview area. It reads the active protocol and computed image size, returns `None` if the area is too small, otherwise centers the image horizontally and vertically, resolves the first idle frame path, clones `self.sixel_dir`, and returns an `AmbientPetDraw` whose `clear_top_y` starts at the image’s own top row.
+**Data flow**: It receives the preview area → checks that image support exists and the area is large enough → chooses the first idle frame and centers it → returns an AmbientPetDraw request or None.
 
-**Call relations**: Used by picker-preview rendering rather than the ambient transcript/composer layout. It delegates frame lookup to `first_idle_frame_path` and size computation to `image_size`.
+**Call relations**: The pet picker uses this instead of the live animation path so browsing pets does not depend on notification state or animation timing.
 
 *Call graph*: calls 3 internal fn (first_idle_frame_path, image_size, protocol); 1 external calls (clone).
 
@@ -6482,11 +6498,11 @@ fn preview_draw_request(&self, area: Rect) -> Option<AmbientPetDraw>
 fn visible_notification(&self, now: Instant) -> Option<&PetNotification>
 ```
 
-**Purpose**: Returns the current notification only if it has not expired at the supplied instant. This isolates expiration filtering from the rest of the animation and layout code.
+**Purpose**: Returns the current notification only if it has not expired.
 
-**Data flow**: It reads `self.notification.as_ref()`, applies a predicate using `PetNotification::is_expired(now)`, and returns `Option<&PetNotification>`. No state is changed.
+**Data flow**: It receives the current time → looks at the stored optional notification and filters out expired ones → returns a reference to the still-visible notification or None.
 
-**Call relations**: Called by both `current_animation` and `draw_request`, so the same expiration rule controls animation selection and reserved notification height.
+**Call relations**: AmbientPet::draw_request uses it to reserve notification space, and AmbientPet::current_animation uses it to choose the matching animation.
 
 *Call graph*: called by 2 (current_animation, draw_request).
 
@@ -6497,11 +6513,11 @@ fn visible_notification(&self, now: Instant) -> Option<&PetNotification>
 fn current_animation(&self) -> Option<&Animation>
 ```
 
-**Purpose**: Chooses the active animation track based on the visible notification, with fallback to `idle`, and handles one-shot animations that should hand off to another track after completion. It encapsulates the semantic-to-track selection policy.
+**Purpose**: Chooses which animation should be considered active right now.
 
-**Data flow**: It reads the current visible notification at `Instant::now()`, derives an animation name from the notification kind or defaults to `idle`, looks up that animation in `self.pet.animations` with fallback to `idle`, and if the chosen animation has `loop_start == None` and elapsed time exceeds `animation.total_duration()`, it attempts to return the animation named by `animation.fallback`; otherwise it returns the chosen animation reference.
+**Data flow**: It checks for a visible notification → uses that notification’s animation name or falls back to idle → looks up the animation, handles completed non-looping animations by switching to their fallback → returns the animation to use.
 
-**Call relations**: Used by `current_frame_path` and `next_frame_delay`. It depends on `visible_notification` for state filtering and on `Animation::total_duration` plus elapsed time to implement one-shot-to-fallback transitions.
+**Call relations**: AmbientPet::current_frame_path and AmbientPet::next_frame_delay both call this before deciding which frame is visible or when to redraw.
 
 *Call graph*: calls 1 internal fn (visible_notification); called by 2 (current_frame_path, next_frame_delay); 2 external calls (elapsed, now).
 
@@ -6512,11 +6528,11 @@ fn current_animation(&self) -> Option<&Animation>
 fn current_frame_path(&self) -> Option<PathBuf>
 ```
 
-**Purpose**: Resolves the filesystem path of the frame image that should be drawn right now. It respects reduced-motion mode by pinning to the first frame of the active animation.
+**Purpose**: Finds the image file for the frame that should be visible right now.
 
-**Data flow**: It reads the current animation via `current_animation()`. If animations are enabled, it computes the current `sprite_index` with `current_animation_frame(animation, elapsed)`; otherwise it takes the first frame’s `sprite_index`. If no animation/frame exists it falls back to index `0`, then maps that sprite index to a cached PNG path with `frame_path_for_sprite_index` and returns `Option<PathBuf>`.
+**Data flow**: It chooses the current animation → either advances by elapsed time or, if animations are disabled, takes the first frame → converts the sprite index into a cached file path → returns that path if available.
 
-**Call relations**: Called by `draw_request` to populate the image payload path. It delegates animation choice to `current_animation` and sprite-index-to-file mapping to `frame_path_for_sprite_index`.
+**Call relations**: AmbientPet::draw_request calls this when creating the actual live pet draw request.
 
 *Call graph*: calls 2 internal fn (current_animation, frame_path_for_sprite_index); called by 1 (draw_request).
 
@@ -6527,11 +6543,11 @@ fn current_frame_path(&self) -> Option<PathBuf>
 fn first_idle_frame_path(&self) -> Option<PathBuf>
 ```
 
-**Purpose**: Returns the cached PNG path for the first frame of the `idle` animation, defaulting to sprite index 0 if idle is absent. This is used for stable previews.
+**Purpose**: Finds a calm, stable image for previewing the pet.
 
-**Data flow**: It reads `self.pet.animations.get("idle")`, takes the first frame’s `sprite_index` if present, otherwise uses `0`, then resolves that index through `frame_path_for_sprite_index` and returns `Option<PathBuf>`.
+**Data flow**: It looks up the idle animation → takes its first frame’s sprite index, or zero if missing → converts that index to a cached file path → returns the path if available.
 
-**Call relations**: Used only by `preview_draw_request`, which intentionally avoids live animation state.
+**Call relations**: AmbientPet::preview_draw_request calls this so the /pets picker preview stays still and predictable.
 
 *Call graph*: calls 1 internal fn (frame_path_for_sprite_index); called by 1 (preview_draw_request).
 
@@ -6542,11 +6558,11 @@ fn first_idle_frame_path(&self) -> Option<PathBuf>
 fn frame_path_for_sprite_index(&self, sprite_index: usize) -> Option<PathBuf>
 ```
 
-**Purpose**: Maps a sprite index from animation metadata to one of the extracted PNG frame paths, clamping out-of-range indices to the last available frame. This prevents panics if metadata and extracted frame counts drift.
+**Purpose**: Converts a sprite frame number into the matching cached PNG file path.
 
-**Data flow**: Input is a `usize` sprite index. It reads `self.frames`, computes `sprite_index.min(self.frames.len().saturating_sub(1))`, clones the corresponding `PathBuf` if present, and returns `Option<PathBuf>`.
+**Data flow**: It receives a sprite index → clamps it to the available frame list so it does not go past the end → returns a cloned path to that frame.
 
-**Call relations**: This is the final lookup step used by both `current_frame_path` and `first_idle_frame_path`.
+**Call relations**: Both current_frame_path and first_idle_frame_path use this as the final lookup step after choosing a sprite index.
 
 *Call graph*: called by 2 (current_frame_path, first_idle_frame_path).
 
@@ -6557,11 +6573,11 @@ fn frame_path_for_sprite_index(&self, sprite_index: usize) -> Option<PathBuf>
 fn image_size(&self) -> ImageSize
 ```
 
-**Purpose**: Computes the pet image’s terminal-cell dimensions from a fixed target pixel height and the pet’s frame aspect ratio. The width calculation includes a 0.52 scaling factor to account for terminal cell proportions.
+**Purpose**: Calculates how large the pet should be in terminal rows and columns.
 
-**Data flow**: It reads constants `PET_TARGET_HEIGHT_PX` and `TERMINAL_ROW_HEIGHT_PX` plus `self.pet.frame_height` and `self.pet.frame_width`. It converts the target height into rounded terminal rows, derives an aspect ratio adjusted by `0.52`, computes rounded columns from rows/aspect, clamps rows and columns to at least 1, and returns an `ImageSize { columns, rows, height_px }`.
+**Data flow**: It reads the pet frame’s pixel width and height → targets a fixed pixel height, converts that into terminal rows, estimates columns from the frame’s shape, and ensures neither value drops below one → returns an ImageSize.
 
-**Call relations**: Used by `draw_request`, `preview_draw_request`, and `image_columns` so all layout code shares the same geometry calculation.
+**Call relations**: draw_request, preview_draw_request, and image_columns all use this so every layout path agrees on the pet’s size.
 
 *Call graph*: called by 3 (draw_request, image_columns, preview_draw_request); 1 external calls (from).
 
@@ -6572,11 +6588,11 @@ fn image_size(&self) -> ImageSize
 fn composer_gap_rows() -> u16
 ```
 
-**Purpose**: Converts the fixed pixel gap above the composer into a minimum one-row terminal spacing. This keeps the ambient sprite from touching the composer pane.
+**Purpose**: Converts the desired pixel gap above the composer into terminal text rows.
 
-**Data flow**: It reads `PET_COMPOSER_GAP_PX` and `TERMINAL_ROW_HEIGHT_PX`, divides and rounds to terminal rows, clamps the result to at least 1, and returns a `u16`.
+**Data flow**: It starts with a fixed pixel gap → divides by the assumed terminal row height and rounds → returns at least one row.
 
-**Call relations**: Called by `draw_request` when computing the sprite’s bottom anchor above the composer.
+**Call relations**: AmbientPet::draw_request uses this to keep the pet from sitting directly on top of the input composer.
 
 *Call graph*: called by 1 (draw_request); 1 external calls (from).
 
@@ -6587,11 +6603,11 @@ fn composer_gap_rows() -> u16
 fn default_image_support() -> PetImageSupport
 ```
 
-**Purpose**: Provides the initial terminal image support snapshot used when constructing an `AmbientPet`. In tests it deliberately returns an unsupported value instead of probing the real terminal.
+**Purpose**: Chooses the default terminal image capability used by a newly loaded ambient pet.
 
-**Data flow**: In non-test builds it resolves `ProtocolSelection::Auto`; in test builds it returns `PetImageSupport::Unsupported(Terminal)`. It has no inputs and returns a `PetImageSupport`.
+**Data flow**: In normal builds it auto-detects the best supported image protocol; in test builds it returns an unsupported value unless a test overrides it → the result is stored on AmbientPet.
 
-**Call relations**: Called only from `AmbientPet::load` so newly loaded pets capture protocol support once at construction time.
+**Call relations**: AmbientPet::load calls this while constructing the pet. Later draw functions consult the stored support before producing image requests.
 
 *Call graph*: called by 1 (load); 1 external calls (Unsupported).
 
@@ -6602,11 +6618,11 @@ fn default_image_support() -> PetImageSupport
 fn current_animation_frame(animation: &Animation, elapsed: Duration) -> Option<AnimationFrameTick>
 ```
 
-**Purpose**: Converts an animation plus elapsed time into the currently visible sprite index and the remaining delay until the next frame boundary. It handles single-frame animations, looping suffixes, and non-looping animations that settle on their last frame.
+**Purpose**: Chooses which frame of an animation should be visible at a given elapsed time.
 
-**Data flow**: Inputs are `&Animation` and an elapsed `Duration`. It returns `Some(AnimationFrameTick)` with `sprite_index` and optional `delay`, or `None` if the animation has no frames. For multi-frame animations it computes elapsed nanoseconds, optionally splits the animation into a non-looping prefix and looping suffix using `loop_start`, folds elapsed time into the loop region when appropriate, and delegates frame selection to `frame_at_elapsed`; if there is no valid loop and elapsed exceeds total duration, it returns the last frame with `delay: None`.
+**Data flow**: It receives an animation and elapsed duration → handles single-frame animations, looping sections, and finished non-looping animations → returns the sprite index plus the time until the next frame, if any.
 
-**Call relations**: Used by `AmbientPet::next_frame_delay` for scheduling. `AmbientPet::current_frame_path` also relies on the same timing logic indirectly when animations are enabled.
+**Call relations**: AmbientPet::next_frame_delay uses this for redraw timing, and current_frame_path uses it indirectly through the animation flow. It calls frame_at_elapsed for the frame-by-frame timing work.
 
 *Call graph*: calls 2 internal fn (frame_at_elapsed, total_duration); called by 1 (next_frame_delay); 1 external calls (as_nanos).
 
@@ -6617,11 +6633,11 @@ fn current_animation_frame(animation: &Animation, elapsed: Duration) -> Option<A
 fn frame_at_elapsed(animation: &Animation, elapsed_nanos: u128) -> Option<AnimationFrameTick>
 ```
 
-**Purpose**: Walks an animation’s frames to find which frame covers a given elapsed nanosecond offset and how much time remains in that frame. It treats zero-duration frames as lasting at least one nanosecond.
+**Purpose**: Walks through an animation’s frames to find the one that contains a specific elapsed time.
 
-**Data flow**: Inputs are `&Animation` and `elapsed_nanos: u128`. It iterates through `animation.frames`, subtracting each frame’s duration in nanoseconds from a running remainder until the remainder falls inside a frame; it then returns that frame’s `sprite_index` and a `delay` computed by `nanos_to_duration(frame_nanos - remaining_elapsed)`. If elapsed runs past all frames, it returns the last frame with `delay: None`.
+**Data flow**: It receives an animation and elapsed nanoseconds → subtracts each frame’s duration until it finds the active frame → returns that frame’s sprite index and remaining delay, or the last frame if time has run out.
 
-**Call relations**: This is the low-level helper used by `current_animation_frame` after loop/non-loop elapsed-time normalization.
+**Call relations**: current_animation_frame calls this after deciding whether the animation is looping or still in its normal timeline.
 
 *Call graph*: calls 1 internal fn (nanos_to_duration); called by 1 (current_animation_frame).
 
@@ -6632,11 +6648,11 @@ fn frame_at_elapsed(animation: &Animation, elapsed_nanos: u128) -> Option<Animat
 fn nanos_to_duration(nanos: u128) -> Duration
 ```
 
-**Purpose**: Safely converts a `u128` nanosecond count into `std::time::Duration` by saturating at `u64::MAX`. This avoids overflow when constructing durations from large intermediate values.
+**Purpose**: Safely converts a large nanosecond count into a Duration value.
 
-**Data flow**: Input is a nanosecond count as `u128`. It clamps that value to `u64::MAX`, casts to `u64`, and returns `Duration::from_nanos(...)`.
+**Data flow**: It receives a nanosecond count as a wide integer → caps it at the largest value Duration::from_nanos accepts → returns a Duration.
 
-**Call relations**: Used only by `frame_at_elapsed` to turn remaining frame time into a schedulable `Duration`.
+**Call relations**: frame_at_elapsed uses this when reporting how long remains before the next animation frame.
 
 *Call graph*: called by 1 (frame_at_elapsed); 2 external calls (from_nanos, from).
 
@@ -6647,11 +6663,11 @@ fn nanos_to_duration(nanos: u128) -> Duration
 fn notification_height(notification: &PetNotification) -> u16
 ```
 
-**Purpose**: Determines how many terminal rows a notification reserves above the sprite. A notification whose body exactly matches its label uses one row; otherwise it uses two.
+**Purpose**: Estimates how many terminal rows a notification needs above or beside the pet.
 
-**Data flow**: Input is `&PetNotification`. It compares `notification.body` to `notification.kind.label()` and returns `1` or `2` as `u16`.
+**Data flow**: It receives a notification → compares its body text with the short label → returns one row for label-only text or two rows when there is a separate body.
 
-**Call relations**: Called by `draw_request` so ambient layout can reserve enough vertical space for the visible notification text.
+**Call relations**: AmbientPet::draw_request uses this to decide whether the pet and its notification can fit without overlapping the rest of the interface.
 
 
 ##### `test_ambient_pet`  (lines 446–473)
@@ -6663,11 +6679,11 @@ fn test_ambient_pet(
 ) -> AmbientPet
 ```
 
-**Purpose**: Builds a deterministic in-memory `AmbientPet` fixture for unit tests without touching disk or real terminal detection. The fixture starts slightly into a looping two-frame idle animation.
+**Purpose**: Builds a small fake AmbientPet for tests without loading real pet files from disk.
 
-**Data flow**: Inputs are a `FrameRequester` and an `animations_enabled` flag. It constructs a synthetic `Pet` with fixed geometry and one idle animation from `test_animation()`, marks image support as `Supported(ImageProtocol::Kitty)`, seeds two frame paths, sets `notification` to `None`, backdates `animation_started_at` by 15 ms from `Instant::now()`, and returns the assembled `AmbientPet`.
+**Data flow**: It receives a frame requester and animation setting → creates a hard-coded pet, fake frame paths, supported image protocol, and a started animation clock → returns the ready test AmbientPet.
 
-**Call relations**: Used by reduced-motion and timing tests to exercise `current_frame_path` and `next_frame_delay` without invoking `AmbientPet::load`.
+**Call relations**: The reduced-motion test calls this to check animation behavior in a controlled setup. It uses test_animation for the fake animation data.
 
 *Call graph*: calls 1 internal fn (test_animation); called by 1 (reduced_motion_uses_stable_first_frame_and_schedules_no_follow_up); 8 external calls (from_millis, from, now, from, new, new, Supported, vec!).
 
@@ -6678,11 +6694,11 @@ fn test_ambient_pet(
 fn test_animation() -> Animation
 ```
 
-**Purpose**: Creates a simple two-frame looping animation used by tests. Each frame lasts 10 ms and the loop starts at frame 0.
+**Purpose**: Creates a simple two-frame looping animation for tests.
 
-**Data flow**: It has no inputs and returns an `Animation` containing two `AnimationFrame` values with sprite indices 0 and 1, equal durations, `loop_start: Some(0)`, and fallback `idle`.
+**Data flow**: It builds two frames with short durations and a loop starting at the first frame → returns an Animation that is easy to reason about.
 
-**Call relations**: Used by both `test_ambient_pet` and the frame-duration unit test to provide a compact predictable animation.
+**Call relations**: test_ambient_pet uses it to populate fake pet data, and the animation timing test uses it directly.
 
 *Call graph*: called by 2 (test_ambient_pet, animation_frame_uses_per_frame_duration); 1 external calls (vec!).
 
@@ -6693,11 +6709,11 @@ fn test_animation() -> Animation
 fn notification_labels_match_codex_app_vocabulary()
 ```
 
-**Purpose**: Checks that each `PetNotificationKind` label string matches the expected app-facing wording. This guards against accidental terminology drift.
+**Purpose**: Checks that pet notification labels match the wording used by the Codex app.
 
-**Data flow**: It calls `label()` on each enum variant and asserts the returned strings equal the expected literals.
+**Data flow**: It calls each label method → compares the returned text with the expected app vocabulary → the test fails if any label changes unexpectedly.
 
-**Call relations**: This test exercises the static mapping in `PetNotificationKind::label`.
+**Call relations**: This protects PetNotificationKind::label because those labels are visible to users and should stay consistent.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -6708,11 +6724,11 @@ fn notification_labels_match_codex_app_vocabulary()
 fn animation_frame_uses_per_frame_duration()
 ```
 
-**Purpose**: Verifies that frame selection honors individual frame durations rather than assuming a uniform or frame-count-based schedule. The chosen elapsed time lands inside the second frame with 5 ms remaining.
+**Purpose**: Verifies that animation timing respects each frame’s own duration.
 
-**Data flow**: It builds the test animation, calls `current_animation_frame(&animation, 15 ms)`, and asserts the result is `Some(AnimationFrameTick { sprite_index: 1, delay: Some(5 ms) })`.
+**Data flow**: It creates the test animation → asks which frame is active after 15 milliseconds → expects the second frame with 5 milliseconds left.
 
-**Call relations**: This test directly validates the timing logic implemented by `current_animation_frame` and `frame_at_elapsed`.
+**Call relations**: This test exercises current_animation_frame through a simple case built by test_animation.
 
 *Call graph*: calls 1 internal fn (test_animation); 1 external calls (assert_eq!).
 
@@ -6723,24 +6739,24 @@ fn animation_frame_uses_per_frame_duration()
 fn reduced_motion_uses_stable_first_frame_and_schedules_no_follow_up()
 ```
 
-**Purpose**: Confirms that disabling animations pins the pet to the first frame and suppresses future frame scheduling. This is the reduced-motion behavior contract.
+**Purpose**: Verifies that reduced-motion mode freezes the pet on a stable frame and does not schedule more animation redraws.
 
-**Data flow**: It creates a test pet with `animations_enabled` set to `false`, reads `current_frame_path()` and `next_frame_delay()`, and asserts they are `Some("frame-0.png")` and `None` respectively.
+**Data flow**: It builds a test AmbientPet with animations disabled → checks that the current frame is the first frame and that there is no next-frame delay → the test fails if reduced motion would still animate.
 
-**Call relations**: This test drives the reduced-motion branches in `AmbientPet::current_frame_path` and `AmbientPet::next_frame_delay` using the `test_ambient_pet` fixture.
+**Call relations**: This test uses test_ambient_pet and then checks AmbientPet::current_frame_path and AmbientPet::next_frame_delay behavior.
 
 *Call graph*: calls 2 internal fn (test_ambient_pet, test_dummy); 1 external calls (assert_eq!).
 
 
 ### `tui/src/pets/preview.rs`
 
-`data_model` · `request handling`
+`domain_logic` · `active during pet picker rendering and preview state updates`
 
-This file provides the small state model behind the pet picker's preview pane. The core type is `PetPickerPreviewState`, which wraps an `Arc<Mutex<PetPickerPreviewInner>>` so both the popup renderer and external async controllers can observe and update the same preview status. The inner state stores two pieces of data: a `PetPickerPreviewStatus` enum (`Hidden`, `Loading`, `Disabled`, `Ready`, or `Error { message }`) and `last_area: Option<Rect>`, which remembers the most recent render rectangle.
+The pet picker has a side pane that can either show a pet preview or explain why no preview is visible. This file keeps that pane simple but coordinated. The key idea is a shared state object, `PetPickerPreviewState`, that can be safely updated from different parts of the program. It uses a mutex, which is a lock that stops two pieces of code from changing the same data at the same time, wrapped in `Arc`, which lets several owners share the same state.
 
-The design is intentionally tolerant of lock failures: every mutator funnels through `update`, which simply does nothing if the mutex is poisoned, and `area()` returns `None` if locking fails. That keeps preview support from destabilizing the rest of the picker UI. `clear()` is the only state transition that also resets geometry, because hidden previews should not leave stale render coordinates behind.
+One part of the picker can create a renderable view of this state. Another part, such as code reacting to selection changes or preview loading, can set the state to loading, ready, disabled, error, or hidden. When the terminal UI redraws, `PetPickerPreviewRenderable::render` looks at the current state and decides what text, if any, should be painted in the side pane.
 
-`PetPickerPreviewRenderable` implements the shared `Renderable` trait. On each render it records the current `Rect` into `last_area`, then either exits immediately (`Hidden` and `Ready`) or draws centered status text for loading, disabled, or error states. `Ready` intentionally renders nothing because actual pet image drawing happens elsewhere using the remembered area. The helper `centered_text_area` vertically centers one or two lines of text within the side pane and clamps requested height to the available area.
+A small but important detail is that rendering records the last screen rectangle used for the preview pane. That remembered area lets image-rendering code outside the normal widget tree know where to place the pet image. In everyday terms, this file is like a shared notice board: one worker updates the message, the display reads it, and the display also marks where the picture should go.
 
 #### Function details
 
@@ -6750,11 +6766,11 @@ The design is intentionally tolerant of lock failures: every mutator funnels thr
 fn renderable(&self) -> PetPickerPreviewRenderable
 ```
 
-**Purpose**: Creates a lightweight renderable view object that shares the same underlying preview state as the controller.
+**Purpose**: Creates a drawable wrapper for the preview pane. The wrapper shares the same underlying state, so the UI can redraw current preview messages without rebuilding the whole picker.
 
-**Data flow**: It reads `self.inner`, clones the `Arc`, and returns a new `PetPickerPreviewRenderable { inner }`. No preview status changes occur; the returned wrapper simply points at the same mutex-backed state.
+**Data flow**: It starts with a `PetPickerPreviewState` that owns shared preview data. It clones the shared pointer, which is cheap and still points to the same locked state. It returns a `PetPickerPreviewRenderable` that can be given to the UI rendering system.
 
-**Call relations**: This method is called by `build_pet_picker_params` when wiring the picker side pane. It exists so the popup can render preview status while external code continues to mutate the same state object.
+**Call relations**: When the pet picker is being assembled, `build_pet_picker_params` calls this so the picker can include the preview pane. Later, the returned renderable reads the same state that selection-change or loading code updates.
 
 *Call graph*: called by 1 (build_pet_picker_params); 1 external calls (clone).
 
@@ -6765,11 +6781,11 @@ fn renderable(&self) -> PetPickerPreviewRenderable
 fn set_loading(&self)
 ```
 
-**Purpose**: Marks the preview as currently loading.
+**Purpose**: Marks the preview pane as waiting for preview data. This is used when a pet preview has been requested but is not ready yet.
 
-**Data flow**: It takes `&self`, acquires mutable access through `update`, and sets `inner.status` to `PetPickerPreviewStatus::Loading`. It returns no value and leaves `last_area` unchanged.
+**Data flow**: It takes the current shared state, locks it through `update`, and changes the status to `Loading`. Nothing is returned; the visible effect appears the next time the pane is rendered.
 
-**Call relations**: This is one of several thin status setters that all delegate to `PetPickerPreviewState::update`, allowing external preview-loading code to drive the side pane state machine.
+**Call relations**: This is one of the public state-changing helpers that funnels through `PetPickerPreviewState::update`. After it changes the status, `PetPickerPreviewRenderable::render` can show a loading message.
 
 *Call graph*: calls 1 internal fn (update).
 
@@ -6780,11 +6796,11 @@ fn set_loading(&self)
 fn set_disabled(&self)
 ```
 
-**Purpose**: Marks the preview pane as representing the disabled-pets state.
+**Purpose**: Marks the preview pane as disabled. This tells the user that terminal pets are turned off and no pet will be shown.
 
-**Data flow**: It updates the shared inner state by setting `status` to `PetPickerPreviewStatus::Disabled` through `update`. It does not alter the remembered render area.
+**Data flow**: It locks the shared preview state through `update` and changes the status to `Disabled`. It does not return a value; it changes what the next UI redraw will display.
 
-**Call relations**: Like the other setters, this is a convenience wrapper over `update` for callers that need the side pane to show the disabled explanatory message.
+**Call relations**: Like the other status setters, it uses `PetPickerPreviewState::update` to safely edit the shared state. The renderable later turns this status into a short title and explanation.
 
 *Call graph*: calls 1 internal fn (update).
 
@@ -6795,11 +6811,11 @@ fn set_disabled(&self)
 fn set_ready(&self)
 ```
 
-**Purpose**: Marks the preview as ready for out-of-band image rendering.
+**Purpose**: Marks the preview as ready. In this state, the text pane does not draw a message, leaving room for the actual pet preview image to appear.
 
-**Data flow**: It sets `inner.status` to `PetPickerPreviewStatus::Ready` via `update`. No text is stored and `last_area` remains available for external renderers to query.
+**Data flow**: It locks the shared state through `update` and sets the status to `Ready`. It returns nothing; the important change is stored in the shared state.
 
-**Call relations**: This setter is used by preview-loading control flow to transition from loading/error states into the mode where `PetPickerPreviewRenderable::render` records geometry but draws no placeholder text.
+**Call relations**: This setter shares the same update path as loading, disabled, and error states. When `PetPickerPreviewRenderable::render` sees `Ready`, it records the area but does not draw text over it.
 
 *Call graph*: calls 1 internal fn (update).
 
@@ -6810,11 +6826,11 @@ fn set_ready(&self)
 fn set_error(&self, message: String)
 ```
 
-**Purpose**: Stores an error message to be shown in the preview pane when preview generation fails.
+**Purpose**: Stores an error message for the preview pane. This lets the UI explain why a preview could not be shown instead of silently leaving the pane blank.
 
-**Data flow**: It takes an owned `String` message, passes a closure to `update`, and replaces `inner.status` with `PetPickerPreviewStatus::Error { message }`. It returns no value and preserves `last_area`.
+**Data flow**: It receives a message string, locks the shared state through `update`, and stores the status as `Error` together with that message. It returns nothing, but the message becomes available for the next render.
 
-**Call relations**: This method is another external control hook; once set, `PetPickerPreviewRenderable::render` will display a fixed title plus the stored message.
+**Call relations**: This is called by code that knows a preview failed. It hands the stored message to `PetPickerPreviewRenderable::render`, which displays it under a general error title.
 
 *Call graph*: calls 1 internal fn (update).
 
@@ -6825,11 +6841,11 @@ fn set_error(&self, message: String)
 fn clear(&self)
 ```
 
-**Purpose**: Resets the preview state to hidden and forgets the last render rectangle.
+**Purpose**: Resets the preview pane to an empty hidden state. It also forgets the last known screen area, because there is no current preview location to reuse.
 
-**Data flow**: Through `update`, it sets `inner.status` to `PetPickerPreviewStatus::Hidden` and `inner.last_area` to `None`. It returns no value.
+**Data flow**: It locks the shared state through `update`, changes the status to `Hidden`, and sets the remembered area to `None`. Nothing is returned; the shared state is simply reset.
 
-**Call relations**: This is the only mutator that clears geometry as well as status, ensuring stale preview coordinates are not reused after the pane is hidden.
+**Call relations**: This uses the same safe update helper as the other setters. After clearing, rendering exits without drawing text, and callers asking for `area` will no longer receive an old rectangle.
 
 *Call graph*: calls 1 internal fn (update).
 
@@ -6840,11 +6856,11 @@ fn clear(&self)
 fn area(&self) -> Option<Rect>
 ```
 
-**Purpose**: Returns the most recently rendered preview rectangle, if one has been recorded.
+**Purpose**: Returns the last screen area where the preview pane was rendered, if one is known. Other code can use this to place an out-of-band pet image in the right spot.
 
-**Data flow**: It locks `self.inner`, reads `inner.last_area`, and returns `Option<Rect>`. If locking fails, it returns `None` rather than propagating an error.
+**Data flow**: It tries to lock the shared state and read `last_area`. If the lock succeeds and an area has been recorded, it returns that rectangle. If the lock fails or no area has been recorded, it returns `None`.
 
-**Call relations**: This accessor supports the out-of-band image rendering design: after `PetPickerPreviewRenderable::render` records the area, external code can query it to know where to draw the actual pet preview.
+**Call relations**: The remembered area is written by `PetPickerPreviewRenderable::render`. This function is the read side of that exchange, giving preview image code a way to find the pane without knowing the picker layout details.
 
 
 ##### `PetPickerPreviewState::update`  (lines 74–78)
@@ -6853,11 +6869,11 @@ fn area(&self) -> Option<Rect>
 fn update(&self, f: impl FnOnce(&mut PetPickerPreviewInner))
 ```
 
-**Purpose**: Provides the shared mutation primitive for all preview-state setters.
+**Purpose**: Safely edits the shared preview state. It is the common helper used by the status-changing methods so they all lock the state in the same careful way.
 
-**Data flow**: It takes a closure `FnOnce(&mut PetPickerPreviewInner)`, attempts to lock the mutex, and if successful applies the closure to the inner state. It returns no value and silently ignores poisoned-lock failures.
+**Data flow**: It receives a small editing function. It tries to lock the shared state; if that works, it gives mutable access to the inner data and runs the edit. If locking fails, it quietly does nothing.
 
-**Call relations**: All state-changing methods (`set_loading`, `set_disabled`, `set_ready`, `set_error`, `clear`) funnel through this helper so lock handling is centralized and non-fatal.
+**Call relations**: `set_loading`, `set_disabled`, `set_ready`, `set_error`, and `clear` all call this instead of touching the locked data directly. This keeps the lock-and-edit pattern in one place.
 
 *Call graph*: called by 5 (clear, set_disabled, set_error, set_loading, set_ready).
 
@@ -6868,11 +6884,11 @@ fn update(&self, f: impl FnOnce(&mut PetPickerPreviewInner))
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the preview side pane's placeholder/status text and records the pane's last on-screen area for external image rendering.
+**Purpose**: Draws the preview pane’s text message into the terminal buffer when a message is needed. It also records the pane’s current screen area so other preview code knows where the pet image belongs.
 
-**Data flow**: It receives a `Rect` and mutable `Buffer`, locks the shared inner state, stores `last_area = Some(area)`, then branches on `status`. For `Hidden` and `Ready` it returns immediately; for `Loading`, `Disabled`, and `Error` it derives a title and optional body string, computes a vertically centered text area with `centered_text_area`, builds `Line` values with bold/dim styling, and renders a centered `Paragraph` into the buffer.
+**Data flow**: It receives a rectangle describing where the pane is on screen and a buffer, which is the terminal drawing surface. It locks the shared state, saves the rectangle as the latest area, checks the current status, and decides whether to draw nothing or draw one or two centered lines. For loading, disabled, and error states it writes styled text into the buffer; for hidden and ready states it leaves the buffer alone.
 
-**Call relations**: This method is invoked by the popup rendering system through the `Renderable` trait after `build_pet_picker_params` installs the preview wrapper as side content. It delegates geometry calculation to `centered_text_area` and intentionally leaves actual image drawing to external code when status is `Ready`.
+**Call relations**: The terminal UI calls this during redraws through the `Renderable` interface. It uses `centered_text_area` to place messages vertically in the pane, and it reads statuses set earlier by the `PetPickerPreviewState` methods.
 
 *Call graph*: calls 1 internal fn (centered_text_area); 3 external calls (from, new, vec!).
 
@@ -6883,11 +6899,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, _width: u16) -> u16
 ```
 
-**Purpose**: Reports a fixed preferred height for the preview side pane content.
+**Purpose**: Tells the layout system that this preview pane would like to be four rows tall. This gives the picker a simple fixed height hint for arranging the UI.
 
-**Data flow**: It ignores the provided width and returns `4`. It does not read or mutate shared state.
+**Data flow**: It receives an available width but does not need it. It always returns `4`, meaning four terminal rows.
 
-**Call relations**: This is the `Renderable` sizing hook used by layout code when placing the preview pane; it complements `render` by advertising a small constant height.
+**Call relations**: The UI layout code can ask this renderable how much vertical space it wants before drawing. The returned value helps reserve enough room for the preview message area.
 
 
 ##### `centered_text_area`  (lines 140–144)
@@ -6896,11 +6912,11 @@ fn desired_height(&self, _width: u16) -> u16
 fn centered_text_area(area: Rect, height: u16) -> Rect
 ```
 
-**Purpose**: Computes a rectangle centered vertically within a larger area for one- or two-line preview status text.
+**Purpose**: Calculates a smaller rectangle that vertically centers a block of text inside a larger area. This keeps preview messages from sticking awkwardly to the top of the pane.
 
-**Data flow**: It takes an outer `Rect` and requested `height`, clamps the height to `area.height`, computes a centered `y` using `saturating_sub`, and returns a new `Rect` with the same `x` and `width`. It does not mutate external state.
+**Data flow**: It receives the full pane rectangle and the desired text height. It caps the text height so it cannot exceed the pane, computes a centered vertical position, and returns a new rectangle with the same x-position and width but adjusted y-position and height.
 
-**Call relations**: This helper is used only by `PetPickerPreviewRenderable::render` to place loading/disabled/error text in the middle of the preview pane.
+**Call relations**: `PetPickerPreviewRenderable::render` calls this right before drawing text. It supplies the neat placement box that the terminal paragraph widget uses.
 
 *Call graph*: called by 1 (render); 1 external calls (new).
 
@@ -6911,11 +6927,11 @@ fn centered_text_area(area: Rect, height: u16) -> Rect
 fn centered_text_area_centers_vertically()
 ```
 
-**Purpose**: Verifies that `centered_text_area` computes the expected vertically centered rectangle.
+**Purpose**: Checks that `centered_text_area` places a short text block in the vertical middle of a taller rectangle. This protects the small layout calculation from accidental changes.
 
-**Data flow**: It constructs a sample outer `Rect`, calls `centered_text_area` with a smaller height, and asserts that the returned rectangle has the expected `y` offset and dimensions. It performs no side effects.
+**Data flow**: It builds a sample outer rectangle and asks for a two-row text area. It compares the result with the exact rectangle expected for vertical centering. The test passes if both rectangles match.
 
-**Call relations**: This unit test directly exercises the geometry helper used by preview rendering.
+**Call relations**: This test exercises `centered_text_area` directly. It is not part of the running picker; it runs during testing to confirm the helper still behaves as the rendering code expects.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -6925,11 +6941,13 @@ These files implement adjacent interactive helpers for platform actions, clipboa
 
 ### `tui/src/app/platform_actions.rs`
 
-`util` · `cross-cutting during input handling and Windows-specific safety setup`
+`orchestration` · `cross-cutting: active during keyboard input handling and Windows sandbox setup`
 
-This module contains two distinct concerns. First, it defines `WindowsSandboxState`, which stores app-level Windows sandbox bookkeeping: when setup started and whether the next world-writable scan should be skipped once after user confirmation. Second, it provides helper actions and predicates used by the broader app. On Windows only, `App::spawn_world_writable_scan` derives sandbox permissions from the current `PermissionProfile` and workspace roots, then launches a blocking scan that applies world-writable checks and deny rules using `codex_windows_sandbox`. If permission resolution fails, it silently returns without spawning work. If the scan itself fails, it emits an `AppEvent::OpenWorldWritableWarningConfirmation` with `failed_scan: true`, no preset/profile selection, and no sample paths, signaling the UI to warn without concrete examples.
+This file is a small bridge between the general terminal app and details that only matter in certain situations. On Windows, the app may need to scan the current workspace for directories that are “world-writable,” meaning many users or processes could write there. That matters because a sandbox is meant to limit what the app can touch; unsafe writable folders can weaken that protection. This file starts that scan in the background so the user interface does not freeze, and sends a warning event if the scan itself fails.
 
-The cross-platform helper `side_return_shortcut_matches` recognizes Ctrl-C and Ctrl-D key presses, case-insensitively, but only for `KeyEventKind::Press`; release events and unrelated keys do not match. This predicate is consumed by higher-level input dispatch to implement a quick return from side conversations without conflating it with ordinary Esc handling. The included test locks down both accepted and rejected key forms.
+It also defines a tiny piece of Windows sandbox state. One field remembers when sandbox setup began, and another lets the app skip exactly one scan after the user has already confirmed they understand the warning. Think of it like a one-use hall pass: it avoids nagging immediately after a choice, but does not permanently disable checking.
+
+Finally, the file contains a keyboard shortcut rule for side conversations. It says that a key press counts as a “return” shortcut only when the user presses Control with C or D, in either uppercase or lowercase. That keeps shortcut behavior consistent and avoids treating unrelated keys, such as Escape, as the same action.
 
 #### Function details
 
@@ -6943,11 +6961,11 @@ fn spawn_world_writable_scan(
         logs_base_dir: AbsolutePa
 ```
 
-**Purpose**: Starts a background Windows-only scan that applies world-writable checks and deny rules for the current workspace and permission profile. If the scan later fails, it triggers a warning-confirmation app event.
+**Purpose**: On Windows, this starts a safety scan for writable workspace paths without blocking the terminal interface. It is used when the app needs to check whether the configured sandbox permissions are safe enough for the current workspace.
 
-**Data flow**: Consumes the current cwd, workspace roots, environment map, logs directory, permission profile, and app event sender. It first derives `ResolvedWindowsSandboxPermissions` from the permission profile and workspace roots; if that fails, it returns immediately. Otherwise it spawns a blocking task that calls `apply_world_writable_scan_and_denies_for_permissions(...)` and, on error, sends a failure warning event via `send_world_writable_scan_failed`.
+**Data flow**: It receives the current folder, workspace roots, environment variables, a log directory, a permission profile, and an event sender. First it turns the permission profile into concrete Windows sandbox permissions for those workspace roots; if that cannot be done, it quietly stops. If permissions are resolved, it starts a background blocking task, runs the scan with the paths and environment it was given, and if the scan fails it sends a warning event back to the app.
 
-**Call relations**: Called from Windows-specific app setup or permission flows when sandbox scanning is needed. It delegates permission derivation and the actual filesystem scan to the `codex_windows_sandbox` crate, and delegates failure reporting to `send_world_writable_scan_failed`.
+**Call relations**: When the app decides a Windows sandbox scan is needed, it calls this method. The method asks `try_from_permission_profile_for_workspace_roots` to translate the user-facing permission profile into concrete sandbox rules, then hands the slower scan work to `spawn_blocking` so the user interface can keep running. If that background work reports an error, it relies on `send_world_writable_scan_failed` to notify the rest of the app.
 
 *Call graph*: calls 1 internal fn (try_from_permission_profile_for_workspace_roots); 1 external calls (spawn_blocking).
 
@@ -6958,11 +6976,11 @@ fn spawn_world_writable_scan(
 fn send_world_writable_scan_failed(tx: &AppEventSender)
 ```
 
-**Purpose**: Sends a standardized app event indicating that the Windows world-writable scan failed and the UI should open a warning confirmation without sample paths. It packages the failure into one consistent event shape.
+**Purpose**: This sends a specific app event saying that the Windows world-writable scan failed. The event opens a warning confirmation screen, but without example paths because the scan did not produce any.
 
-**Data flow**: Accepts an `AppEventSender`, constructs `AppEvent::OpenWorldWritableWarningConfirmation` with `preset: None`, `profile_selection: None`, empty `sample_paths`, `extra_count: 0`, and `failed_scan: true`, and sends it through the channel. It returns unit.
+**Data flow**: It takes an app event sender as input. It builds an `OpenWorldWritableWarningConfirmation` event with no preset, no profile selection, no sample paths, zero extra paths, and a flag saying the scan failed. It sends that event outward, changing the app’s event stream rather than returning a value.
 
-**Call relations**: Used only by the background scan task in `App::spawn_world_writable_scan` when the scan operation returns an error. It isolates the exact warning payload from the scanning logic.
+**Call relations**: This helper is used after the Windows scan task detects a failure. It calls the sender’s `send` method to hand the warning event back to the app, where normal event processing can show the appropriate confirmation UI.
 
 *Call graph*: calls 1 internal fn (send); 1 external calls (new).
 
@@ -6973,11 +6991,11 @@ fn send_world_writable_scan_failed(tx: &AppEventSender)
 fn side_return_shortcut_matches(key_event: KeyEvent) -> bool
 ```
 
-**Purpose**: Recognizes the Ctrl-C and Ctrl-D key presses that act as side-conversation return shortcuts. It is intentionally limited to press events so releases do not trigger navigation.
+**Purpose**: This checks whether a keyboard event is the shortcut for returning from a side conversation. The accepted shortcuts are Ctrl+C and Ctrl+D, regardless of letter case.
 
-**Data flow**: Reads a `KeyEvent`, pattern-matches for `KeyCode::Char(c)` with `KeyModifiers::CONTROL` and `KeyEventKind::Press`, then returns true when `c` is ASCII-equal to `c` or `d` in either case. It mutates no state.
+**Data flow**: It receives one key event. It looks at the key code, modifier keys, and whether the event is an actual press. It returns `true` only for a pressed character key where Control is held and the character is C or D; otherwise it returns `false`.
 
-**Call relations**: Called by higher-level input dispatch in `App::handle_key_event` before ordinary widget handling. It encapsulates the exact shortcut predicate so the input module does not duplicate key matching logic.
+**Call relations**: Code that reads keyboard input can call this function before deciding what action to take. Internally it uses Rust’s pattern-matching form, `matches!`, to express the rule in one place so the rest of the app does not need to repeat the shortcut details.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -6988,24 +7006,26 @@ fn side_return_shortcut_matches(key_event: KeyEvent) -> bool
 fn side_return_shortcuts_match_ctrl_c_and_ctrl_d()
 ```
 
-**Purpose**: Verifies that the side-return shortcut predicate accepts Ctrl-C/Ctrl-D in either case and rejects unrelated Esc press/release events. It locks down the intended key semantics.
+**Purpose**: This test proves that the side-return shortcut accepts Ctrl+C and Ctrl+D in both uppercase and lowercase forms, and rejects unrelated Escape key events. It protects the shortcut rule from accidental changes.
 
-**Data flow**: Constructs several `KeyEvent` values with `KeyEvent::new` and `KeyEvent::new_with_kind`, passes them to `side_return_shortcut_matches`, and asserts the expected true/false outcomes. It mutates no shared state.
+**Data flow**: It creates several sample key events, feeds them into `side_return_shortcut_matches`, and checks the returned true-or-false result. The expected result is true for Control plus C or D, and false for Escape presses or releases without Control.
 
-**Call relations**: Run by the test harness as the specification for `side_return_shortcut_matches`. It directly exercises the predicate with representative accepted and rejected inputs.
+**Call relations**: During test runs, this function exercises `side_return_shortcut_matches` directly. It uses assertions to make the shortcut contract explicit, so future edits that broaden or break the shortcut behavior are caught quickly.
 
 *Call graph*: 1 external calls (assert!).
 
 
 ### `tui/src/clipboard_paste.rs`
 
-`io_transport` · `user paste handling and related normalization tests`
+`io_transport` · `request handling, when the user pastes text, paths, or images`
 
-This module covers two related but distinct concerns: image paste from the clipboard and normalization of pasted text into search queries or paths. For images, it defines `PasteImageError` with user-facing variants for clipboard access, missing image data, encoding failure, and I/O failure, plus `EncodedImageFormat` and `PastedImageInfo` metadata. `paste_image_as_png` is the core non-Android implementation: it opens `arboard::Clipboard`, prefers clipboard file-list entries that can be opened by `image::open`, otherwise falls back to raw clipboard image bytes from `get_image`, reconstructs an `image::RgbaImage`, and encodes the resulting `DynamicImage` to PNG bytes while recording tracing spans. `paste_image_to_temp_png` then persists those bytes to a uniquely named tempfile and, on Linux, falls back to a WSL-specific path if clipboard access failed.
+When a user pastes into the terminal interface, the app cannot assume the pasted data is already tidy. An image might arrive as raw clipboard pixels, as a copied file, or through the Windows clipboard while the app is running under WSL. A path might be quoted, shell-escaped, written as a file:// URL, or use Windows backslashes. This file is the adapter that turns those messy real-world clipboard inputs into predictable Rust values.
 
-The WSL fallback path is careful and narrow: only clipboard-unavailable or no-image errors trigger it, `is_probably_wsl` must succeed, PowerShell is asked to dump the Windows clipboard image to a temporary PNG, and the resulting Windows path is converted to a `/mnt/<drive>/...` WSL path before dimensions are probed.
+For images, it first tries the normal system clipboard route. If the clipboard points to image files, it prefers opening those files. Otherwise it reads raw image data from the clipboard. In both cases it re-encodes the image as PNG, records its width and height, and can optionally write it to a uniquely named temporary .png file. On Android it returns a clear “unsupported” error because the clipboard library used here does not work there.
 
-The text normalization helpers collapse whitespace for search queries and parse pasted paths from `file://` URLs, quoted strings, shell-escaped single paths, Windows drive paths, and UNC paths. On Linux under WSL, Windows drive-letter paths are converted into WSL mount paths. The tests focus on these normalization rules and extension-based image-format inference.
+On Linux, it has a special WSL escape hatch. If the normal Linux clipboard access fails, it can ask Windows PowerShell to save the Windows clipboard image to a temporary PNG, then translate a path like C:\Temp\x.png into /mnt/c/Temp/x.png.
+
+For text, the file offers small cleanup tools: one for turning pasted search text into a single spaced line, and one for recognizing pasted filesystem paths safely.
 
 #### Function details
 
@@ -7015,11 +7035,11 @@ The text normalization helpers collapse whitespace for search queries and parse 
 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 ```
 
-**Purpose**: Formats each `PasteImageError` variant into a user-facing message with a stable prefix describing the failure category. It gives callers readable errors without exposing enum internals.
+**Purpose**: This turns a paste-image error into a clear sentence for logs or user-facing messages. It explains whether the clipboard was unavailable, no image was found, image encoding failed, or file input/output failed.
 
-**Data flow**: It matches on `self` and writes one of four strings into the provided formatter: `clipboard unavailable: ...`, `no image on clipboard: ...`, `could not encode image: ...`, or `io error: ...`.
+**Data flow**: It receives one PasteImageError value and a text formatter. It chooses the matching human-readable prefix, adds the stored error message, and writes that text into the formatter. Nothing else is changed.
 
-**Call relations**: This `Display` implementation is used implicitly whenever paste-image errors are rendered or logged. It does not participate in control flow beyond formatting.
+**Call relations**: Rust calls this automatically whenever a PasteImageError needs to be displayed as text. The image paste functions create these errors when clipboard access, image conversion, or file writing fails, and this formatter makes those failures understandable.
 
 *Call graph*: 1 external calls (write!).
 
@@ -7030,11 +7050,11 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
 fn label(self) -> &'static str
 ```
 
-**Purpose**: Returns a short uppercase label for an encoded image format. The labels are intended for compact UI display.
+**Purpose**: This gives a short display label for an image format. It is useful when the interface wants to show “PNG”, “JPEG”, or a generic “IMG” without exposing internal enum names.
 
-**Data flow**: It matches `self` and returns the static string `PNG`, `JPEG`, or `IMG`.
+**Data flow**: It receives an EncodedImageFormat value. It matches that value to a fixed text label and returns that label. It does not read or change anything else.
 
-**Call relations**: This is a pure helper on the enum and is used wherever the UI needs a concise format label.
+**Call relations**: Code that receives image information can call this when it needs a user-friendly format name. It sits beside PastedImageInfo as a small presentation helper.
 
 
 ##### `paste_image_as_png`  (lines 113–117)
@@ -7043,11 +7063,11 @@ fn label(self) -> &'static str
 fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageError>
 ```
 
-**Purpose**: Reads an image from the system clipboard and encodes it as PNG bytes along with width, height, and format metadata. It accepts either clipboard file references or raw image data and prefers files when both are present.
+**Purpose**: This reads an image from the system clipboard and returns it as PNG bytes with basic information such as width and height. It exists so the rest of the app can treat pasted images the same way no matter how the operating system provided them.
 
-**Data flow**: On non-Android targets it enters tracing spans, creates `arboard::Clipboard::new()`, and maps clipboard-construction errors to `PasteImageError::ClipboardUnavailable`. It then tries `cb.get().file_list()`, converting errors to the same variant; if any listed file can be opened with `image::open`, that `DynamicImage` is used. Otherwise it calls `cb.get_image()`, maps failure to `PasteImageError::NoImage`, converts the returned width, height, and owned RGBA bytes into `image::RgbaImage::from_raw`, and errors with `EncodeFailed("invalid RGBA buffer")` if reconstruction fails. The chosen image is written to a `Vec<u8>` through a `Cursor` using `image::ImageFormat::Png`, with encoding errors mapped to `EncodeFailed`. On success it returns `(png_bytes, PastedImageInfo { width, height, encoded_format: EncodedImageFormat::Png })`.
+**Data flow**: It starts by opening the system clipboard. It first looks for copied files and tries to open the first file that is actually an image; if that does not work, it reads raw image pixels from the clipboard. It converts the resulting image into PNG bytes, then returns those bytes together with image metadata. If the platform is Android, or if the clipboard/image conversion fails, it returns a PasteImageError instead.
 
-**Call relations**: This is the primary clipboard-image reader and is called by `paste_image_to_temp_png`. If it fails on Linux with clipboard-unavailable or no-image errors, the caller may attempt the WSL fallback path.
+**Call relations**: paste_image_to_temp_png calls this as its first attempt at image paste. Inside, it relies on the clipboard library for clipboard access and the image library for decoding and PNG encoding. Its result is the clean image payload that later code can write to disk or send onward.
 
 *Call graph*: calls 1 internal fn (new); called by 1 (paste_image_to_temp_png); 8 external calls (new, new, ImageRgba8, from_raw, debug!, debug_span!, ClipboardUnavailable, EncodeFailed).
 
@@ -7060,11 +7080,11 @@ fn try_wsl_clipboard_fallback(
 ) -> Result<(PathBuf, PastedImageInfo), PasteImageError>
 ```
 
-**Purpose**: Attempts to recover clipboard image paste under WSL by asking Windows PowerShell to dump the clipboard image to a temporary PNG and then mapping that path back into WSL. It only activates for clipboard-access or no-image failures that are plausibly caused by WSL clipboard limitations.
+**Purpose**: This is the backup route for image paste when the app is running in WSL and normal Linux clipboard access cannot see the Windows clipboard. It tries to bridge from Linux into Windows to recover the pasted image.
 
-**Data flow**: It takes the original `PasteImageError` by reference, returns `Err(error.clone())` immediately unless `is_probably_wsl()` is true and the error matches `ClipboardUnavailable(_) | NoImage(_)`, then logs a debug message and calls `try_dump_windows_clipboard_image()`. If no Windows path is produced, path conversion fails, or `image::image_dimensions(&mapped_path)` fails, it returns the cloned original error. Otherwise it returns `(mapped_path, PastedImageInfo { width: w, height: h, encoded_format: EncodedImageFormat::Png })` without copying the file.
+**Data flow**: It receives the original paste error. If the machine does not look like WSL, or the error is not the kind this fallback can fix, it returns that original error again. Otherwise it asks PowerShell to save the Windows clipboard image, converts the returned Windows path into a WSL path, checks the image dimensions, and returns that path with image information.
 
-**Call relations**: This helper is called only from `paste_image_to_temp_png` on Linux after `paste_image_as_png` fails. It delegates Windows-side extraction to `try_dump_windows_clipboard_image` and path translation to `convert_windows_path_to_wsl`.
+**Call relations**: paste_image_to_temp_png calls this only after the normal clipboard route fails on Linux. This function calls is_probably_wsl to decide whether the fallback is appropriate, try_dump_windows_clipboard_image to ask Windows for the image, and convert_windows_path_to_wsl so Linux-side code can read the file.
 
 *Call graph*: calls 3 internal fn (convert_windows_path_to_wsl, is_probably_wsl, try_dump_windows_clipboard_image); called by 1 (paste_image_to_temp_png); 4 external calls (image_dimensions, matches!, debug!, clone).
 
@@ -7075,11 +7095,11 @@ fn try_wsl_clipboard_fallback(
 fn try_dump_windows_clipboard_image() -> Option<String>
 ```
 
-**Purpose**: Runs a PowerShell script under several common executable names to save the Windows clipboard image to a temporary PNG and print the resulting Windows path. It returns `None` if no command succeeds or no image is present.
+**Purpose**: This asks Windows PowerShell to save the current clipboard image as a temporary PNG file. It is used only as a WSL workaround when Linux clipboard access cannot reach the Windows clipboard directly.
 
-**Data flow**: It defines a PowerShell script that forces UTF-8 output, calls `Get-Clipboard -Format Image`, saves the image to a temp `.png`, and writes the path. It iterates over `powershell.exe`, `pwsh`, and `powershell`, spawning each with `-NoProfile -Command <script>` and capturing output. For the first successful command with non-empty stdout, it decodes stdout with `String::from_utf8_lossy`, trims it, logs a debug message, and returns `Some(win_path)`; non-zero exits and spawn failures are logged and skipped. If all commands fail, it returns `None`.
+**Data flow**: It builds a small PowerShell script that reads an image from the Windows clipboard, saves it as a PNG in a temporary location, and prints the file path. It tries several common PowerShell command names. If one succeeds and prints a non-empty path, that Windows path is returned; otherwise it returns None.
 
-**Call relations**: This function is used exclusively by `try_wsl_clipboard_fallback` as the Windows-side extraction step.
+**Call relations**: try_wsl_clipboard_fallback calls this after deciding that a WSL fallback is worth trying. This function hands back a Windows-style path, which the caller then translates into a Linux-readable WSL path.
 
 *Call graph*: called by 1 (try_wsl_clipboard_fallback); 3 external calls (from_utf8_lossy, new, debug!).
 
@@ -7090,11 +7110,11 @@ fn try_dump_windows_clipboard_image() -> Option<String>
 fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImageError>
 ```
 
-**Purpose**: Convenience wrapper that turns clipboard image paste into a persisted temporary PNG file path plus metadata. It handles both the normal clipboard path and the Linux WSL fallback path.
+**Purpose**: This gives callers a ready-to-use temporary PNG file for the pasted image instead of raw bytes. That is useful when later code expects a file path rather than an in-memory image.
 
-**Data flow**: On non-Android targets it first calls `paste_image_as_png()`. On success it creates a tempfile with prefix `codex-clipboard-` and suffix `.png` using `tempfile::Builder`, writes the PNG bytes to `tmp.path()`, persists the tempfile with `keep()`, and returns the resulting `PathBuf` plus the original `PastedImageInfo`. On error, Linux builds call `try_wsl_clipboard_fallback(&e).or(Err(e))`, while other platforms simply return the original error.
+**Data flow**: It first calls paste_image_as_png. If that succeeds, it creates a unique temporary .png file, writes the PNG bytes into it, keeps the file so it remains after the temporary handle is dropped, and returns the path plus image information. If normal paste fails on Linux, it may try the WSL fallback. On Android it returns a clear unsupported error.
 
-**Call relations**: This is the higher-level image-paste API used by the TUI when it wants a file path rather than in-memory bytes. It delegates clipboard reading to `paste_image_as_png` and only invokes `try_wsl_clipboard_fallback` when the primary path fails on Linux.
+**Call relations**: This is the main convenience entry point for image paste as a file. It delegates image reading and encoding to paste_image_as_png, uses the WSL fallback when needed, and returns the final path to the caller that will attach, serialize, or display the pasted image.
 
 *Call graph*: calls 2 internal fn (paste_image_as_png, try_wsl_clipboard_fallback); 3 external calls (new, write, ClipboardUnavailable).
 
@@ -7105,11 +7125,11 @@ fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImageErr
 fn normalize_pasted_search_query(pasted: &str) -> Option<String>
 ```
 
-**Purpose**: Normalizes arbitrary pasted text into a single-line search query by collapsing all whitespace runs to single spaces. It rejects inputs that become empty after normalization.
+**Purpose**: This turns pasted text into a clean single-line search query. It removes leading and trailing blank space and collapses any internal whitespace, such as newlines and tabs, into single spaces.
 
-**Data flow**: It splits `pasted` on Unicode whitespace, collects the pieces into a `Vec<_>`, joins them with single spaces, and returns `Some(normalized)` only if the result is non-empty; otherwise it returns `None`.
+**Data flow**: It receives pasted text. It splits the text wherever there is whitespace, joins the pieces back together with one space between each, and returns the cleaned string. If the paste contained no real text, it returns None.
 
-**Call relations**: This helper is called by paste-handling code for search inputs. It is intentionally simple and independent of the image/path logic in the rest of the module.
+**Call relations**: handle_paste calls this when pasted text is meant for search. It gives that higher-level paste flow a simple answer: either a useful one-line query or nothing to search for.
 
 *Call graph*: called by 2 (handle_paste, handle_paste).
 
@@ -7120,11 +7140,11 @@ fn normalize_pasted_search_query(pasted: &str) -> Option<String>
 fn normalize_pasted_path(pasted: &str) -> Option<PathBuf>
 ```
 
-**Purpose**: Attempts to interpret pasted text as exactly one filesystem path across several common representations, including file URLs, quoted paths, shell-escaped paths, Windows drive paths, and UNC paths. It avoids POSIX shell parsing pitfalls for raw Windows paths containing backslashes.
+**Purpose**: This tries to understand pasted text as one filesystem path. It accepts common forms people paste, including file:// URLs, quoted paths, shell-escaped Unix paths, Windows drive paths, and UNC network paths.
 
-**Data flow**: It trims the input, strips matching single or double quotes when present, and first tries to parse the unquoted text as a `url::Url`; if the scheme is `file`, it returns `url.to_file_path().ok()`. Next it calls `normalize_windows_path(unquoted)` and returns that if successful, bypassing `shlex` for raw Windows paths. Otherwise it tokenizes the original `pasted` string with `shlex::Shlex`; if exactly one token results, it checks that token again with `normalize_windows_path` and falls back to `PathBuf::from(part)`. If multiple tokens remain, it returns `None`.
+**Data flow**: It receives pasted text and trims outer whitespace. It removes simple matching quotes if present, converts file:// URLs into local paths, recognizes Windows-style paths before shell parsing can damage their backslashes, and otherwise uses shell-style splitting to unescape a single path. It returns a PathBuf when the paste clearly means one path, or None when it looks like multiple tokens or not a path.
 
-**Call relations**: This function is used by paste handlers that accept image/file paths and is heavily covered by unit tests for URLs, quoting, shell escaping, Windows paths, and UNC paths. It delegates Windows-specific recognition and optional WSL conversion to `normalize_windows_path`.
+**Call relations**: handle_paste_image_path calls this when the user pastes a path to an image. The tests also exercise many edge cases. It calls normalize_windows_path for Windows-specific recognition and conversion, and uses URL and shell parsing libraries for the other formats.
 
 *Call graph*: calls 1 internal fn (normalize_windows_path); called by 12 (handle_paste_image_path, normalize_double_quoted_windows_path, normalize_file_url, normalize_file_url_windows, normalize_multiple_tokens_returns_none, normalize_shell_escaped_single_path, normalize_simple_quoted_path_fallback, normalize_single_quoted_unix_path, normalize_single_quoted_windows_path, normalize_unc_windows_path (+2 more)); 3 external calls (from, new, parse).
 
@@ -7135,11 +7155,11 @@ fn normalize_pasted_path(pasted: &str) -> Option<PathBuf>
 fn is_probably_wsl() -> bool
 ```
 
-**Purpose**: Heuristically detects whether the current Linux process is running under WSL. It combines `/proc/version` inspection with environment-variable fallbacks for nonstandard kernels.
+**Purpose**: This detects whether the app is likely running inside WSL, the Windows Subsystem for Linux. That matters because paths and clipboard access behave differently there than on normal Linux.
 
-**Data flow**: It first tries to read `/proc/version`; if successful, it lowercases the contents and returns `true` if they contain `microsoft` or `wsl`. If not, it checks whether `WSL_DISTRO_NAME` or `WSL_INTEROP` is present in the environment and returns that boolean.
+**Data flow**: It reads /proc/version and looks for WSL-related words. If that does not prove anything, it checks environment variables commonly set by WSL. It returns true when either check suggests WSL, and false otherwise.
 
-**Call relations**: This detector is used by both clipboard and path-normalization logic: `try_wsl_clipboard_fallback`, `normalize_windows_path`, and the clipboard-copy module's `is_wsl_session` all rely on it to enable WSL-specific behavior.
+**Call relations**: Several parts of the app call this to choose WSL-specific behavior. In this file, normalize_windows_path uses it before translating Windows paths, and try_wsl_clipboard_fallback uses it before trying the PowerShell clipboard bridge.
 
 *Call graph*: called by 11 (footer_props, paste_image_shortcut_prefers_ctrl_alt_v_under_wsl, is_wsl_session, normalize_windows_path, normalize_double_quoted_windows_path, normalize_file_url_windows, normalize_single_quoted_windows_path, normalize_unquoted_windows_path_with_spaces, normalize_windows_path_in_wsl, try_wsl_clipboard_fallback (+1 more)); 2 external calls (var_os, read_to_string).
 
@@ -7150,11 +7170,11 @@ fn is_probably_wsl() -> bool
 fn convert_windows_path_to_wsl(input: &str) -> Option<PathBuf>
 ```
 
-**Purpose**: Converts a Windows drive-letter path into the corresponding `/mnt/<drive>/...` WSL path. It intentionally refuses UNC paths because there is no simple direct mapping here.
+**Purpose**: This translates a Windows drive path into the matching WSL path. For example, it can turn C:\Users\Alice\file.png into /mnt/c/Users/Alice/file.png.
 
-**Data flow**: It returns `None` immediately for inputs starting with `\\`. Otherwise it extracts the first character as a drive letter, requires it to be ASCII alphabetic, requires `:` at index 1, and builds a `PathBuf` starting with `/mnt/<lowercased-drive>`. It then trims leading separators from the remainder, splits on both `\` and `/`, filters empty components, pushes each component onto the path, and returns `Some(result)`.
+**Data flow**: It receives a text path. If the path is a UNC network path or does not begin with a drive letter and colon, it returns None. Otherwise it builds a new PathBuf under /mnt/<drive>, splits the rest of the path on slashes or backslashes, appends each component, and returns the converted path.
 
-**Call relations**: This helper is called by `normalize_windows_path` and `try_wsl_clipboard_fallback` whenever a Windows path needs to be mapped into the Linux filesystem view under WSL.
+**Call relations**: try_wsl_clipboard_fallback uses this after PowerShell reports where it saved a clipboard image. normalize_windows_path also uses it when a pasted Windows path appears while running under WSL.
 
 *Call graph*: called by 6 (normalize_windows_path, normalize_double_quoted_windows_path, normalize_file_url_windows, normalize_single_quoted_windows_path, normalize_unquoted_windows_path_with_spaces, try_wsl_clipboard_fallback); 2 external calls (from, format!).
 
@@ -7165,11 +7185,11 @@ fn convert_windows_path_to_wsl(input: &str) -> Option<PathBuf>
 fn normalize_windows_path(input: &str) -> Option<PathBuf>
 ```
 
-**Purpose**: Recognizes Windows drive-letter and UNC paths and returns them as `PathBuf`s, optionally converting drive-letter paths into WSL mount paths when running under WSL. It exists to avoid misparsing backslashes as shell escapes.
+**Purpose**: This recognizes Windows-style paths and optionally adapts them for WSL. It protects paths like C:\Users\Alice\file.png from being misread as shell-escaped Unix text.
 
-**Data flow**: It inspects the input to determine whether it matches a drive path like `C:\` or `C:/` or a UNC path beginning with `\\`. If neither pattern matches, it returns `None`. On Linux, if `is_probably_wsl()` is true and `convert_windows_path_to_wsl(input)` succeeds, it returns the converted path; otherwise it returns `Some(PathBuf::from(input))` unchanged.
+**Data flow**: It receives a text path. It checks whether it looks like a drive-letter path or a UNC network path. If not, it returns None. On Linux under WSL, it tries to convert drive-letter paths into /mnt/<drive> form. Otherwise it returns the original path as a PathBuf.
 
-**Call relations**: This helper is called by `normalize_pasted_path` before and after shell tokenization. It centralizes Windows-path recognition and the optional WSL conversion policy.
+**Call relations**: normalize_pasted_path calls this before and after shell-style parsing. It calls is_probably_wsl and convert_windows_path_to_wsl only when WSL conversion might be needed.
 
 *Call graph*: calls 2 internal fn (convert_windows_path_to_wsl, is_probably_wsl); called by 1 (normalize_pasted_path); 1 external calls (from).
 
@@ -7180,11 +7200,11 @@ fn normalize_windows_path(input: &str) -> Option<PathBuf>
 fn pasted_image_format(path: &Path) -> EncodedImageFormat
 ```
 
-**Purpose**: Infers a coarse encoded image format from a file path's extension. It is used for UI metadata when a pasted image path already exists on disk.
+**Purpose**: This guesses an image format from a file path extension. It is a lightweight way to label pasted image paths as PNG, JPEG, or an unknown image type.
 
-**Data flow**: It reads `path.extension()`, converts it to lowercase text when possible, and returns `EncodedImageFormat::Png` for `png`, `EncodedImageFormat::Jpeg` for `jpg` or `jpeg`, and `EncodedImageFormat::Other` otherwise.
+**Data flow**: It receives a filesystem path, reads its extension, lowercases it, and compares it with known image extensions. It returns Png for .png, Jpeg for .jpg or .jpeg, and Other for anything else or no extension.
 
-**Call relations**: This helper is called by paste-handling code that accepts image file paths rather than clipboard image bytes. It is also covered by tests for Unix and Windows-style paths.
+**Call relations**: handle_paste_image_path calls this after a pasted path has been normalized. It gives the paste flow a simple format label without opening or decoding the image file.
 
 *Call graph*: called by 1 (handle_paste_image_path); 1 external calls (extension).
 
@@ -7195,11 +7215,11 @@ fn pasted_image_format(path: &Path) -> EncodedImageFormat
 fn collapses_whitespace()
 ```
 
-**Purpose**: Tests that pasted search queries collapse mixed whitespace into single spaces. It verifies the normalization contract for search input.
+**Purpose**: This test proves that pasted search text with spaces, tabs, and newlines becomes one clean query line.
 
-**Data flow**: It calls `normalize_pasted_search_query` with a string containing spaces, tabs, and newlines and asserts that the result is `Some("alpha beta gamma")`.
+**Data flow**: It feeds a messy string into normalize_pasted_search_query and checks that the result is “alpha beta gamma”. The test passes only if extra whitespace is removed and word order is kept.
 
-**Call relations**: This test directly exercises `normalize_pasted_search_query`.
+**Call relations**: The test runner calls this during tests. It protects the behavior used by handle_paste when pasted text is treated as a search query.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -7210,11 +7230,11 @@ fn collapses_whitespace()
 fn normalize_file_url()
 ```
 
-**Purpose**: Tests that a Unix `file://` URL is converted into the corresponding local path. It validates the URL parsing branch of path normalization.
+**Purpose**: This test checks that a Unix-style file:// URL is converted into a normal filesystem path.
 
-**Data flow**: It passes `file:///tmp/example.png` to `normalize_pasted_path`, unwraps the result, and asserts equality with `PathBuf::from("/tmp/example.png")`.
+**Data flow**: It gives normalize_pasted_path the text file:///tmp/example.png. It expects the returned path to be /tmp/example.png.
 
-**Call relations**: This test covers the early file-URL branch in `normalize_pasted_path`.
+**Call relations**: The test runner calls this on non-Windows systems. It verifies the URL branch inside normalize_pasted_path.
 
 *Call graph*: calls 1 internal fn (normalize_pasted_path); 1 external calls (assert_eq!).
 
@@ -7225,11 +7245,11 @@ fn normalize_file_url()
 fn normalize_file_url_windows()
 ```
 
-**Purpose**: Tests normalization of a Windows drive path input, including optional conversion to a WSL mount path when running under WSL. It verifies that raw Windows paths are accepted without shell parsing.
+**Purpose**: This test checks that a Windows drive path is accepted as a single pasted path. On WSL, it also checks that the path can be converted into /mnt/<drive> form.
 
-**Data flow**: It calls `normalize_pasted_path` on `C:\Temp\example.png`, computes the expected path as either `convert_windows_path_to_wsl(input)` under WSL or the original `PathBuf` otherwise, and asserts equality.
+**Data flow**: It sends C:\Temp\example.png into normalize_pasted_path. It builds the expected result based on whether the test is running under WSL, then compares the actual path with that expectation.
 
-**Call relations**: This test exercises `normalize_windows_path` through `normalize_pasted_path` and also validates the WSL conversion branch when applicable.
+**Call relations**: The test runner calls this to protect Windows-path recognition. It exercises normalize_pasted_path and, on Linux, the WSL detection and path conversion helpers.
 
 *Call graph*: calls 3 internal fn (convert_windows_path_to_wsl, is_probably_wsl, normalize_pasted_path); 2 external calls (from, assert_eq!).
 
@@ -7240,11 +7260,11 @@ fn normalize_file_url_windows()
 fn normalize_shell_escaped_single_path()
 ```
 
-**Purpose**: Tests that a shell-escaped Unix path containing spaces is unescaped into a single `PathBuf`. It validates the `shlex` single-token branch.
+**Purpose**: This test checks that a Unix path with a shell-escaped space becomes a normal path with a real space.
 
-**Data flow**: It passes `/home/user/My\ File.png` to `normalize_pasted_path`, unwraps the result, and asserts equality with `/home/user/My File.png`.
+**Data flow**: It passes /home/user/My\ File.png into normalize_pasted_path and expects /home/user/My File.png back.
 
-**Call relations**: This test covers the shell-tokenization fallback path in `normalize_pasted_path`.
+**Call relations**: The test runner calls this to verify the shell-style unescaping branch of normalize_pasted_path.
 
 *Call graph*: calls 1 internal fn (normalize_pasted_path); 1 external calls (assert_eq!).
 
@@ -7255,11 +7275,11 @@ fn normalize_shell_escaped_single_path()
 fn normalize_simple_quoted_path_fallback()
 ```
 
-**Purpose**: Tests that a simply double-quoted Unix path is accepted after trimming quotes. It validates the initial quote-stripping logic.
+**Purpose**: This test checks that a double-quoted path is accepted even when it contains spaces.
 
-**Data flow**: It calls `normalize_pasted_path` with `"/home/user/My File.png"` and asserts the resulting `PathBuf` equals `/home/user/My File.png`.
+**Data flow**: It passes a quoted /home/user/My File.png string into normalize_pasted_path. It expects the quotes to be removed and the inner path to be returned.
 
-**Call relations**: This test exercises the quote-stripping branch before URL and shell parsing.
+**Call relations**: The test runner calls this to protect the simple quote-stripping behavior in normalize_pasted_path.
 
 *Call graph*: calls 1 internal fn (normalize_pasted_path); 1 external calls (assert_eq!).
 
@@ -7270,11 +7290,11 @@ fn normalize_simple_quoted_path_fallback()
 fn normalize_single_quoted_unix_path()
 ```
 
-**Purpose**: Tests that a single-quoted Unix path is normalized correctly. It verifies that quoted single-path inputs survive normalization.
+**Purpose**: This test checks that a single-quoted Unix path is accepted and returned without the quotes.
 
-**Data flow**: It passes `'/home/user/My File.png'` to `normalize_pasted_path`, unwraps the result, and asserts equality with the unquoted path.
+**Data flow**: It gives normalize_pasted_path the text '/home/user/My File.png'. It expects a PathBuf for /home/user/My File.png.
 
-**Call relations**: This test covers another quote-handling case in `normalize_pasted_path`.
+**Call relations**: The test runner calls this to confirm that quoted pasted paths with spaces remain one path instead of being rejected as multiple words.
 
 *Call graph*: calls 1 internal fn (normalize_pasted_path); 1 external calls (assert_eq!).
 
@@ -7285,11 +7305,11 @@ fn normalize_single_quoted_unix_path()
 fn normalize_multiple_tokens_returns_none()
 ```
 
-**Purpose**: Tests that pasted text representing more than one shell token is rejected as ambiguous rather than treated as a path. It enforces the single-path invariant.
+**Purpose**: This test checks that two pasted paths are not mistaken for one path. That prevents ambiguous paste input from being silently interpreted incorrectly.
 
-**Data flow**: It passes `/home/user/a\ b.png /home/user/c.png` to `normalize_pasted_path` and asserts that the result is `None`.
+**Data flow**: It passes text that shell-splits into two paths. It expects normalize_pasted_path to return None.
 
-**Call relations**: This test targets the `parts.len() != 1` rejection branch in `normalize_pasted_path`.
+**Call relations**: The test runner calls this to protect the “single path only” rule in normalize_pasted_path.
 
 *Call graph*: calls 1 internal fn (normalize_pasted_path); 1 external calls (assert!).
 
@@ -7300,11 +7320,11 @@ fn normalize_multiple_tokens_returns_none()
 fn pasted_image_format_png_jpeg_unknown()
 ```
 
-**Purpose**: Tests extension-based image format inference for PNG, JPEG, missing extension, and unknown extension cases. It verifies case-insensitive matching.
+**Purpose**: This test checks format guessing for common image extensions. It makes sure PNG and JPEG are recognized and unknown or missing extensions stay generic.
 
-**Data flow**: It calls `pasted_image_format` on several `Path` values and asserts the expected `EncodedImageFormat` for each.
+**Data flow**: It passes several paths into pasted_image_format and compares each returned enum value with the expected format. The test includes uppercase extensions to confirm matching is case-insensitive.
 
-**Call relations**: This test directly exercises `pasted_image_format`.
+**Call relations**: The test runner calls this to protect pasted_image_format, which is used when a pasted path points to an image file.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -7315,11 +7335,11 @@ fn pasted_image_format_png_jpeg_unknown()
 fn normalize_single_quoted_windows_path()
 ```
 
-**Purpose**: Tests that a single-quoted Windows path is accepted and optionally converted under WSL. It validates quote stripping plus Windows-path recognition.
+**Purpose**: This test checks that a single-quoted Windows path is still recognized as a Windows path after quotes are removed.
 
-**Data flow**: It passes a single-quoted Windows path to `normalize_pasted_path`, computes the expected result as either a WSL-converted path or the original Windows path, and asserts equality.
+**Data flow**: It passes a quoted Windows path into normalize_pasted_path. It computes the expected result, converting to WSL form when appropriate, and checks that the returned path matches.
 
-**Call relations**: This test covers the interaction between quote stripping and `normalize_windows_path`.
+**Call relations**: The test runner calls this to cover the interaction between quote removal, Windows path recognition, and optional WSL conversion.
 
 *Call graph*: calls 3 internal fn (convert_windows_path_to_wsl, is_probably_wsl, normalize_pasted_path); 2 external calls (from, assert_eq!).
 
@@ -7330,11 +7350,11 @@ fn normalize_single_quoted_windows_path()
 fn normalize_double_quoted_windows_path()
 ```
 
-**Purpose**: Tests that a double-quoted Windows path is accepted and optionally converted under WSL. It mirrors the previous test for double quotes.
+**Purpose**: This test checks that a double-quoted Windows path is accepted and normalized correctly.
 
-**Data flow**: It calls `normalize_pasted_path` with a double-quoted Windows path, computes the expected path using `is_probably_wsl` and `convert_windows_path_to_wsl` when relevant, and asserts equality.
+**Data flow**: It sends a double-quoted Windows path into normalize_pasted_path. It expects either the original Windows path or, under WSL, the converted /mnt/<drive> path.
 
-**Call relations**: This test exercises the same normalization path as the single-quoted Windows case but with double-quote stripping.
+**Call relations**: The test runner calls this to ensure normalize_pasted_path treats quoted Windows paths the same way as unquoted ones after removing the quotes.
 
 *Call graph*: calls 3 internal fn (convert_windows_path_to_wsl, is_probably_wsl, normalize_pasted_path); 2 external calls (from, assert_eq!).
 
@@ -7345,11 +7365,11 @@ fn normalize_double_quoted_windows_path()
 fn normalize_unquoted_windows_path_with_spaces()
 ```
 
-**Purpose**: Tests that an unquoted Windows path containing spaces is still recognized as a single path. It validates the deliberate bypass of POSIX `shlex` for raw Windows paths.
+**Purpose**: This test checks that an unquoted Windows path containing spaces is still accepted as one path. This is important because Windows paths often contain folder names like “My Pictures”.
 
-**Data flow**: It passes an unquoted Windows path with spaces to `normalize_pasted_path`, computes the expected WSL-converted or unchanged path, and asserts equality.
+**Data flow**: It passes an unquoted Windows path with spaces into normalize_pasted_path. It expects the whole string to remain one path, with WSL conversion applied only when running under WSL.
 
-**Call relations**: This test specifically validates why `normalize_pasted_path` checks `normalize_windows_path` before shell tokenization.
+**Call relations**: The test runner calls this to make sure Windows-path detection happens before shell-style splitting, which would otherwise treat spaces as separators.
 
 *Call graph*: calls 3 internal fn (convert_windows_path_to_wsl, is_probably_wsl, normalize_pasted_path); 2 external calls (from, assert_eq!).
 
@@ -7360,11 +7380,11 @@ fn normalize_unquoted_windows_path_with_spaces()
 fn normalize_unc_windows_path()
 ```
 
-**Purpose**: Tests that UNC paths are accepted as Windows paths and preserved as-is. It verifies the UNC recognition branch.
+**Purpose**: This test checks that a UNC network path, such as \\server\share\folder\file.jpg, is accepted.
 
-**Data flow**: It passes a UNC path string to `normalize_pasted_path`, unwraps the result, and asserts equality with the same UNC `PathBuf`.
+**Data flow**: It passes a UNC-style Windows network path into normalize_pasted_path and expects the same path back as a PathBuf.
 
-**Call relations**: This test covers the UNC branch in `normalize_windows_path`, which intentionally does not convert UNC paths to WSL paths.
+**Call relations**: The test runner calls this to verify the UNC branch inside normalize_windows_path, reached through normalize_pasted_path.
 
 *Call graph*: calls 1 internal fn (normalize_pasted_path); 1 external calls (assert_eq!).
 
@@ -7375,11 +7395,11 @@ fn normalize_unc_windows_path()
 fn pasted_image_format_with_windows_style_paths()
 ```
 
-**Purpose**: Tests image-format inference on Windows-style path strings. It ensures extension parsing works regardless of path separator style.
+**Purpose**: This test checks that image format guessing still works when the path text uses Windows-style backslashes.
 
-**Data flow**: It calls `pasted_image_format` on Windows-style `Path` values ending in `.PNG`, `.jpeg`, and no extension, then asserts the expected enum values.
+**Data flow**: It passes Windows-looking paths ending in .PNG, .jpeg, and no extension into pasted_image_format. It expects PNG, JPEG, and Other respectively.
 
-**Call relations**: This test extends `pasted_image_format` coverage to Windows-style paths.
+**Call relations**: The test runner calls this to protect extension-based format detection for paths pasted from Windows.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -7390,11 +7410,11 @@ fn pasted_image_format_with_windows_style_paths()
 fn normalize_windows_path_in_wsl()
 ```
 
-**Purpose**: Tests actual Windows-to-WSL path conversion on real WSL systems. It is skipped when not running under WSL.
+**Purpose**: This test checks the real WSL conversion behavior for Windows drive paths. It only performs the assertion when the test is actually running under WSL.
 
-**Data flow**: It first checks `is_probably_wsl()` and returns early if false. Otherwise it passes a Windows path to `normalize_pasted_path`, unwraps the result, and asserts equality with the expected `/mnt/c/...` path.
+**Data flow**: It first asks is_probably_wsl whether the environment is WSL. If not, it exits early. If yes, it passes a Windows path into normalize_pasted_path and expects the matching /mnt/c/... path.
 
-**Call relations**: This test directly validates the runtime WSL conversion branch in `normalize_windows_path`.
+**Call relations**: The test runner calls this on Linux builds. It ties together is_probably_wsl, normalize_pasted_path, normalize_windows_path, and convert_windows_path_to_wsl in the environment where that conversion matters.
 
 *Call graph*: calls 2 internal fn (is_probably_wsl, normalize_pasted_path); 1 external calls (assert_eq!).
 
@@ -7403,11 +7423,13 @@ fn normalize_windows_path_in_wsl()
 
 `orchestration` · `request handling`
 
-This file is the orchestration layer around the migration prompt and app-server APIs. It defines four public message constants for finished, no-items, remote-unavailable, and daemon-unavailable cases, plus the `ExternalAgentConfigMigrationFlowOutcome` enum used by callers to distinguish a started import from a no-op or cancellation.
+This file is the traffic controller for the `/import` experience in the text user interface. Its job is to safely start a migration from Claude Code configuration into Codex, without surprising the user or starting work in an unsupported situation.
 
-The main async function, `handle_external_agent_config_migration_prompt`, first enforces environment constraints in a strict order: remote workspaces are rejected, non-embedded app-server sessions are rejected, and an already-running import is rejected using the shared in-progress message constant. It then captures `config.cwd`, asks the app server to detect importable Claude Code configuration with `include_home: true` and the current working directory in `cwds`, and logs a warning plus returns a formatted error if detection fails.
+The flow begins by checking the current app-server connection. Import is only allowed for a local Codex session using the embedded app server. It is blocked in remote workspaces, when Codex is connected to a separate local daemon, or when another import is already running. These checks matter because the import needs access to local files and must not overlap with another import job.
 
-If no items are detected, it returns `NoItems`. Otherwise it initializes `selected_items` to all detected items and enters a loop that repeatedly shows `run_external_agent_config_migration_prompt`, passing any prior import error back into the UI. On `Proceed(items)`, it attempts `external_agent_config_import(items)`. Success returns `Started(...)` with a message built from the number of remaining unselected items; failure logs and stores `Import failed: ...` so the prompt reopens with inline feedback. On `Skip`, it returns `Cancelled`. The helper functions encapsulate the exact wording for the success message and the optional handoff text when some items remain for a later `/import` run.
+If import is allowed, the file asks the app server to detect Claude Code setup items. It looks both in the user’s home area and in the current working directory. If nothing is found, it reports that there is nothing to import.
+
+When items are found, it shows an interactive prompt in the TUI. The user can choose items and either proceed or cancel. If import fails, the same prompt is shown again with the error message, like a form that stays open after a failed submission. If import starts successfully, the file returns a message explaining that the work is happening in the background and, if needed, that more items can be reviewed later.
 
 #### Function details
 
@@ -7417,11 +7439,11 @@ If no items are detected, it returns `NoItems`. Otherwise it initializes `select
 fn external_agent_config_migration_success_message(remaining_item_count: usize) -> String
 ```
 
-**Purpose**: Builds the success text shown after an import starts, optionally appending guidance about items left for a later run. It keeps the base message stable while delegating pluralization and omission rules to a helper.
+**Purpose**: Builds the success text shown after an import has started. It also adds a note if there are still more detected items that were not included in this import.
 
-**Data flow**: It takes `remaining_item_count`, starts from a fixed base sentence, calls `remaining_items_handoff(remaining_item_count)`, and either concatenates the returned suffix with `format!` or returns the base sentence unchanged. It reads no external state and returns a `String`.
+**Data flow**: It receives the number of remaining items. It starts with a standard success sentence, asks `remaining_items_handoff` whether an extra follow-up sentence is needed, and returns either the plain success message or the success message plus that extra guidance.
 
-**Call relations**: This helper is called only from `handle_external_agent_config_migration_prompt` after a successful `external_agent_config_import`. It depends on `remaining_items_handoff` to decide whether there is any follow-up guidance to append.
+**Call relations**: This is called by `handle_external_agent_config_migration_prompt` after the app server accepts an import request. It delegates the wording about leftover items to `remaining_items_handoff` so the main success message stays simple.
 
 *Call graph*: calls 1 internal fn (remaining_items_handoff); called by 1 (handle_external_agent_config_migration_prompt); 1 external calls (format!).
 
@@ -7432,11 +7454,11 @@ fn external_agent_config_migration_success_message(remaining_item_count: usize) 
 fn remaining_items_handoff(remaining_item_count: usize) -> Option<String>
 ```
 
-**Purpose**: Formats the optional follow-up sentence describing how many importable items remain after the current selection. It handles the zero, singular, and plural cases explicitly.
+**Purpose**: Creates the small follow-up note that tells the user whether more importable items remain. It handles the wording carefully so zero, one, and many items read naturally.
 
-**Data flow**: It takes `remaining_item_count`, matches on the count, and returns `None` for zero, a fixed singular sentence for one, or a pluralized `format!` string for any larger count. It has no side effects and returns `Option<String>`.
+**Data flow**: It receives a count. If the count is zero, it returns nothing. If the count is one, it returns a sentence using singular wording. If the count is more than one, it returns a sentence with the exact number and plural wording.
 
-**Call relations**: This function is used only by `external_agent_config_migration_success_message` to keep count-specific wording separate from the base success text.
+**Call relations**: This helper is used only by `external_agent_config_migration_success_message`. It supplies the optional second sentence that tells the user to run `/import` again later if more items still need review.
 
 *Call graph*: called by 1 (external_agent_config_migration_success_message); 1 external calls (format!).
 
@@ -7451,24 +7473,24 @@ async fn handle_external_agent_config_migration_prompt(
 ) -> Result<ExternalAgentConfigMigrationFlowOutcome, String>
 ```
 
-**Purpose**: Runs the full import interaction: validates whether import is allowed, detects candidate items, shows the prompt, retries on import failure, and returns a flow outcome for the caller. It is the single driver for this feature from the TUI event layer.
+**Purpose**: Runs the complete Claude Code import flow from the TUI side. It decides whether import is allowed, asks the app server what can be imported, shows the user a selection prompt, and starts the import if the user chooses to proceed.
 
-**Data flow**: It receives mutable access to the `tui::Tui` and `AppServerSession`, plus immutable `Config`. It reads app-server state via `uses_remote_workspace`, `uses_embedded_app_server`, and `external_agent_config_import_in_progress`; reads `config.cwd`; calls `external_agent_config_detect` with `include_home: true` and the current cwd; then either returns an error string, `NoItems`, or enters a loop. Inside the loop it passes `detected_items`, current `selected_items`, and optional `error` text into `run_external_agent_config_migration_prompt`. On `Proceed(items)`, it writes `selected_items = items.clone()`, calls `external_agent_config_import(items)`, and on success returns `Started(success_message)`; on failure it logs and updates `error` so the next prompt render includes the failure. On `Skip`, it returns `Cancelled`.
+**Data flow**: It receives the TUI, the app-server session, and the current configuration. First it reads the app-server state to reject unsupported cases: remote workspace, non-embedded daemon mode, or an import already in progress. Then it reads the current working directory from the config and asks the app server to detect importable Claude Code setup items. If none are found, it returns `NoItems`. If items are found, it repeatedly shows a prompt with the detected items, the currently selected items, and any previous error. If the user cancels, it returns `Cancelled`. If the user proceeds, it asks the app server to start importing the chosen items. On success it returns `Started` with a user-facing message; on failure it records the error and shows the prompt again.
 
-**Call relations**: The TUI event handler invokes this async function when the user triggers the import command. It delegates UI interaction to `run_external_agent_config_migration_prompt`, delegates detection/import RPCs to `AppServerSession`, and uses `external_agent_config_migration_success_message` only after the import request has been accepted.
+**Call relations**: This function is called by `handle_event` when the user triggers the import action. It coordinates lower-level pieces: it asks `AppServerSession` about connection mode and import state, calls the app server to detect and import configuration, uses `run_external_agent_config_migration_prompt` to interact with the user, and uses `external_agent_config_migration_success_message` to prepare the final confirmation text.
 
 *Call graph*: calls 7 internal fn (external_agent_config_detect, external_agent_config_import, external_agent_config_import_in_progress, uses_embedded_app_server, uses_remote_workspace, run_external_agent_config_migration_prompt, external_agent_config_migration_success_message); called by 1 (handle_event); 4 external calls (format!, warn!, Started, vec!).
 
 
 ### `tui/src/theme_picker.rs`
 
-`domain_logic` · `interactive picker rendering`
+`orchestration` · `request handling, when the user opens the /theme picker`
 
-This file assembles the complete theme-picker experience for the TUI. It defines small preview-domain types (`PreviewDiffKind`, `PreviewRow`) plus two fixed preview datasets: a 4-line narrow diff and an 8-line wide diff. These samples are rendered by `render_preview`, which syntax-highlights the concatenated Rust snippet, computes line-number width, maps preview row kinds into `DiffLineType`, wraps each row using the same diff-render helpers as real diffs, and paints only the first wrapped line into the provided `Buffer`. Wide mode vertically centers the preview and applies a two-column left inset; narrow mode renders flush-left below the list.
+This file is the theme chooser for the terminal UI. Without it, users could not browse available syntax themes from inside the app, see what a theme looks like before choosing it, or safely back out without changing anything.
 
-The picker subtitle is width-sensitive. `subtitle_available_width` computes the usable list width based on popup sizing and whether side-by-side layout fits. `theme_picker_subtitle` prefers a concrete message pointing users to `{CODEX_HOME}/themes`, but only when the formatted path begins with `~` and the full sentence fits the available width; otherwise it falls back to a generic preview instruction string.
+The file does three main jobs. First, it prepares the list of themes: built-in themes plus custom `.tmTheme` files found in the user’s Codex themes folder. Second, it builds a small preview of Rust code shown as a diff, meaning it includes unchanged lines, added lines, and removed lines. That preview uses the same syntax highlighting and diff styling as real code output, so the user sees a realistic sample. Third, it wires the dialog behavior: moving the cursor temporarily applies the highlighted theme, confirming sends an app event to save the choice, and canceling restores the theme that was active before the picker opened.
 
-`build_theme_picker_params` is the orchestration point. It snapshots the current syntax theme for cancel-restore, lists available bundled and custom themes, resolves the effective current theme name by honoring `current_name` only if it is actually available, and builds `SelectionItem`s whose actions send `AppEvent::SyntaxThemeSelected`. It separately derives preview theme names from the final item list so preview indexing stays aligned even if item construction changes. The `on_selection_changed` callback resolves and applies the highlighted theme, then emits `SyntaxThemePreviewed`; `on_cancel` restores the original theme and emits the same event. The returned `SelectionViewParams` enables search, side content, stacked fallback preview, and background preservation.
+There are two preview layouts. On wider terminals, a larger preview sits beside the theme list. On narrower terminals, a compact four-line preview is stacked below the list. This is like a clothing store mirror that changes size depending on the room, but still lets you see the outfit before buying it.
 
 #### Function details
 
@@ -7478,11 +7500,11 @@ The picker subtitle is width-sensitive. `subtitle_available_width` computes the 
 fn preview_diff_line_type(kind: PreviewDiffKind) -> DiffLineType
 ```
 
-**Purpose**: Maps the local preview-specific diff kind enum into the shared diff renderer’s `DiffLineType`. This keeps preview sample rows compatible with the normal diff styling pipeline.
+**Purpose**: Converts the preview’s simple idea of a line type — unchanged, added, or removed — into the diff line type used by the normal diff renderer. This lets the fake preview snippet look like real added and deleted code.
 
-**Data flow**: Takes `kind: PreviewDiffKind`, matches `Context`, `Added`, or `Removed`, and returns `DiffLineType::Context`, `Insert`, or `Delete` respectively.
+**Data flow**: It receives a preview line kind. It matches that kind to the renderer’s diff category, then returns the matching value: context for unchanged text, insert for added text, or delete for removed text.
 
-**Call relations**: Used only by `render_preview` while converting static preview rows into renderable diff lines.
+**Call relations**: The preview renderer calls this for each preview row before drawing it, so every sample line is styled the same way a real diff line would be.
 
 *Call graph*: called by 1 (render_preview).
 
@@ -7493,11 +7515,11 @@ fn preview_diff_line_type(kind: PreviewDiffKind) -> DiffLineType
 fn centered_offset(available: u16, content: u16, min_frame: u16) -> u16
 ```
 
-**Purpose**: Computes a vertical offset that centers content within available space while optionally preserving a minimum frame padding on top and bottom. It avoids negative math by using saturating arithmetic.
+**Purpose**: Calculates how much empty space should appear before vertically centered preview content. It keeps the wide preview from sticking to the top when there is room to make it look balanced.
 
-**Data flow**: Consumes `available`, `content`, and `min_frame`, computes free space, decides whether both top and bottom frame padding can be honored, and returns the top offset as `u16`.
+**Data flow**: It receives the available height, the content height, and a minimum frame padding. It works out the leftover space, reserves a small frame if possible, and returns the top offset to use before drawing.
 
-**Call relations**: Called by `render_preview` only when wide preview mode requests vertical centering.
+**Call relations**: The shared preview renderer uses this only when drawing the wide preview, where the code sample should be centered in the side panel.
 
 *Call graph*: called by 1 (render_preview).
 
@@ -7514,11 +7536,11 @@ fn render_preview(
 )
 ```
 
-**Purpose**: Renders a fixed diff-style code preview into a Ratatui buffer, optionally vertically centered and horizontally inset. It reuses the real syntax-highlighting and diff-wrapping pipeline so theme previews look like actual code blocks.
+**Purpose**: Draws the theme preview snippet into the terminal buffer. It shows line numbers, diff markers, syntax colors, and diff styling so the sample resembles real code output.
 
-**Data flow**: Takes a target `Rect`, mutable `Buffer`, a slice of `PreviewRow`, and layout flags. It early-returns on zero-sized areas or empty row lists, joins preview code into one Rust snippet, syntax-highlights it, computes line-number width from the maximum preview line number, derives top/left padding, then iterates visible rows. For each row it maps kind via `preview_diff_line_type`, wraps/stylizes the line using either syntax-aware or plain diff helpers, selects the first wrapped `Line`, and renders it into the buffer.
+**Data flow**: It receives a screen area, a drawing buffer, a list of preview rows, and layout choices such as whether to center vertically and how far to inset from the left. It turns the sample code into syntax-highlighted spans, computes line number width, styles each row as added, removed, or unchanged, and writes the first rendered line for each preview row into the buffer.
 
-**Call relations**: This is the shared renderer behind both `ThemePreviewWideRenderable::render` and `ThemePreviewNarrowRenderable::render`. It delegates styling and wrapping to the diff/highlight subsystems so preview visuals stay consistent with the rest of the TUI.
+**Call relations**: Both preview widgets call this function: the wide widget passes the larger sample and asks for vertical centering, while the narrow widget passes the compact sample and draws from the top. It relies on the diff rendering helpers and syntax highlighter so the preview matches the rest of the app.
 
 *Call graph*: calls 7 internal fn (current_diff_render_style_context, line_number_width, push_wrapped_diff_line_with_style_context, push_wrapped_diff_line_with_syntax_and_style_context, highlight_code_to_styled_spans, centered_offset, preview_diff_line_type); called by 2 (render, render); 4 external calls (new, is_empty, iter, len).
 
@@ -7529,11 +7551,11 @@ fn render_preview(
 fn desired_height(&self, _width: u16) -> u16
 ```
 
-**Purpose**: Advertises that the wide preview can consume all available vertical space. This allows the side panel to fill its container and let the preview center itself vertically.
+**Purpose**: Tells the layout system that the wide preview is happy to use as much vertical space as it can get. This helps it fill the side panel beside the theme list.
 
-**Data flow**: Ignores the provided width and returns `u16::MAX`.
+**Data flow**: It receives a width value but does not need it. It returns the largest possible height request, signaling that the preview can occupy the full available height.
 
-**Call relations**: Used by layout code through the `Renderable` trait when sizing side content for the theme picker.
+**Call relations**: The selection dialog’s layout code asks this renderable how tall it wants to be when deciding how to place the side-by-side preview.
 
 
 ##### `ThemePreviewWideRenderable::render`  (lines 242–250)
@@ -7542,11 +7564,11 @@ fn desired_height(&self, _width: u16) -> u16
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the wide side-panel preview using the larger sample diff, vertical centering, and a two-column inset.
+**Purpose**: Draws the wide, side-panel version of the theme preview. It uses the longer code sample and centers it vertically with a small left inset.
 
-**Data flow**: Receives `area` and mutable `buf`, then calls `render_preview(area, buf, &WIDE_PREVIEW_ROWS, true, WIDE_PREVIEW_LEFT_INSET)`.
+**Data flow**: It receives the drawing area and terminal buffer. It passes those, along with the wide preview rows and layout settings, into the shared preview drawing function, which writes the preview into the buffer.
 
-**Call relations**: This is the concrete side-content renderer installed by `build_theme_picker_params` for side-by-side layouts.
+**Call relations**: The selection dialog calls this when the terminal is wide enough for a side-by-side layout. It delegates the actual drawing to `render_preview` so wide and narrow previews stay consistent.
 
 *Call graph*: calls 1 internal fn (render_preview).
 
@@ -7557,11 +7579,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn desired_height(&self, _width: u16) -> u16
 ```
 
-**Purpose**: Reports the exact height needed for the compact stacked preview. The height equals the number of fixed preview rows.
+**Purpose**: Tells the layout system that the narrow preview needs exactly enough height for its compact four-line sample. This keeps it small when stacked under the theme list.
 
-**Data flow**: Ignores width and returns `NARROW_PREVIEW_ROWS.len() as u16`.
+**Data flow**: It receives a width value but does not need it. It returns the number of rows in the narrow preview sample.
 
-**Call relations**: Used by layout code through the `Renderable` trait when stacked preview mode is active.
+**Call relations**: The selection dialog’s layout code uses this when the terminal is too narrow for a side panel and must stack the preview below the list.
 
 
 ##### `ThemePreviewNarrowRenderable::render`  (lines 258–266)
@@ -7570,11 +7592,11 @@ fn desired_height(&self, _width: u16) -> u16
 fn render(&self, area: Rect, buf: &mut Buffer)
 ```
 
-**Purpose**: Renders the compact stacked preview using the four-line sample diff without centering or inset.
+**Purpose**: Draws the compact preview used on narrower terminals. It shows a short diff with both an added and a removed line so users still see the important colors.
 
-**Data flow**: Receives `area` and mutable `buf`, then calls `render_preview(area, buf, &NARROW_PREVIEW_ROWS, false, 0)`.
+**Data flow**: It receives the drawing area and terminal buffer. It passes those, along with the narrow preview rows and non-centered layout settings, into the shared preview renderer, which writes the sample into the buffer.
 
-**Call relations**: Installed by `build_theme_picker_params` as `stacked_side_content` for narrow terminals.
+**Call relations**: The selection dialog calls this as the fallback preview when side-by-side layout does not fit. Like the wide renderer, it hands the actual drawing to `render_preview`.
 
 *Call graph*: calls 1 internal fn (render_preview).
 
@@ -7585,11 +7607,11 @@ fn render(&self, area: Rect, buf: &mut Buffer)
 fn subtitle_available_width(terminal_width: Option<u16>) -> usize
 ```
 
-**Purpose**: Computes how much horizontal space the picker subtitle can safely occupy, accounting for popup width and whether side-by-side preview layout will split the content area.
+**Purpose**: Figures out how much horizontal room the theme picker subtitle can safely use. This prevents long helper text from overflowing or crowding the list.
 
-**Data flow**: Takes `terminal_width: Option<u16>`, defaults to 80 when absent, computes popup content width, then either returns the list-pane width from `side_by_side_layout_widths` or the full popup content width as `usize`.
+**Data flow**: It receives the terminal width, or assumes a default if none is known. It calculates the popup’s content width, then checks whether the popup will use a side-by-side layout; if so, it returns the list column width, otherwise it returns the full content width.
 
-**Call relations**: Called by `theme_picker_subtitle` to decide whether the path-specific subtitle sentence will fit.
+**Call relations**: The subtitle builder calls this before deciding whether a path-based subtitle will fit. It relies on the same popup layout helpers used by the actual picker.
 
 *Call graph*: called by 1 (theme_picker_subtitle); 2 external calls (popup_content_width, side_by_side_layout_widths).
 
@@ -7600,11 +7622,11 @@ fn subtitle_available_width(terminal_width: Option<u16>) -> usize
 fn theme_picker_subtitle(codex_home: Option<&Path>, terminal_width: Option<u16>) -> String
 ```
 
-**Purpose**: Builds the subtitle shown under the theme picker title, preferring a concrete `~/.codex/themes` guidance sentence when it fits and falling back to a generic live-preview hint otherwise.
+**Purpose**: Creates the small explanatory line shown under the theme picker title. When possible, it tells users where to put custom `.tmTheme` files; otherwise it shows simple preview instructions.
 
-**Data flow**: Takes optional `codex_home` and `terminal_width`, derives `themes_dir = codex_home.join("themes")`, formats it with `format_directory_display`, computes available width via `subtitle_available_width`, and if the formatted path starts with `~` and the full sentence fits by display width, returns that sentence. Otherwise it returns `PREVIEW_FALLBACK_SUBTITLE.to_string()`.
+**Data flow**: It receives the Codex home directory and terminal width. It builds the expected `themes` directory path, formats it for display, checks whether the text fits in the available subtitle space, and returns either the custom-theme directory message or a fallback message about moving up and down to preview themes.
 
-**Call relations**: Used by `build_theme_picker_params` when assembling the picker view model. Several tests call it directly to verify width-sensitive and tilde-path fallback behavior.
+**Call relations**: The main picker builder uses this when filling in the dialog parameters. Several tests call it directly to make sure it chooses readable text for different terminal widths and directory paths.
 
 *Call graph*: calls 1 internal fn (subtitle_available_width); called by 5 (build_theme_picker_params, subtitle_falls_back_for_94_column_terminal_side_by_side_layout, subtitle_falls_back_to_preview_instructions_without_tilde_path, subtitle_falls_back_when_tilde_path_subtitle_is_too_wide, subtitle_uses_tilde_path_when_codex_home_under_home_directory); 2 external calls (width, format!).
 
@@ -7619,11 +7641,11 @@ fn build_theme_picker_params(
 ) -> SelectionViewParams
 ```
 
-**Purpose**: Constructs the full `SelectionViewParams` for the `/theme` picker, including items, initial selection, live preview callback, cancel-restore callback, subtitle, search settings, and responsive preview renderables.
+**Purpose**: Builds the complete set of settings for the `/theme` selection dialog. This includes the theme list, search behavior, preview widgets, live preview callback, cancel restore callback, and confirmation action.
 
-**Data flow**: Consumes `current_name`, `codex_home`, and `terminal_width`. It snapshots `highlight::current_syntax_theme()`, loads theme entries with `highlight::list_available_themes`, resolves an effective current theme name by validating `current_name` against available entries or falling back to `highlight::configured_theme_name()`, then maps entries into `SelectionItem`s with display names, `is_current`, canonical `search_value`, and actions that send `AppEvent::SyntaxThemeSelected`. It derives `preview_theme_names` from the final items, builds `on_selection_changed` to resolve and apply the selected theme then send `SyntaxThemePreviewed`, builds `on_cancel` to restore the original theme and send the same event, and returns a populated `SelectionViewParams` with title, subtitle, footer hint, search config, side content, stacked fallback, and background-preservation flags.
+**Data flow**: It receives the currently configured theme name, the Codex home directory, and terminal width. It records the current active theme, loads available themes, decides which entry should start selected, turns each theme into a selectable item, attaches an action that sends a theme-selected event, prepares live-preview data, and returns a `SelectionViewParams` object used by the bottom-pane selection UI.
 
-**Call relations**: This function is called when the `/theme` command opens the picker and by tests validating picker configuration. It orchestrates helpers in this file plus the highlight subsystem and app-event channel, but does not itself persist config; instead item actions emit `AppEvent::SyntaxThemeSelected` for downstream handling.
+**Call relations**: The app calls this when opening the theme picker. The returned callbacks later run as the user moves through the list or cancels: selection changes temporarily set the syntax theme and notify the app to redraw, while cancel restores the saved original theme.
 
 *Call graph*: calls 5 internal fn (standard_popup_hint_line, configured_theme_name, current_syntax_theme, list_available_themes, theme_picker_subtitle); called by 6 (theme_picker_enables_side_content_background_preservation, theme_picker_subtitle_uses_fallback_text_in_94x35_terminal, open_theme_picker, theme_picker_items_include_search_values_for_preview_mapping, theme_picker_uses_half_width_with_stacked_fallback_preview, unavailable_configured_theme_falls_back_to_configured_or_default_selection); 2 external calls (new, default).
 
@@ -7634,11 +7656,11 @@ fn build_theme_picker_params(
 fn render_buffer(renderable: &dyn Renderable, width: u16, height: u16) -> Buffer
 ```
 
-**Purpose**: Renders any `Renderable` into a fresh Ratatui `Buffer` for inspection in tests.
+**Purpose**: Test helper that renders a preview widget into an in-memory terminal buffer. It lets tests inspect what would have appeared on screen without opening a real terminal.
 
-**Data flow**: Takes a `&dyn Renderable`, width, and height; creates a `Rect`, allocates `Buffer::empty(area)`, calls `renderable.render(area, &mut buf)`, and returns the filled buffer.
+**Data flow**: It receives a renderable preview object plus a width and height. It creates an empty buffer of that size, asks the renderable to draw into it, and returns the filled buffer.
 
-**Call relations**: Used by preview-rendering tests as the lowest-level helper for inspecting symbols and styles.
+**Call relations**: Preview rendering tests call this when they need to check either the visible characters or the styling stored in the buffer.
 
 *Call graph*: 3 external calls (empty, new, render).
 
@@ -7649,11 +7671,11 @@ fn render_buffer(renderable: &dyn Renderable, width: u16, height: u16) -> Buffer
 fn render_lines(renderable: &dyn Renderable, width: u16, height: u16) -> Vec<String>
 ```
 
-**Purpose**: Converts a rendered buffer into a vector of plain text lines for easier assertions in tests.
+**Purpose**: Test helper that converts a rendered buffer into plain strings, one per terminal row. This makes it easy for tests to check line numbers, diff markers, and spacing.
 
-**Data flow**: Calls `render_buffer`, then iterates each row and column, reading `buf[(col, row)].symbol()`, substituting spaces for empty symbols, concatenating each row into a `String`, and returning `Vec<String>`.
+**Data flow**: It receives a renderable preview object and dimensions. It renders the object into a buffer, walks through each cell, turns empty cells into spaces, and returns the resulting list of text lines.
 
-**Call relations**: Used by multiple preview tests that assert line numbers, markers, padding, and textual layout.
+**Call relations**: Most preview layout tests call this to make assertions about what the wide and narrow previews display.
 
 *Call graph*: 1 external calls (render_buffer).
 
@@ -7664,11 +7686,11 @@ fn render_lines(renderable: &dyn Renderable, width: u16, height: u16) -> Vec<Str
 fn first_non_space_style_after_marker(buf: &Buffer, row: u16, width: u16) -> Option<Modifier>
 ```
 
-**Purpose**: Finds the first styled code cell after a diff marker on a given row and returns its modifier flags. It is used to verify deleted-line dimming.
+**Purpose**: Finds the text style applied to the first visible code character after a diff marker. Tests use it to confirm that deleted preview code is dimmed like real deleted code.
 
-**Data flow**: Scans columns in the provided `Buffer` row to find a `-` or `+` marker, then scans subsequent columns until a non-space symbol appears and returns that cell’s `style().add_modifier` as `Option<Modifier>`.
+**Data flow**: It receives a rendered buffer, a row number, and a width. It finds the `-` or `+` marker on that row, scans to the next non-space cell, and returns that cell’s style modifier if found.
 
-**Call relations**: Used by the deleted-preview styling test to inspect rendered style metadata rather than just text.
+**Call relations**: The deleted-line styling test uses this helper after rendering the narrow preview, so it can inspect styling rather than only visible text.
 
 
 ##### `tests::preview_line_number`  (lines 454–465)
@@ -7677,11 +7699,11 @@ fn first_non_space_style_after_marker(buf: &Buffer, row: u16, width: u16) -> Opt
 fn preview_line_number(line: &str) -> Option<usize>
 ```
 
-**Purpose**: Parses a rendered preview line to extract its leading line number if present.
+**Purpose**: Extracts the line number from a rendered preview line. This helps tests verify that preview rows appear in the expected order.
 
-**Data flow**: Trims leading spaces, counts leading ASCII digits, verifies they are followed by a space, parses the digit slice as `usize`, and returns `Option<usize>`.
+**Data flow**: It receives one rendered line of text. It trims leading spaces, reads the starting digits, checks that they are followed by a space, and returns the parsed number if the format matches.
 
-**Call relations**: Used by preview layout tests to identify which rendered rows correspond to preview content.
+**Call relations**: The preview layout tests use this to identify which rendered rows are actual preview lines and to confirm their line numbers.
 
 
 ##### `tests::preview_line_marker`  (lines 467–478)
@@ -7690,11 +7712,11 @@ fn preview_line_number(line: &str) -> Option<usize>
 fn preview_line_marker(line: &str) -> Option<char>
 ```
 
-**Purpose**: Parses a rendered preview line to extract the diff marker character following the line number.
+**Purpose**: Extracts the diff marker character from a rendered preview line. This lets tests count added and removed lines in the sample.
 
-**Data flow**: Trims leading spaces, counts leading ASCII digits, verifies a separating space, then returns the next character as `Option<char>`.
+**Data flow**: It receives one rendered line of text. It trims leading spaces, skips the line number and following space, then returns the next character if the line matches the expected preview format.
 
-**Call relations**: Used by preview tests to count and locate added and removed lines.
+**Call relations**: The wide and narrow preview tests use this helper to confirm that the preview includes `+` added lines and `-` removed lines.
 
 
 ##### `tests::theme_picker_uses_half_width_with_stacked_fallback_preview`  (lines 481–488)
@@ -7703,11 +7725,11 @@ fn preview_line_marker(line: &str) -> Option<char>
 fn theme_picker_uses_half_width_with_stacked_fallback_preview()
 ```
 
-**Purpose**: Verifies that the picker is configured for half-width side content with a stacked fallback preview.
+**Purpose**: Checks that the theme picker asks for a half-width side preview and also provides a stacked fallback preview. This protects the responsive layout behavior.
 
-**Data flow**: Builds picker params with default-ish inputs and asserts `side_content_width`, `side_content_min_width`, and presence of `stacked_side_content`.
+**Data flow**: It builds default theme picker parameters, then checks the side-content width setting, minimum preview width, and presence of stacked preview content.
 
-**Call relations**: This test validates the structural layout choices made by `build_theme_picker_params`.
+**Call relations**: This test calls the main picker builder and verifies that the layout choices needed by the bottom-pane UI are present.
 
 *Call graph*: calls 1 internal fn (build_theme_picker_params); 2 external calls (assert!, assert_eq!).
 
@@ -7718,11 +7740,11 @@ fn theme_picker_uses_half_width_with_stacked_fallback_preview()
 fn theme_picker_items_include_search_values_for_preview_mapping()
 ```
 
-**Purpose**: Ensures every picker item carries a canonical `search_value`, which the live-preview callback relies on for stable index-to-theme mapping.
+**Purpose**: Checks that every theme item stores its real theme name as a search value. The live preview depends on those names staying aligned with the visible list.
 
-**Data flow**: Builds picker params and asserts that all items have `search_value.is_some()`.
+**Data flow**: It builds theme picker parameters, inspects every item, and asserts that each one has a search value.
 
-**Call relations**: This test protects the invariant documented in `build_theme_picker_params` about deriving preview targets from final items.
+**Call relations**: This test protects the connection between the final item list and the live-preview callback created by `build_theme_picker_params`.
 
 *Call graph*: calls 1 internal fn (build_theme_picker_params); 1 external calls (assert!).
 
@@ -7733,11 +7755,11 @@ fn theme_picker_items_include_search_values_for_preview_mapping()
 fn wide_preview_renders_all_lines_with_vertical_center_and_left_inset()
 ```
 
-**Purpose**: Checks that the wide preview renders every sample row, is vertically centered within a taller area, starts after the expected left inset, and includes both addition and removal markers.
+**Purpose**: Verifies that the wide preview draws every sample row, is vertically centered, and starts after the intended left inset. It also confirms that both added and removed lines are visible.
 
-**Data flow**: Renders `ThemePreviewWideRenderable` to text lines, extracts numbered rows and markers, and asserts row count, top/bottom padding, left inset in the first line, and presence of `+` and `-` markers.
+**Data flow**: It renders the wide preview into text lines, finds rows with preview line numbers, checks their count and vertical position, checks the first line’s indentation, and gathers diff markers to ensure both `+` and `-` appear.
 
-**Call relations**: This test validates `render_preview` behavior as configured by `ThemePreviewWideRenderable::render`.
+**Call relations**: This test exercises `ThemePreviewWideRenderable::render` through the rendering helpers, indirectly checking the shared preview drawing logic.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, render_lines).
 
@@ -7748,11 +7770,11 @@ fn wide_preview_renders_all_lines_with_vertical_center_and_left_inset()
 fn narrow_preview_renders_single_add_and_single_remove_in_four_lines()
 ```
 
-**Purpose**: Verifies that the narrow preview renders the exact four fixed rows with one addition and one removal, aligned at the left edge.
+**Purpose**: Verifies that the narrow preview stays compact and still shows one added and one removed line. This protects the fallback layout for small terminals.
 
-**Data flow**: Renders `ThemePreviewNarrowRenderable`, parses line numbers and markers from the output, and asserts the exact sequence `[12, 13, 13, 14]`, marker counts, and left-edge alignment of the first numbered line.
+**Data flow**: It renders the narrow preview into text lines, extracts line numbers and markers, and checks that the sample has four expected rows with exactly one `+` and one `-` marker.
 
-**Call relations**: This test validates the compact preview dataset and the no-inset rendering mode.
+**Call relations**: This test exercises `ThemePreviewNarrowRenderable::render` through the rendering helpers, making sure the compact sample remains useful.
 
 *Call graph*: 3 external calls (assert!, assert_eq!, render_lines).
 
@@ -7763,11 +7785,11 @@ fn narrow_preview_renders_single_add_and_single_remove_in_four_lines()
 fn deleted_preview_code_uses_dim_overlay_like_real_diff_renderer()
 ```
 
-**Purpose**: Checks that deleted preview lines inherit the dim styling used by the real diff renderer.
+**Purpose**: Checks that removed code in the preview is dimmed, matching the app’s real diff renderer. This matters because the preview should be a trustworthy sample of actual code output.
 
-**Data flow**: Renders the narrow preview to both buffer and text lines, locates the row containing a `-` marker, extracts the first non-space style modifier after the marker, and asserts it contains `Modifier::DIM`.
+**Data flow**: It renders the narrow preview, finds the row marked as deleted, looks up the style of the first code character after the marker, and asserts that the dim style is present.
 
-**Call relations**: This test confirms that `render_preview` is correctly reusing the shared diff styling pipeline.
+**Call relations**: This test combines the buffer and line helpers to inspect both the rendered text and the style data produced by the shared preview renderer.
 
 *Call graph*: 4 external calls (assert!, first_non_space_style_after_marker, render_buffer, render_lines).
 
@@ -7778,11 +7800,11 @@ fn deleted_preview_code_uses_dim_overlay_like_real_diff_renderer()
 fn subtitle_uses_tilde_path_when_codex_home_under_home_directory()
 ```
 
-**Purpose**: Verifies that the subtitle uses a concrete tilde-prefixed themes directory path when `codex_home` is under the user’s home directory and there is enough width.
+**Purpose**: Checks that the subtitle can show a friendly `~` home-directory path when there is enough room. This makes the custom theme folder easier for users to recognize.
 
-**Data flow**: Builds a `codex_home` under `dirs::home_dir()`, calls `theme_picker_subtitle`, and asserts the returned string contains `~` and `directory`.
+**Data flow**: It gets the user’s home directory, builds a Codex home path under it, asks for a subtitle with a wide terminal, and asserts that the result includes `~` and mentions a directory.
 
-**Call relations**: This test covers the preferred subtitle branch in `theme_picker_subtitle`.
+**Call relations**: This test calls `theme_picker_subtitle` directly to verify the user-facing helper text.
 
 *Call graph*: calls 1 internal fn (theme_picker_subtitle); 2 external calls (assert!, home_dir).
 
@@ -7793,11 +7815,11 @@ fn subtitle_uses_tilde_path_when_codex_home_under_home_directory()
 fn subtitle_falls_back_when_tilde_path_subtitle_is_too_wide()
 ```
 
-**Purpose**: Ensures the subtitle falls back to the generic preview hint when the concrete path-based sentence would exceed available width.
+**Purpose**: Checks that an overly long custom-theme path is not shown in the subtitle. Instead, the picker should use the short fallback instruction.
 
-**Data flow**: Constructs a very long `codex_home` path under the home directory, calls `theme_picker_subtitle` with a finite terminal width, and asserts the fallback subtitle is returned.
+**Data flow**: It builds a very long Codex home path under the user’s home directory, asks for a subtitle with limited width, and confirms the returned text is the fallback message.
 
-**Call relations**: This test validates the width-check branch in `theme_picker_subtitle`.
+**Call relations**: This test calls `theme_picker_subtitle` directly and protects the width check that keeps the dialog readable.
 
 *Call graph*: calls 1 internal fn (theme_picker_subtitle); 2 external calls (assert_eq!, home_dir).
 
@@ -7808,11 +7830,11 @@ fn subtitle_falls_back_when_tilde_path_subtitle_is_too_wide()
 fn subtitle_falls_back_to_preview_instructions_without_tilde_path()
 ```
 
-**Purpose**: Ensures the generic fallback subtitle is used when no `codex_home` path is available.
+**Purpose**: Checks that the subtitle uses the fallback preview instruction when there is no Codex home path. This avoids showing misleading custom-theme folder text.
 
-**Data flow**: Calls `theme_picker_subtitle(None, None)` and asserts the result equals `PREVIEW_FALLBACK_SUBTITLE`.
+**Data flow**: It asks for a subtitle without a Codex home directory and confirms that the fallback message is returned.
 
-**Call relations**: This test covers the no-path branch of `theme_picker_subtitle`.
+**Call relations**: This test calls `theme_picker_subtitle` directly for the no-path case.
 
 *Call graph*: calls 1 internal fn (theme_picker_subtitle); 1 external calls (assert_eq!).
 
@@ -7823,11 +7845,11 @@ fn subtitle_falls_back_to_preview_instructions_without_tilde_path()
 fn subtitle_falls_back_for_94_column_terminal_side_by_side_layout()
 ```
 
-**Purpose**: Verifies that a 94-column terminal leaves too little list width for the path-based subtitle once side-by-side layout is considered, so the fallback text is used.
+**Purpose**: Checks a specific terminal width where the side-by-side layout leaves too little room for the custom-theme path subtitle. The picker should choose the shorter fallback text.
 
-**Data flow**: Builds a home-based `codex_home`, calls `theme_picker_subtitle` with width 94, and asserts the fallback subtitle is returned.
+**Data flow**: It builds a normal Codex home path, asks for a subtitle at 94 columns, and confirms the fallback message is returned.
 
-**Call relations**: This test specifically exercises the interaction between `subtitle_available_width` and `theme_picker_subtitle`.
+**Call relations**: This test calls `theme_picker_subtitle`, which in turn uses the available-width calculation tied to the picker layout.
 
 *Call graph*: calls 1 internal fn (theme_picker_subtitle); 2 external calls (assert_eq!, home_dir).
 
@@ -7838,10 +7860,10 @@ fn subtitle_falls_back_for_94_column_terminal_side_by_side_layout()
 fn unavailable_configured_theme_falls_back_to_configured_or_default_selection()
 ```
 
-**Purpose**: Checks that when the caller supplies a nonexistent current theme name, the picker preselects the configured/default theme rather than the first arbitrary entry.
+**Purpose**: Checks that if the saved theme name is not available, the picker still selects the app’s configured or default theme instead of an unrelated first item. This keeps opening the picker from accidentally previewing the wrong theme.
 
-**Data flow**: Reads `highlight::configured_theme_name()`, builds picker params with `Some("not-a-real-theme")`, extracts `initial_selected_idx` and the selected item’s `search_value`, and asserts it matches the configured/default theme name.
+**Data flow**: It reads the configured-or-default theme name, builds picker parameters with a fake missing current theme, finds the initially selected item, and checks that its stored theme name matches the fallback theme.
 
-**Call relations**: This test validates the effective-theme resolution logic inside `build_theme_picker_params`.
+**Call relations**: This test calls `build_theme_picker_params` and protects the selection logic used when the current configuration points to a theme that cannot be found.
 
 *Call graph*: calls 2 internal fn (configured_theme_name, build_theme_picker_params); 1 external calls (assert_eq!).

@@ -1,10 +1,6 @@
 # Core integration harness and common test support  `stage-23.2.3`
 
-This stage is the cross-cutting test infrastructure that sits underneath the core crate’s end-to-end verification. Rather than testing one feature itself, it assembles the single integration-test binary and provides the reusable harnesses, fixtures, and fake services that let the main test suite drive real core execution paths in a controlled way.
-
-At the top, core/tests/all.rs defines the shared integration-test entrypoint, while core/tests/suite/mod.rs gathers the suite and installs the early dispatch trick that lets the test binary masquerade as helper executables. core/tests/common/lib.rs is the central re-export surface for shared helpers, and core/src/test_support.rs exposes test-only constructors and internal wiring from the crate itself.
-
-The remaining files supply the environment around tests: test_environment.rs detects local, Docker, or Wine modes; hooks.rs mutates config to trust hook fixtures; tracing.rs enables test telemetry; process.rs waits on child-process lifecycle events; and apps_test_server.rs, responses.rs, and streaming_sse.rs provide mock HTTP, websocket, and deterministic SSE servers. context_snapshot.rs stabilizes assertions, zsh_fork.rs prepares real-shell interception scenarios, and test_codex.rs plus test_codex_exec.rs build the hermetic Codex and codex-exec harnesses that most integration tests run through.
+This stage is shared behind-the-scenes support for testing the core crate. It is not a feature being tested; it is the workshop that lets all the feature tests run safely and repeatably. The main entry files, `all.rs` and `suite/mod.rs`, gather the integration tests into one runnable test program and let that program pretend to be helper binaries when needed. The common toolbox supplies temporary folders, default settings, sandbox checks, hook approval setup, tracing setup, and helpers for waiting on background processes. Other helpers decide whether tests run locally, in Docker, or through Wine, and prepare special zsh fork tests when that path is available. Several files build fake outside services: mock Codex Apps, OpenAI Responses and Models APIs, WebSocket or HTTP replies, and controlled Server-Sent Event streams. Snapshot helpers turn large request data into stable readable text. The Codex test builders create a complete fake conversation world, while the exec helper runs `codex-exec` without touching real user files. Together, these pieces make end-to-end tests reliable, isolated, and understandable.
 
 ## Files in this stage
 
@@ -13,20 +9,26 @@ These files define the integration-test binary and top-level suite aggregation t
 
 ### `core/tests/all.rs`
 
-`test` · `startup`
+`test` · `test run`
 
-This file is the root of the `core` integration test binary. Instead of many standalone integration test crates under `tests/`, the project aggregates them into one binary and places the actual test modules under `tests/all/`, imported here through `mod suite;`. The crate-level `#![allow(clippy::expect_used)]` reflects a testing convention that permits `expect` calls in assertions and setup code without lint noise.
+This file exists to make the integration tests easy for Rust’s test system to find and run. Instead of scattering separate test binaries across many files, the project uses one main test file that pulls in the actual test suite from a submodule named `suite`.
 
-The file also publicly re-exports `codex_protocol::error` for use by submodules, giving the suite a common error type path without each test module needing to import it independently. There is no runtime logic here beyond Rust’s normal test harness initialization and module loading. The important design choice is consolidation: a single integration binary can share setup, reduce compile duplication, and support global initialization patterns implemented in `suite/mod.rs`. This file therefore serves as the entry shell that hands control to the aggregated suite structure.
+The line allowing `clippy::expect_used` relaxes one lint rule for tests. In normal production code, using `expect` can be discouraged because it crashes if something goes wrong. In tests, that is often useful: a failed assumption should stop the test clearly, with a helpful message.
+
+It also publicly re-exports `codex_protocol::error`. That makes the protocol error type available to the test modules through this shared test crate, so tests can refer to it consistently.
+
+Without this file, the test modules under `tests/all/` would not be collected into this integration test binary in the same way. Think of it like the cover page and table of contents for a test booklet: it does not contain the questions itself, but it tells the runner which section to open.
 
 
 ### `core/tests/suite/mod.rs`
 
-`test` · `startup`
+`test` · `test startup and test discovery`
 
-This module is the central registry for integration tests under `core/tests/all/`. Its most significant content is the `#[ctor]`-initialized static `CODEX_ALIASES_TEMP_DIR`, which runs before any tests and calls `configure_test_binary_dispatch("codex-core-tests", ...)` to decide how the test binary should behave when invoked under different executable names or first arguments. The closure checks `argv1` against `CODEX_CORE_APPLY_PATCH_ARG1` and `CODEX_FS_HELPER_ARG1`, and checks `exe_name` against `CODEX_LINUX_SANDBOX_ARG0`; in those cases it returns `TestBinaryDispatchMode::DispatchArg0Only`, causing the binary to dispatch like the corresponding helper tool. Otherwise it returns `TestBinaryDispatchMode::InstallAliases`, which sets up alias executables for normal test operation. The static stores an optional `TestBinaryDispatchGuard`, preserving the installation for the test process lifetime.
+This file brings many former standalone integration tests together under one Rust test suite. Each `mod ...` line points Rust at another test file, so those tests are compiled and run as part of the same test binary. Without this file, large parts of the core behavior would not be included when the suite runs.
 
-Below that, the file declares a large set of test modules, with platform gating for Windows, Unix, and non-Windows cases. This makes the file the suite manifest: adding a test means adding a module here, and platform-specific behavior is encoded directly in conditional compilation. The note about ARM documents an important limitation of the constructor-based alias mechanism. Overall, this file performs global test-environment orchestration first, then exposes the full matrix of integration scenarios to the Rust test harness.
+Before the tests start, it also configures command dispatch for the test binary. Some code under test expects to launch helper executables such as `apply_patch`, a filesystem helper, or the Linux sandbox tool. In real use, those are separate command names. In the test environment, this file lets one test binary wear different “name tags,” like one actor playing several roles depending on how it is invoked. That makes tests closer to real behavior without needing to build and locate many separate binaries.
+
+A few test modules are included only on certain operating systems. For example, sandbox and permission tests that depend on Unix or Linux features are skipped on Windows. This keeps the suite portable while still testing platform-specific behavior where it exists.
 
 
 ### Core test wiring
@@ -34,15 +36,15 @@ These modules provide the foundational shared utilities, internal test-only cons
 
 ### `core/tests/common/lib.rs`
 
-`util` · `cross-cutting test support`
+`test` · `test startup and test execution`
 
-This file is the umbrella support module for core tests. At process startup, three `#[ctor]` functions force deterministic thread/process IDs, install arg0 dispatch for test binaries, and set `INSTA_WORKSPACE_ROOT` when absent so snapshot tests resolve paths consistently. The rest of the file is a grab bag of concrete helpers used across integration tests.
+Tests need a controlled world. This file builds that world for many Codex test crates, so each test does not have to repeat the same setup or guess how the host machine behaves. At process startup, it switches Codex into deterministic test behavior, such as stable process IDs, and prepares special binary lookup and snapshot-test paths. That makes test results repeatable instead of depending on timing or a developer’s machine.
 
-Path helpers normalize Unix-vs-Windows expectations: `test_path_buf_with_windows`, `test_absolute_path_with_windows`, and related wrappers synthesize platform-appropriate `PathBuf` and `AbsolutePathBuf` values from canonical test literals. `create_directory_symlink` abstracts the OS-specific symlink syscall. `TempDirExt::abs` converts a `tempfile::TempDir` into an absolute-path wrapper used throughout the codebase.
+The file also offers path helpers that hide operating-system differences. A test can ask for “/tmp” or another Unix-style path and get a sensible Windows path when running on Windows. It provides helpers for absolute paths, temporary directories, and directory symlinks.
 
-Config helpers build hermetic `Config` instances rooted in a per-test temp home. `load_default_config_for_test_with_cloud_config_bundle` uses `ConfigBuilder` with managed-config loading disabled, test harness overrides, and optional cloud bundle fixtures; on Linux, `default_test_overrides` injects the `codex-linux-sandbox` executable path. Runtime helpers wait for protocol events from `CodexThread`, interpret MCP startup summaries, and submit thread-settings updates while matching responses by submission ID.
+For tests that start a Codex thread, this file supplies waiting functions. They read Codex events until the expected message appears, with timeouts so a broken test fails instead of hanging forever. Other helpers build an isolated default configuration in a temporary Codex home, locate test binaries, fetch DotSlash resources, and format shell commands the same way Codex would.
 
-The nested `fs_wait` module provides blocking file-existence and file-discovery loops wrapped in `spawn_blocking`, using `notify` watchers plus final rescans to avoid races. Finally, exported macros skip tests under sandboxed, no-network, remote, Wine, or missing-binary conditions, allowing downstream test crates to share the same environment gating logic.
+The nested `fs_wait` module is like a lookout watching the file system: it waits until a path or matching file appears. The exported skip macros let tests politely exit when the current sandbox, network, Windows, remote, or Wine environment cannot support them.
 
 #### Function details
 
@@ -52,11 +54,11 @@ The nested `fs_wait` module provides blocking file-existence and file-discovery 
 fn enable_deterministic_unified_exec_process_ids_for_tests()
 ```
 
-**Purpose**: Turns on deterministic thread-manager and process-ID behavior for the entire test process before tests run.
+**Purpose**: Turns on test-only deterministic behavior for Codex process handling. This keeps tests from depending on random or timing-sensitive process IDs.
 
-**Data flow**: It takes no arguments and writes global test-support state inside `codex_core` by enabling thread-manager test mode and deterministic process IDs. It returns nothing.
+**Data flow**: It takes no input. At test process startup, it tells Codex test support to use the test thread manager mode and deterministic process IDs. It returns nothing, but it changes global test settings for the whole process.
 
-**Call relations**: As a startup ctor, it is invoked automatically during test process initialization rather than by explicit callers. It prepares global execution behavior that later test helpers and assertions rely on.
+**Call relations**: This runs automatically as a startup constructor before tests begin. It hands the work to `set_thread_manager_test_mode` and `set_deterministic_process_ids`, so later tests see predictable execution behavior.
 
 *Call graph*: calls 2 internal fn (set_deterministic_process_ids, set_thread_manager_test_mode).
 
@@ -67,11 +69,11 @@ fn enable_deterministic_unified_exec_process_ids_for_tests()
 fn configure_arg0_dispatch_for_test_binaries()
 ```
 
-**Purpose**: Initializes arg0-based binary dispatch once for the test process and stores the resulting guard.
+**Purpose**: Sets up test binaries so they can find related Codex helper programs through the special `arg0` dispatch mechanism. This helps tests launch the right helper executable without hard-coding paths everywhere.
 
-**Data flow**: It reads and writes the `TEST_ARG0_PATH_ENTRY` `OnceLock`, invoking `codex_arg0::arg0_dispatch` only on first initialization and retaining the optional `Arg0PathEntryGuard`. It returns nothing.
+**Data flow**: It takes no direct input. It initializes a shared one-time value with the result of `codex_arg0::arg0_dispatch`, if that has not already happened. It returns nothing, but stores the guard that keeps the temporary path setup alive.
 
-**Call relations**: This ctor runs at startup so later helpers such as Linux sandbox binary lookup can consult the cached arg0-dispatch paths without reinitializing dispatch.
+**Call relations**: This also runs automatically at process startup. Later, `find_codex_linux_sandbox_exe` can read the stored dispatch information to locate the sandbox helper binary.
 
 
 ##### `configure_insta_workspace_root_for_snapshot_tests`  (lines 57–74)
@@ -80,11 +82,11 @@ fn configure_arg0_dispatch_for_test_binaries()
 fn configure_insta_workspace_root_for_snapshot_tests()
 ```
 
-**Purpose**: Sets `INSTA_WORKSPACE_ROOT` at startup when absent so snapshot paths resolve relative to the repository workspace.
+**Purpose**: Makes snapshot tests find the project workspace reliably. Snapshot tests compare output against saved reference files, so they need a stable root folder.
 
-**Data flow**: It reads the `INSTA_WORKSPACE_ROOT` environment variable; if unset, it queries `repo_root`, appends `codex-rs`, canonicalizes the path, and writes the environment variable via `set_var`. It returns nothing.
+**Data flow**: It first checks whether `INSTA_WORKSPACE_ROOT` is already set. If not, it asks for the repository root, appends `codex-rs`, canonicalizes that path, and writes it into the environment. It returns nothing, but may set an environment variable.
 
-**Call relations**: This startup ctor only acts when the variable is missing. It supports snapshot-based tests elsewhere in the suite by establishing a stable workspace root before test threads begin.
+**Call relations**: This startup constructor prepares the process before snapshot tests run. It relies on the external repository-root helper and only sets the environment when the caller has not already chosen one.
 
 *Call graph*: 3 external calls (repo_root, set_var, var_os).
 
@@ -95,11 +97,11 @@ fn configure_insta_workspace_root_for_snapshot_tests()
 fn assert_regex_match(pattern: &str, actual: &'s str) -> regex_lite::Captures<'s>
 ```
 
-**Purpose**: Compiles a regex and asserts that it captures against the provided string, returning the captures for further inspection.
+**Purpose**: Checks that a piece of text matches a regular expression, and returns the captured parts. Tests use it when exact text may vary but must follow a known pattern.
 
-**Data flow**: It takes a pattern and an `actual` string slice, constructs a `regex_lite::Regex`, runs `captures(actual)`, and returns the resulting `Captures<'s>`. It panics if compilation fails or no match is found.
+**Data flow**: It receives a pattern string and the actual text. It compiles the pattern, tries to match it against the text, and either returns the match captures or fails the test with a clear expectation message.
 
-**Call relations**: This is a leaf assertion helper used directly by tests that need both a match assertion and access to capture groups.
+**Call relations**: Individual tests call this helper directly. It delegates pattern compilation to the regex library and is marked so failures point at the test line that called it.
 
 *Call graph*: 1 external calls (new).
 
@@ -110,11 +112,11 @@ fn assert_regex_match(pattern: &str, actual: &'s str) -> regex_lite::Captures<'s
 fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -> PathBuf
 ```
 
-**Purpose**: Builds a platform-appropriate `PathBuf` for tests from a Unix-style path and an optional explicit Windows override.
+**Purpose**: Builds a test path that works on both Unix-like systems and Windows. This lets tests describe paths once while still running on different operating systems.
 
-**Data flow**: It takes `unix_path` and optional `windows_path`. On Windows it either returns `PathBuf::from(windows_path)` or synthesizes a `C:\...` path by splitting the Unix path into segments; on non-Windows it returns `PathBuf::from(unix_path)`.
+**Data flow**: It receives a Unix-style path and, optionally, a Windows-specific replacement. On Windows it uses the replacement if provided, otherwise it converts path segments under `C:\`; elsewhere it returns the Unix path unchanged. The output is a `PathBuf`, Rust’s owned path value.
 
-**Call relations**: This is the base path-construction helper used by `test_path_buf` and the absolute-path wrappers so tests can express one logical path across platforms.
+**Call relations**: This is the base path-conversion helper. `test_path_buf` uses it for ordinary paths, and `test_absolute_path_with_windows` uses it before checking that a path is absolute.
 
 *Call graph*: called by 2 (test_absolute_path_with_windows, test_path_buf); 2 external calls (from, cfg!).
 
@@ -125,11 +127,11 @@ fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -> Pa
 fn test_path_buf(unix_path: &str) -> PathBuf
 ```
 
-**Purpose**: Convenience wrapper that converts a Unix-style test path into a platform-specific `PathBuf` without a custom Windows override.
+**Purpose**: Creates an operating-system-appropriate test path from a Unix-style path. It is the simple version for cases that do not need a custom Windows spelling.
 
-**Data flow**: It takes `unix_path`, forwards it to `test_path_buf_with_windows` with `None`, and returns the resulting `PathBuf`.
+**Data flow**: It receives a Unix-style path string and passes it to `test_path_buf_with_windows` with no Windows override. It returns the resulting `PathBuf`.
 
-**Call relations**: This is the simpler sibling of `test_path_buf_with_windows`, used when the default Windows translation is sufficient.
+**Call relations**: Tests call this when they need a plain path value. It is a thin wrapper around `test_path_buf_with_windows`.
 
 *Call graph*: calls 1 internal fn (test_path_buf_with_windows).
 
@@ -143,11 +145,11 @@ fn test_absolute_path_with_windows(
 ) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds an `AbsolutePathBuf` from a Unix-style path and optional Windows override, asserting the result is absolute.
+**Purpose**: Creates an absolute test path that works across operating systems. It also checks that the resulting path really is absolute, which catches bad test setup early.
 
-**Data flow**: It takes `unix_path` and optional `windows_path`, obtains a `PathBuf` from `test_path_buf_with_windows`, converts it with `AbsolutePathBuf::from_absolute_path`, and returns the absolute wrapper. It panics if the path is not absolute.
+**Data flow**: It receives a Unix-style path and an optional Windows-specific path. It first builds a platform-correct `PathBuf`, then converts it into `AbsolutePathBuf`, a path type that promises the path is absolute. It returns that absolute path or fails if the path is not absolute.
 
-**Call relations**: This helper underpins `test_absolute_path` and `test_tmp_path`, giving tests a typed absolute path in the project's path abstraction.
+**Call relations**: This builds on `test_path_buf_with_windows`. `test_absolute_path` and `test_tmp_path` call it for common absolute-path needs.
 
 *Call graph*: calls 2 internal fn (test_path_buf_with_windows, from_absolute_path); called by 2 (test_absolute_path, test_tmp_path).
 
@@ -158,11 +160,11 @@ fn test_absolute_path_with_windows(
 fn test_absolute_path(unix_path: &str) -> AbsolutePathBuf
 ```
 
-**Purpose**: Convenience wrapper that creates an `AbsolutePathBuf` from a Unix-style path using default Windows translation.
+**Purpose**: Creates an absolute test path from a Unix-style string. It is the convenient version when no Windows-specific spelling is needed.
 
-**Data flow**: It takes `unix_path`, delegates to `test_absolute_path_with_windows` with no explicit Windows path, and returns the resulting `AbsolutePathBuf`.
+**Data flow**: It receives a Unix-style path string, calls `test_absolute_path_with_windows` without a Windows override, and returns an `AbsolutePathBuf`.
 
-**Call relations**: This is the common absolute-path helper used by tests that do not need a custom Windows path literal.
+**Call relations**: Tests use this as the common absolute-path helper. The real platform adjustment is done by `test_absolute_path_with_windows`.
 
 *Call graph*: calls 1 internal fn (test_absolute_path_with_windows).
 
@@ -173,11 +175,11 @@ fn test_absolute_path(unix_path: &str) -> AbsolutePathBuf
 fn create_directory_symlink(source: &Path, link: &Path)
 ```
 
-**Purpose**: Creates a directory symlink using the platform-specific filesystem API and panics with a test-oriented message on failure.
+**Purpose**: Creates a directory symbolic link for tests. A symbolic link is like a shortcut in the file system that points to another directory.
 
-**Data flow**: It takes source and link `&Path` values and invokes either Unix `symlink` or Windows `symlink_dir`, writing the symlink on disk. It returns nothing.
+**Data flow**: It receives the real directory path and the link path to create. On Unix it calls the Unix symlink function; on Windows it calls the Windows directory-symlink function. It returns nothing, but creates a link on disk or fails the test if creation is not allowed.
 
-**Call relations**: Tests call this helper instead of branching on OS-specific symlink APIs themselves.
+**Call relations**: Tests call this when they need to exercise behavior around linked directories. The function hides the platform-specific system call differences.
 
 *Call graph*: 2 external calls (symlink, symlink_dir).
 
@@ -188,11 +190,11 @@ fn create_directory_symlink(source: &Path, link: &Path)
 fn abs(&self) -> AbsolutePathBuf
 ```
 
-**Purpose**: Converts a `tempfile::TempDir` into an `AbsolutePathBuf` using the test path extension trait.
+**Purpose**: Adds a convenient way to get a temporary directory as an absolute path. Tests use it to pass temp directories into code that requires absolute paths.
 
-**Data flow**: It reads `self.path()`, converts it via `.abs()`, and returns the resulting `AbsolutePathBuf`.
+**Data flow**: It reads the path stored inside a `TempDir`, converts that path using the project’s absolute-path test helper, and returns an `AbsolutePathBuf`. It does not change the temporary directory.
 
-**Call relations**: This trait method is used throughout test setup code whenever a temp directory must be passed into APIs expecting the project's absolute-path wrapper.
+**Call relations**: This method comes from the local `TempDirExt` trait implemented for `TempDir`. Any test that imports the trait can call `.abs()` directly on a temporary directory.
 
 
 ##### `test_tmp_path`  (lines 143–145)
@@ -201,11 +203,11 @@ fn abs(&self) -> AbsolutePathBuf
 fn test_tmp_path() -> AbsolutePathBuf
 ```
 
-**Purpose**: Returns the canonical temporary-directory path used by tests on the current platform.
+**Purpose**: Returns a believable temporary-directory path for the current operating system. It is useful for tests that need to compare or construct temp paths without using the real environment.
 
-**Data flow**: It takes no arguments and returns an `AbsolutePathBuf` built from `/tmp` on Unix or `C:\Users\codex\AppData\Local\Temp` on Windows via `test_absolute_path_with_windows`.
+**Data flow**: It supplies `/tmp` for Unix-like systems and a Windows temp-folder path for Windows, then turns that into an absolute path. The output is an `AbsolutePathBuf`.
 
-**Call relations**: This helper centralizes the expected temp-root path and is used by `test_tmp_path_buf` and tests that compare temp locations.
+**Call relations**: It uses `test_absolute_path_with_windows` for the platform conversion. `test_tmp_path_buf` calls it when a regular `PathBuf` is needed instead.
 
 *Call graph*: calls 1 internal fn (test_absolute_path_with_windows); called by 1 (test_tmp_path_buf).
 
@@ -216,11 +218,11 @@ fn test_tmp_path() -> AbsolutePathBuf
 fn test_tmp_path_buf() -> PathBuf
 ```
 
-**Purpose**: Returns the canonical test temporary-directory path as a plain `PathBuf`.
+**Purpose**: Returns the test temporary-directory path as a regular owned path value. This is for APIs that do not require the stricter absolute-path type.
 
-**Data flow**: It calls `test_tmp_path`, converts the `AbsolutePathBuf` into a `PathBuf`, and returns it.
+**Data flow**: It calls `test_tmp_path` to get the absolute test temp path, then converts it into a `PathBuf`. It returns that path and changes nothing else.
 
-**Call relations**: This is the `PathBuf`-returning companion to `test_tmp_path` for APIs that do not use the absolute-path wrapper.
+**Call relations**: This is a small adapter around `test_tmp_path`, used by tests that need the more general path type.
 
 *Call graph*: calls 1 internal fn (test_tmp_path).
 
@@ -234,11 +236,11 @@ fn fetch_dotslash_file(
 ) -> anyhow::Result<PathBuf>
 ```
 
-**Purpose**: Runs the external `dotslash -- fetch` command for a resource file and validates that the resolved path is a real file.
+**Purpose**: Runs the `dotslash` tool to fetch a declared resource and returns the actual file path that was downloaded or resolved. DotSlash is a tool for making external files or executables available in a repeatable way.
 
-**Data flow**: It takes a DotSlash manifest path and optional cache path, constructs a `std::process::Command`, optionally sets `DOTSLASH_CACHE`, executes it, checks exit status and UTF-8 stdout, trims the fetched path string, converts it to `PathBuf`, verifies `is_file()`, and returns that path or an `anyhow::Error` with contextual messages.
+**Data flow**: It receives the DotSlash file to fetch and an optional cache directory. It builds a `dotslash -- fetch ...` command, optionally sets `DOTSLASH_CACHE`, runs the command, checks that it succeeded, reads the returned path from standard output, verifies that the path is non-empty and points to a file, and returns that file path. Errors include context about what went wrong.
 
-**Call relations**: This helper is used by tests that need to materialize external resources through DotSlash while surfacing command failures and malformed output clearly.
+**Call relations**: Tests call this when they need a DotSlash-managed fixture or executable. It hands the actual fetching to the external `dotslash` command and validates the result before giving it back.
 
 *Call graph*: 4 external calls (from, from_utf8, new, ensure!).
 
@@ -249,11 +251,11 @@ fn fetch_dotslash_file(
 async fn load_default_config_for_test(codex_home: &TempDir) -> Config
 ```
 
-**Purpose**: Builds a default hermetic `Config` rooted in the provided temporary Codex home using the default cloud bundle loader.
+**Purpose**: Builds a default Codex configuration whose files live inside a test temporary directory. This prevents tests from reading or modifying a developer’s real Codex home folder.
 
-**Data flow**: It takes `&TempDir`, constructs `CloudConfigBundleLoader::default()`, delegates to `load_default_config_for_test_with_cloud_config_bundle`, awaits the result, and returns the built `Config`.
+**Data flow**: It receives a temporary directory representing the test Codex home. It creates the default cloud-config bundle loader and passes both values to the more detailed config-loading helper. It returns the completed `Config`.
 
-**Call relations**: This is the standard config-construction entry used by most tests; specialized callers use the cloud-bundle variant directly.
+**Call relations**: Tests use this common helper for ordinary configuration setup. It delegates the real construction to `load_default_config_for_test_with_cloud_config_bundle`.
 
 *Call graph*: calls 2 internal fn (default, load_default_config_for_test_with_cloud_config_bundle).
 
@@ -267,11 +269,11 @@ async fn load_default_config_for_test_with_cloud_config_bundle(
 ) -> Config
 ```
 
-**Purpose**: Constructs a test `Config` with managed config disabled, a temp `codex_home`, harness overrides, and a caller-supplied cloud config bundle loader.
+**Purpose**: Builds a test Codex configuration while allowing the test to supply cloud configuration requirements. This is used when a test needs special managed or enterprise-like settings.
 
-**Data flow**: It takes `&TempDir` and a `CloudConfigBundleLoader`, configures a `ConfigBuilder` with `LoaderOverrides::without_managed_config_for_tests()`, `codex_home`, `default_test_overrides()`, and the cloud bundle, then asynchronously builds and returns the resulting `Config`, panicking if construction fails.
+**Data flow**: It receives a temporary Codex home and a cloud-config bundle loader. It starts a default `ConfigBuilder`, disables managed config loading for tests, points Codex home at the temp directory, applies test overrides, attaches the cloud bundle loader, builds the config asynchronously, and returns it. If this default test setup fails, the test fails.
 
-**Call relations**: This is the underlying config builder used by `load_default_config_for_test` and by higher-level harness builders that need cloud-config fixtures applied during config load.
+**Call relations**: `load_default_config_for_test` calls this for the normal case. Internally it asks `default_test_overrides` for platform-specific overrides, such as the Linux sandbox helper path.
 
 *Call graph*: calls 2 internal fn (without_managed_config_for_tests, default_test_overrides); called by 1 (load_default_config_for_test); 2 external calls (path, default).
 
@@ -282,11 +284,11 @@ async fn load_default_config_for_test_with_cloud_config_bundle(
 fn managed_network_requirements_loader() -> CloudConfigBundleLoader
 ```
 
-**Purpose**: Creates a cloud-config fixture loader that enables experimental network access and local binding requirements.
+**Purpose**: Creates a test cloud-config loader that says managed network requirements are enabled and local binding is allowed. Tests use this to simulate an enterprise configuration that affects networking behavior.
 
-**Data flow**: It takes no arguments and returns a `CloudConfigBundleLoader` produced from an inline TOML fixture string via `CloudConfigBundleFixture::loader_with_enterprise_requirement`.
+**Data flow**: It contains a small TOML configuration text block and passes it to the cloud-config fixture builder. It returns a `CloudConfigBundleLoader` ready to be used during config construction.
 
-**Call relations**: Tests use this helper when they need config construction to include enterprise-managed network requirements.
+**Call relations**: Tests can pass this loader into `load_default_config_for_test_with_cloud_config_bundle` when they need those network requirements applied.
 
 *Call graph*: calls 1 internal fn (loader_with_enterprise_requirement).
 
@@ -297,11 +299,11 @@ fn managed_network_requirements_loader() -> CloudConfigBundleLoader
 fn default_test_overrides() -> ConfigOverrides
 ```
 
-**Purpose**: Provides platform-specific `ConfigOverrides` for tests, injecting the Linux sandbox executable path on Linux and defaults elsewhere.
+**Purpose**: Provides configuration overrides that are useful in tests, especially for finding the Linux sandbox executable on Linux. On non-Linux systems it leaves the defaults unchanged.
 
-**Data flow**: On Linux it resolves `find_codex_linux_sandbox_exe()` and returns a `ConfigOverrides` with `codex_linux_sandbox_exe` set; on other platforms it returns `ConfigOverrides::default()`.
+**Data flow**: On Linux, it tries to find the `codex-linux-sandbox` helper and stores that path in `ConfigOverrides`; all other fields keep their defaults. On other operating systems, it returns default overrides. The output is a `ConfigOverrides` value.
 
-**Call relations**: This helper is consumed during test config construction so sandbox-related code paths can find the helper binary when needed.
+**Call relations**: `load_default_config_for_test_with_cloud_config_bundle` calls this while building test configuration. On Linux it depends on `find_codex_linux_sandbox_exe` to locate the helper binary.
 
 *Call graph*: calls 1 internal fn (find_codex_linux_sandbox_exe); called by 1 (load_default_config_for_test_with_cloud_config_bundle); 1 external calls (default).
 
@@ -312,11 +314,11 @@ fn default_test_overrides() -> ConfigOverrides
 fn find_codex_linux_sandbox_exe() -> Result<PathBuf, CargoBinError>
 ```
 
-**Purpose**: Finds the `codex-linux-sandbox` executable for Linux tests using arg0-dispatch paths, the current executable, or Cargo binary lookup.
+**Purpose**: Finds the executable path for the Linux sandbox helper used by tests. The sandbox helper is a separate program that runs commands with Linux restrictions.
 
-**Data flow**: It reads the cached `TEST_ARG0_PATH_ENTRY` for a precomputed sandbox path; if absent, it tries `std::env::current_exe()`, and finally falls back to `codex_utils_cargo_bin::cargo_bin("codex-linux-sandbox")`. It returns a `Result<PathBuf, CargoBinError>`.
+**Data flow**: It first checks whether the startup `arg0` dispatch setup already knows the helper path. If not, it tries the current test executable path, and if that fails, asks Cargo’s binary helper for `codex-linux-sandbox`. It returns the path or an error from the binary lookup.
 
-**Call relations**: Linux-only test setup calls this from `default_test_overrides`, and skip macros may also rely on it indirectly to decide whether sandbox-dependent tests can run.
+**Call relations**: `default_test_overrides` calls this when building Linux test configuration. Skip macros may also use it indirectly when deciding whether sandbox-dependent tests can run.
 
 *Call graph*: called by 1 (default_test_overrides); 2 external calls (cargo_bin, current_exe).
 
@@ -330,11 +332,11 @@ async fn wait_for_event(
 ) -> codex_protocol::protocol::EventMsg
 ```
 
-**Purpose**: Waits up to a default short timeout for the next `CodexThread` event whose message satisfies a predicate.
+**Purpose**: Waits until a Codex thread emits an event that matches a test’s condition. It gives tests a simple way to wait for asynchronous work without sleeping blindly.
 
-**Data flow**: It takes `&CodexThread` and a predicate over `EventMsg`, constructs a one-second duration, delegates to `wait_for_event_with_timeout`, and returns the matching `EventMsg`.
+**Data flow**: It receives a `CodexThread` and a predicate function that says whether an event is the desired one. It calls the timeout-aware waiting helper with a one-second requested wait, and returns the first matching event message.
 
-**Call relations**: This is the convenience wrapper used by `wait_for_event_match` and tests that do not need a custom timeout.
+**Call relations**: `wait_for_event_match` uses this as its event-waiting base. The real loop and timeout behavior live in `wait_for_event_with_timeout`.
 
 *Call graph*: calls 1 internal fn (wait_for_event_with_timeout); called by 1 (wait_for_event_match); 1 external calls (from_secs).
 
@@ -345,11 +347,11 @@ async fn wait_for_event(
 async fn wait_for_mcp_server(codex: &CodexThread, server_name: &str) -> anyhow::Result<()>
 ```
 
-**Purpose**: Consumes events until MCP startup completes, then verifies that a named MCP server ended in the ready set rather than failed or cancelled.
+**Purpose**: Waits for Codex to finish starting an MCP server and checks that a named server became ready. MCP means Model Context Protocol, a way for Codex to talk to external tool servers.
 
-**Data flow**: It takes `&CodexThread` and `server_name`, repeatedly awaits `next_event()` until it sees `EventMsg::McpStartupComplete(summary)`, inspects `summary.failed`, `summary.cancelled`, and `summary.ready`, and returns `Ok(())` or an `anyhow` error / assertion failure describing the startup outcome.
+**Data flow**: It receives a Codex thread and a server name. It reads events until it sees the MCP startup summary, then looks for the named server in the failed, cancelled, and ready lists. It returns success if the server is ready, or an error or assertion failure if startup did not produce the expected result.
 
-**Call relations**: Tests call this after configuring MCP servers to block until startup settles and to surface the specific server's status from the aggregate startup summary.
+**Call relations**: Tests call this after configuring MCP servers. It reads events directly from the Codex thread and interprets the startup-complete message for the specific server under test.
 
 *Call graph*: calls 1 internal fn (next_event); 2 external calls (bail!, assert!).
 
@@ -363,11 +365,11 @@ async fn submit_thread_settings(
 ) -> anyhow::Result<()>
 ```
 
-**Purpose**: Submits thread-settings overrides to a running `CodexThread` and waits for the matching success or error event for that submission ID.
+**Purpose**: Sends new thread settings to a running Codex thread and waits until Codex confirms that they were applied. This lets tests change settings and know when the change has taken effect.
 
-**Data flow**: It takes `&CodexThread` and `ThreadSettingsOverrides`, submits `Op::ThreadSettings`, stores the returned submission ID, then loops reading timed events until one with the same `id` arrives. It returns `Ok(())` on `ThreadSettingsApplied`, panics on `Error` or any unexpected event kind for that submission.
+**Data flow**: It receives a Codex thread and setting overrides. It submits a `ThreadSettings` operation, remembers the returned submission ID, then reads events with a timeout until it finds a response with that same ID. It returns success on `ThreadSettingsApplied`, panics on an error event or an unexpected event, and propagates submission errors.
 
-**Call relations**: This helper is used by tests that need to mutate thread settings mid-run and verify the update completed before proceeding.
+**Call relations**: Tests call this when they need to adjust a live Codex thread. It hands the request to `submit` and then uses `next_event` to wait for the matching acknowledgement.
 
 *Call graph*: calls 2 internal fn (next_event, submit); 2 external calls (from_secs, panic!).
 
@@ -378,11 +380,11 @@ async fn submit_thread_settings(
 async fn wait_for_event_match(codex: &CodexThread, matcher: F) -> T
 ```
 
-**Purpose**: Waits for an event whose message can be transformed by a matcher closure and returns the extracted value.
+**Purpose**: Waits for an event and extracts a useful value from it at the same time. This avoids making tests wait once and then separately unpack the event.
 
-**Data flow**: It takes `&CodexThread` and a matcher `Fn(&EventMsg) -> Option<T>`, waits using `wait_for_event` until the matcher would succeed, then re-applies the matcher to the returned event and yields the extracted `T`.
+**Data flow**: It receives a Codex thread and a matcher function that returns `Some(value)` for the desired event or `None` otherwise. It waits for any event where the matcher succeeds, then runs the matcher again on that event and returns the extracted value.
 
-**Call relations**: This helper layers extraction on top of `wait_for_event`; higher-level test harnesses use it to wait for specific protocol events and pull out IDs or payloads.
+**Call relations**: This is built on top of `wait_for_event`. Tests use it when they care about data inside an event, not just the fact that the event happened.
 
 *Call graph*: calls 1 internal fn (wait_for_event).
 
@@ -397,11 +399,11 @@ async fn wait_for_event_with_timeout(
 ) -> codex_protocol::protocol::EventMsg
 ```
 
-**Purpose**: Loops on `CodexThread::next_event` until a predicate matches, enforcing a caller-specified timeout with a minimum floor to tolerate startup work.
+**Purpose**: Repeatedly reads Codex events until one matches a condition, with a timeout so tests do not hang forever. It is the core event-waiting loop for asynchronous Codex tests.
 
-**Data flow**: It takes `&CodexThread`, a mutable predicate over `EventMsg`, and a `Duration`. On each iteration it awaits `next_event()` under `timeout(wait_time.max(10s), ...)`, panics on timeout or stream end, and returns the first `EventMsg` whose message satisfies the predicate.
+**Data flow**: It receives a Codex thread, a predicate, and a wait duration. In a loop, it waits for the next event using at least ten seconds to allow startup work, fails if the wait times out or the event stream ends, and returns the first event message that satisfies the predicate.
 
-**Call relations**: This is the primitive event waiter used by `wait_for_event` and by harness code that needs longer waits for turn completion or startup-related events.
+**Call relations**: `wait_for_event` calls this with its default timeout. This function talks directly to `CodexThread::next_event`, so it is the main bridge between tests and Codex’s event stream.
 
 *Call graph*: calls 1 internal fn (next_event); called by 1 (wait_for_event); 2 external calls (from_secs, max).
 
@@ -412,11 +414,11 @@ async fn wait_for_event_with_timeout(
 fn sandbox_env_var() -> &'static str
 ```
 
-**Purpose**: Exposes the environment variable name used to indicate the active sandbox implementation.
+**Purpose**: Returns the name of the environment variable that tells Codex what sandbox mode is active. Tests and skip macros use the shared constant instead of duplicating the string.
 
-**Data flow**: It takes no arguments and returns the `&'static str` constant from `codex_core::spawn::CODEX_SANDBOX_ENV_VAR`.
+**Data flow**: It takes no input and returns a static string borrowed from Codex core. It does not read the environment itself.
 
-**Call relations**: The exported skip macros use this helper so downstream crates can expand them without depending directly on `codex_core` internals.
+**Call relations**: The `skip_if_sandbox` macro uses this function when deciding whether a test should exit early in the seatbelt sandbox.
 
 
 ##### `sandbox_network_env_var`  (lines 359–361)
@@ -425,11 +427,11 @@ fn sandbox_env_var() -> &'static str
 fn sandbox_network_env_var() -> &'static str
 ```
 
-**Purpose**: Exposes the environment variable name used to indicate network-disabled sandbox execution.
+**Purpose**: Returns the name of the environment variable that means network access is disabled in the Codex sandbox. This keeps network-related test skipping tied to the same constant as production code.
 
-**Data flow**: It takes no arguments and returns the `&'static str` constant from `codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR`.
+**Data flow**: It takes no input and returns a static string from Codex core. It does not inspect the environment or change anything.
 
-**Call relations**: This helper is consumed by the no-network skip macro and any tests that need to inspect the same environment variable.
+**Call relations**: The `skip_if_no_network` macro uses this value to check whether a test should skip itself because networking is unavailable.
 
 
 ##### `format_with_current_shell`  (lines 363–365)
@@ -438,11 +440,11 @@ fn sandbox_network_env_var() -> &'static str
 fn format_with_current_shell(command: &str) -> Vec<String>
 ```
 
-**Purpose**: Formats a command string into the current user's shell executable arguments using a login shell.
+**Purpose**: Formats a command as arguments for the user’s default shell, using a login shell. A login shell is started as if the user had just logged in, so it may load profile files.
 
-**Data flow**: It takes a command string, reads the default user shell from `codex_core::shell::default_user_shell()`, derives exec args with `use_login_shell = true`, and returns `Vec<String>`.
+**Data flow**: It receives a command string. It asks Codex core what the default user shell is, asks that shell how to run the command with login-shell behavior, and returns the argument list as strings.
 
-**Call relations**: This helper is used by the display-formatting wrapper and by tests that need the exact argv shape Codex would use for shell execution.
+**Call relations**: Tests use this to compare against Codex’s real shell command formatting. `format_with_current_shell_display` calls it when it needs a printable version.
 
 *Call graph*: calls 1 internal fn (default_user_shell); called by 1 (format_with_current_shell_display).
 
@@ -453,11 +455,11 @@ fn format_with_current_shell(command: &str) -> Vec<String>
 fn format_with_current_shell_display(command: &str) -> String
 ```
 
-**Purpose**: Formats a command for the current login shell and serializes the resulting argv into a shell-escaped display string.
+**Purpose**: Formats a command for the current shell and turns the argument list into a readable shell-style string. This is handy for snapshot tests or error-message comparisons.
 
-**Data flow**: It takes a command string, gets argv from `format_with_current_shell`, joins it with `shlex::try_join`, and returns the display string.
+**Data flow**: It receives a command string, gets the login-shell argument list from `format_with_current_shell`, then quotes and joins those arguments using shell escaping. It returns one display string.
 
-**Call relations**: This is the human-readable companion to `format_with_current_shell`, used in assertions and snapshots.
+**Call relations**: This is a display wrapper around `format_with_current_shell`. It relies on `shlex` joining so arguments with spaces or special characters are shown safely.
 
 *Call graph*: calls 1 internal fn (format_with_current_shell); 1 external calls (try_join).
 
@@ -468,11 +470,11 @@ fn format_with_current_shell_display(command: &str) -> String
 fn format_with_current_shell_non_login(command: &str) -> Vec<String>
 ```
 
-**Purpose**: Formats a command string into the current user's shell executable arguments without using a login shell.
+**Purpose**: Formats a command as arguments for the user’s default shell without using login-shell behavior. Tests use this when they need the non-login command form Codex would run.
 
-**Data flow**: It takes a command string, reads the default user shell, derives exec args with `use_login_shell = false`, and returns `Vec<String>`.
+**Data flow**: It receives a command string. It asks the default user shell to build execution arguments with `use_login_shell` set to false, and returns the resulting list of strings.
 
-**Call relations**: This helper parallels the login-shell variant and feeds the non-login display wrapper.
+**Call relations**: This parallels `format_with_current_shell` but chooses non-login behavior. `format_with_current_shell_display_non_login` calls it to make a printable string.
 
 *Call graph*: calls 1 internal fn (default_user_shell); called by 1 (format_with_current_shell_display_non_login).
 
@@ -483,11 +485,11 @@ fn format_with_current_shell_non_login(command: &str) -> Vec<String>
 fn format_with_current_shell_display_non_login(command: &str) -> String
 ```
 
-**Purpose**: Formats a command for the current non-login shell and serializes the argv into a shell-escaped display string.
+**Purpose**: Formats a non-login shell command and returns it as a readable string. This helps tests compare displayed commands without manually quoting arguments.
 
-**Data flow**: It takes a command string, gets argv from `format_with_current_shell_non_login`, joins it with `shlex::try_join`, and returns the resulting string.
+**Data flow**: It receives a command string, gets the non-login argument list from `format_with_current_shell_non_login`, quotes and joins the arguments, and returns the joined string.
 
-**Call relations**: This is the display-oriented wrapper for the non-login shell formatting path.
+**Call relations**: This is the display companion to `format_with_current_shell_non_login`, just as `format_with_current_shell_display` is for login-shell commands.
 
 *Call graph*: calls 1 internal fn (format_with_current_shell_non_login); 1 external calls (try_join).
 
@@ -498,11 +500,11 @@ fn format_with_current_shell_display_non_login(command: &str) -> String
 fn stdio_server_bin() -> Result<String, CargoBinError>
 ```
 
-**Purpose**: Finds the `test_stdio_server` Cargo binary and returns its path as a string.
+**Purpose**: Finds the test `test_stdio_server` binary and returns its path as text. Tests use that helper server when checking communication over standard input and output.
 
-**Data flow**: It takes no arguments, resolves the binary with `cargo_bin`, converts the resulting path lossily to `String`, and returns `Result<String, CargoBinError>`.
+**Data flow**: It asks the Cargo binary helper for the `test_stdio_server` executable path, converts that path to a string, and returns it. If the binary cannot be found, it returns the lookup error.
 
-**Call relations**: Tests that launch the stdio test server use this helper to locate the compiled binary.
+**Call relations**: Tests that launch the stdio test server call this before spawning it. The actual binary discovery is delegated to the shared Cargo helper.
 
 *Call graph*: 1 external calls (cargo_bin).
 
@@ -516,11 +518,11 @@ async fn wait_for_path_exists(
     ) -> Result<PathBuf>
 ```
 
-**Purpose**: Asynchronously waits for a path to appear by running the blocking watcher-based implementation on a blocking thread.
+**Purpose**: Asynchronously waits for a specific file-system path to appear. This is useful when a test triggers another task to create a file or directory and needs to wait for it reliably.
 
-**Data flow**: It takes a path-like input and timeout, converts the path into `PathBuf`, spawns `wait_for_path_exists_blocking` via `tokio::task::spawn_blocking`, awaits it, and returns the existing `PathBuf` or an error.
+**Data flow**: It receives a path-like value and a timeout. It converts the path into an owned `PathBuf`, runs the blocking file-wait logic on a background blocking task, and returns the found path or an error.
 
-**Call relations**: This is the async wrapper around the blocking filesystem watcher logic, used by tests that need to await file creation without blocking the runtime.
+**Call relations**: Async tests call this public helper. It keeps blocking file-system watching out of the async runtime by handing the real work to `wait_for_path_exists_blocking` inside `spawn_blocking`.
 
 *Call graph*: 2 external calls (into, spawn_blocking).
 
@@ -535,11 +537,11 @@ async fn wait_for_matching_file(
     ) -> Result<PathBuf>
 ```
 
-**Purpose**: Asynchronously waits for any file under a root directory to satisfy a predicate, using the blocking scanner/watcher implementation.
+**Purpose**: Asynchronously waits until some file under a root directory satisfies a test-provided condition. For example, a test can wait for the first log file whose name matches a pattern.
 
-**Data flow**: It takes a root path, timeout, and `Send + 'static` predicate, converts the root to `PathBuf`, moves the predicate into a `spawn_blocking` closure, and returns the first matching file path or an error.
+**Data flow**: It receives a root path, a timeout, and a predicate function for candidate file paths. It moves the work to a blocking task, waits for the root to exist, scans and watches for matching files, and returns the matching path or an error.
 
-**Call relations**: This helper is the async entrypoint for tests that need to wait for generated files whose exact names are not known in advance.
+**Call relations**: Async tests call this when the exact file name may not be known up front. It delegates to `blocking_find_matching_file` so file-system watching does not block async execution.
 
 *Call graph*: 2 external calls (into, spawn_blocking).
 
@@ -550,11 +552,11 @@ async fn wait_for_matching_file(
 fn wait_for_path_exists_blocking(path: PathBuf, timeout: Duration) -> Result<PathBuf>
 ```
 
-**Purpose**: Synchronously waits for a specific path to exist by watching the nearest existing ancestor and rechecking after each filesystem event until timeout.
+**Purpose**: Waits in a blocking way for one exact path to exist. Blocking means the current thread waits, which is why async callers run it on a special blocking thread.
 
-**Data flow**: It takes a target `PathBuf` and timeout. If the path already exists it returns immediately; otherwise it computes `nearest_existing_ancestor`, creates a `notify` watcher and channel, loops until the deadline checking `path.exists()` before and after each received event, and returns the path or an `anyhow!` timeout error.
+**Data flow**: It receives a path and timeout. If the path already exists, it returns immediately. Otherwise it finds the nearest existing parent, starts a file-system watcher there, and checks after each notification until the path appears or the deadline passes. It returns the path on success or a timeout/watcher error.
 
-**Call relations**: This is the core implementation behind `wait_for_path_exists` and is also reused by `blocking_find_matching_file` to ensure the watched root exists before scanning.
+**Call relations**: `fs_wait::wait_for_path_exists` calls this from a blocking task, and `fs_wait::blocking_find_matching_file` uses it to make sure the root directory exists before scanning. It relies on `nearest_existing_ancestor` to choose a watchable starting point.
 
 *Call graph*: 6 external calls (now, exists, anyhow!, nearest_existing_ancestor, channel, recommended_watcher).
 
@@ -569,11 +571,11 @@ fn blocking_find_matching_file(
     ) -> Result<PathBuf>
 ```
 
-**Purpose**: Synchronously waits for a root directory to exist and then repeatedly scans it for a file matching a predicate, rescanning after watcher events until timeout.
+**Purpose**: Searches and watches a directory tree until a file matching a predicate appears. It combines an immediate scan with live file-system notifications.
 
-**Data flow**: It takes a root `PathBuf`, timeout, and mutable predicate. It first ensures the root exists via `wait_for_path_exists_blocking`, performs an initial `scan_for_match`, then installs a recursive watcher on the root and loops until the deadline, rescanning after each event. It returns the first matching `PathBuf` or an `anyhow!` timeout error.
+**Data flow**: It receives a root path, timeout, and mutable predicate. It first waits for the root path to exist, scans all files under it, and returns the first match if found. If not, it watches the tree recursively, rescanning after changes until a match appears or time runs out. It returns the matching file path or an error.
 
-**Call relations**: This function powers `wait_for_matching_file`; it combines existence waiting, recursive scanning, and event-driven rescans to avoid missing files created between polls.
+**Call relations**: `fs_wait::wait_for_matching_file` runs this inside a blocking task. It uses `wait_for_path_exists_blocking` before watching and `scan_for_match` both before and after notifications.
 
 *Call graph*: 6 external calls (now, anyhow!, scan_for_match, wait_for_path_exists_blocking, channel, recommended_watcher).
 
@@ -584,11 +586,11 @@ fn blocking_find_matching_file(
 fn scan_for_match(root: &Path, predicate: &mut impl FnMut(&Path) -> bool) -> Option<PathBuf>
 ```
 
-**Purpose**: Walks a directory tree and returns the first regular file for which the predicate returns true.
+**Purpose**: Walks through a directory tree and finds the first regular file accepted by a predicate. It is the simple scanning part used by the file-wait helpers.
 
-**Data flow**: It takes a root `&Path` and mutable predicate, iterates `WalkDir::new(root)`, skips non-file entries, applies the predicate to each file path, and returns `Some(PathBuf)` for the first match or `None`.
+**Data flow**: It receives a root directory and a mutable predicate. It walks every entry below the root, skips anything that is not a file, tests file paths with the predicate, and returns the first matching path. If no file matches, it returns nothing.
 
-**Call relations**: This is the pure scanning primitive used by `blocking_find_matching_file` before and after watcher notifications.
+**Call relations**: `fs_wait::blocking_find_matching_file` calls this before setting up a watcher, after watcher events, and once more at the end. It does not watch for changes itself; it only scans the current state.
 
 *Call graph*: 1 external calls (new).
 
@@ -599,24 +601,24 @@ fn scan_for_match(root: &Path, predicate: &mut impl FnMut(&Path) -> bool) -> Opt
 fn nearest_existing_ancestor(path: &Path) -> PathBuf
 ```
 
-**Purpose**: Finds the closest existing ancestor of a path, falling back to `.` if no ancestor exists.
+**Purpose**: Finds the closest existing parent path for a path that may not exist yet. File watchers need something real to watch, so this gives them a safe starting point.
 
-**Data flow**: It takes `&Path`, repeatedly checks `current.exists()`, walks to `current.parent()` when absent, and returns the first existing ancestor as `PathBuf` or `PathBuf::from(".")` if it reaches the root without finding one.
+**Data flow**: It receives a path and walks upward through its parents until it finds one that exists. If it reaches the top without finding one, it returns the current directory `.`. The output is a `PathBuf` for an existing or fallback watch root.
 
-**Call relations**: This helper is used by `wait_for_path_exists_blocking` to choose a valid watch root even when the target path and some parents do not yet exist.
+**Call relations**: `fs_wait::wait_for_path_exists_blocking` calls this before creating a file-system watcher. It makes waiting for not-yet-created paths possible by watching the nearest existing folder instead.
 
 *Call graph*: 1 external calls (from).
 
 
 ### `core/src/test_support.rs`
 
-`test` · `cross-cutting test setup and fixtures`
+`test` · `test setup and test execution`
 
-This module is explicitly marked test-only and re-exports a curated set of helpers that integration tests in other crates can call. It includes `EmptyUserInstructionsProvider`, a trivial `UserInstructionsProvider` implementation whose async loader always returns `LoadedUserInstructions::default()`, allowing tests to bypass user-instruction loading entirely.
+This file is like a box of safe shortcuts for integration tests. Many tests need real-looking pieces of the Codex system: an authentication manager, a thread manager, model information, response metadata, or built-in model presets. Creating those through the normal production path would require more setup than a test cares about, and could make tests slow or brittle. This module gives tests direct, controlled ways to create those pieces.
 
-Several functions are thin wrappers around internal `*_for_tests` constructors: toggles for thread-manager test mode and deterministic unified-exec process ids; auth-manager builders from `CodexAuth`, optionally with a custom Codex home; thread-manager constructors with model providers, custom homes, environment managers, and optional state DB handles; and thread start/resume helpers that inject a user-shell override. `models_manager_with_provider` creates a provider via `create_model_provider` and immediately asks it for a models manager rooted at the supplied home directory. Offline model helpers forward to codex-models-manager test support to resolve a model slug or construct `ModelInfo` from a `Config`'s models-manager view.
+It also contains a simple user-instructions provider, EmptyUserInstructionsProvider, which always says there are no saved user instructions. That is useful when a test wants to remove personal configuration from the equation and focus on one behavior.
 
-The file also defines `TestCodexResponsesRequestKind` and a `responses_metadata` helper that maps test-facing request kinds into `Option<CodexResponsesRequestKind>`, conditionally includes `turn_id`, computes subagent header/kind from `SessionSource`, and fills the remaining fields from `CodexResponsesMetadata::new`. Finally, it exposes a lazily initialized, sorted `TEST_MODEL_PRESETS` built from bundled models JSON and a wrapper for builtin collaboration mode presets. The design keeps tests using the same production wiring paths while avoiding crate-feature permutations.
+Most functions here are thin wrappers around internal “for testing” constructors. The value of the file is not complex logic; it is controlled access. It lets cross-crate tests use private-ish setup paths without enabling separate build features or changing production behavior. It also provides stable offline model data, so tests do not need to contact a live service just to know what a model is. Finally, it can build Codex response metadata in the same shape production code expects, while letting tests choose whether the request is a normal turn, prewarm request, or websocket connection.
 
 #### Function details
 
@@ -626,11 +628,11 @@ The file also defines `TestCodexResponsesRequestKind` and a `responses_metadata`
 fn load_user_instructions(&self) -> LoadUserInstructionsFuture<'_>
 ```
 
-**Purpose**: Implements the test provider by returning an async future that resolves to empty/default user instructions.
+**Purpose**: This returns an empty set of user instructions for tests. It is useful when a test needs a user-instructions provider but wants to make sure no real user preferences affect the result.
 
-**Data flow**: Reads `self`, constructs an async block returning `LoadedUserInstructions::default()`, boxes it with `Box::pin`, and returns `LoadUserInstructionsFuture<'_>`.
+**Data flow**: It takes no meaningful input beyond the provider itself. It creates the default LoadedUserInstructions value, which means “nothing loaded,” wraps it in an asynchronous future, and returns that future to the caller.
 
-**Call relations**: Tests use this provider wherever production code expects a `UserInstructionsProvider` but no instructions should be loaded.
+**Call relations**: Tests can pass EmptyUserInstructionsProvider into code that expects a UserInstructionsProvider. When that code asks for instructions, this method answers immediately with an empty result instead of reading from a real source.
 
 *Call graph*: 2 external calls (pin, default).
 
@@ -641,11 +643,11 @@ fn load_user_instructions(&self) -> LoadUserInstructionsFuture<'_>
 fn set_thread_manager_test_mode(enabled: bool)
 ```
 
-**Purpose**: Enables or disables thread-manager test mode through the internal test-only hook.
+**Purpose**: This turns the thread manager’s test mode on or off. Tests use it when they need the thread manager to behave in a more predictable or test-friendly way than it would in production.
 
-**Data flow**: Consumes `enabled: bool` and forwards it to `thread_manager::set_thread_manager_test_mode_for_tests(enabled)`. It returns `()`.
+**Data flow**: It receives a true-or-false flag. It passes that flag to the internal test-mode switch for the thread manager, changing global test behavior and returning nothing.
 
-**Call relations**: Test setup code calls this to switch thread-manager behavior into deterministic or test-friendly mode.
+**Call relations**: A higher-level test helper, enable_deterministic_unified_exec_process_ids_for_tests, calls this as part of preparing a deterministic test environment. This function hands the request off to the thread manager’s internal test hook.
 
 *Call graph*: calls 1 internal fn (set_thread_manager_test_mode_for_tests); called by 1 (enable_deterministic_unified_exec_process_ids_for_tests).
 
@@ -656,11 +658,11 @@ fn set_thread_manager_test_mode(enabled: bool)
 fn set_deterministic_process_ids(enabled: bool)
 ```
 
-**Purpose**: Turns deterministic unified-exec process id generation on or off for tests.
+**Purpose**: This tells the execution system whether to use predictable process IDs in tests. Predictable IDs make test output stable, so snapshots and assertions do not change from run to run.
 
-**Data flow**: Consumes `enabled: bool` and forwards it to `unified_exec::set_deterministic_process_ids_for_tests(enabled)`. It returns `()`.
+**Data flow**: It receives a true-or-false flag. It forwards that flag to the unified execution test hook, which changes how process IDs are produced, and returns nothing.
 
-**Call relations**: Tests that assert process ids or background-terminal behavior call this during setup.
+**Call relations**: It is used by enable_deterministic_unified_exec_process_ids_for_tests when a test wants repeatable execution details. This function is the public test-support doorway into the lower-level execution setting.
 
 *Call graph*: calls 1 internal fn (set_deterministic_process_ids_for_tests); called by 1 (enable_deterministic_unified_exec_process_ids_for_tests).
 
@@ -671,11 +673,11 @@ fn set_deterministic_process_ids(enabled: bool)
 fn auth_manager_from_auth(auth: CodexAuth) -> Arc<AuthManager>
 ```
 
-**Purpose**: Builds an `AuthManager` from a `CodexAuth` value using the testing constructor.
+**Purpose**: This builds an AuthManager from a supplied CodexAuth value for tests. Tests use it to simulate a logged-in user or API-key setup without performing a real login flow.
 
-**Data flow**: Consumes `auth: CodexAuth`, calls `AuthManager::from_auth_for_testing(auth)`, and returns `Arc<AuthManager>`.
+**Data flow**: It receives a CodexAuth object containing the test authentication state. It gives that to the authentication module’s testing constructor and returns a shared AuthManager wrapped in Arc, which is a thread-safe shared pointer.
 
-**Call relations**: Many integration tests use this as the standard way to obtain authenticated session infrastructure without production login flows.
+**Call relations**: Many integration tests call this when they need authentication available to model requests, remote control flows, configuration building, or provider calls. It delegates the actual construction to AuthManager::from_auth_for_testing.
 
 *Call graph*: calls 1 internal fn (from_auth_for_testing); called by 25 (remote_control_auth_manager, remote_control_auth_manager, rewrite_mcp_tool_arguments_for_openai_files_surfaces_upload_failures, approve_mode_skips_guardian_in_every_permission_mode, build_from_config, responses_respects_model_info_overrides_from_config, azure_responses_request_includes_store_and_reasoning_ids, prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens, websocket_harness_with_provider_options, code_mode_can_call_standalone_web_search (+15 more)).
 
@@ -686,11 +688,11 @@ fn auth_manager_from_auth(auth: CodexAuth) -> Arc<AuthManager>
 fn auth_manager_from_auth_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<AuthManager>
 ```
 
-**Purpose**: Builds a test `AuthManager` from auth plus an explicit Codex home directory.
+**Purpose**: This builds a test AuthManager and pins it to a specific Codex home folder. That lets tests control where authentication-related files would live.
 
-**Data flow**: Consumes `auth` and `codex_home: PathBuf`, forwards them to `AuthManager::from_auth_for_testing_with_home`, and returns `Arc<AuthManager>`.
+**Data flow**: It receives a CodexAuth value and a PathBuf pointing to the test Codex home directory. It passes both to the testing constructor and returns a shared AuthManager.
 
-**Call relations**: Tests that need auth state rooted in a temporary home directory use this variant.
+**Call relations**: remote_control_auth_manager_with_home calls this when a test needs both fake authentication and a controlled home directory. The function forwards the setup to AuthManager::from_auth_for_testing_with_home.
 
 *Call graph*: calls 1 internal fn (from_auth_for_testing_with_home); called by 1 (remote_control_auth_manager_with_home).
 
@@ -704,11 +706,11 @@ fn thread_manager_with_models_provider(
 ) -> ThreadManager
 ```
 
-**Purpose**: Constructs a `ThreadManager` for tests using a chosen model provider.
+**Purpose**: This creates a ThreadManager for tests using a chosen model provider. Tests use it when they need to start or inspect Codex threads without relying on the default provider setup.
 
-**Data flow**: Consumes `auth` and `provider`, forwards them to `ThreadManager::with_models_provider_for_tests`, and returns the resulting `ThreadManager`.
+**Data flow**: It receives test authentication and model-provider information. It passes both into the ThreadManager testing constructor and returns a ready-to-use ThreadManager.
 
-**Call relations**: Integration tests use this to stand up thread management with a specific provider backend.
+**Call relations**: Tests about warnings and model configuration call this to get a thread manager with known model behavior. The real setup work is handed to ThreadManager::with_models_provider_for_tests.
 
 *Call graph*: calls 1 internal fn (with_models_provider_for_tests); called by 3 (emits_warning_when_resumed_model_differs, emits_warning_when_unstable_features_enabled_via_config, suppresses_warning_when_configured).
 
@@ -724,11 +726,11 @@ fn thread_manager_with_models_provider_and_home(
 ) -> ThreadManager
 ```
 
-**Purpose**: Constructs a test `ThreadManager` with explicit model provider, Codex home, and environment manager.
+**Purpose**: This creates a test ThreadManager using a chosen model provider, a chosen Codex home directory, and an environment manager. It is useful when a test needs control over both model setup and the filesystem-like environment.
 
-**Data flow**: Consumes auth, provider, `codex_home`, and `Arc<EnvironmentManager>`, forwards them to `ThreadManager::with_models_provider_and_home_for_tests`, and returns `ThreadManager`.
+**Data flow**: It receives authentication, provider information, a home path, and a shared EnvironmentManager. It forwards those inputs to the ThreadManager testing constructor and returns the constructed ThreadManager.
 
-**Call relations**: Tests needing both custom filesystem roots and environment management use this richer constructor.
+**Call relations**: Tests around guardian review behavior, subagent activity, and turn snapshots call this when they need a more complete thread-manager setup. This function acts as the test-support bridge to ThreadManager::with_models_provider_and_home_for_tests.
 
 *Call graph*: calls 1 internal fn (with_models_provider_and_home_for_tests); called by 3 (guardian_command_execution_notifications_wrap_review_lifecycle, interrupted_subagent_activity_removes_missing_thread_watch, turn_started_omits_active_snapshot_items).
 
@@ -744,11 +746,11 @@ fn thread_manager_with_models_provider_home_and_state(
     state_db: Op
 ```
 
-**Purpose**: Constructs a test `ThreadManager` with explicit provider, home, environment manager, and optional persisted state handle.
+**Purpose**: This creates a test ThreadManager with model provider settings, a Codex home directory, an environment manager, and an optional state database. Tests use it when they need to include or omit persistent state on purpose.
 
-**Data flow**: Consumes auth, provider, home path, environment manager, and `Option<crate::StateDbHandle>`, forwards them to `ThreadManager::with_models_provider_home_and_state_for_tests`, and returns `ThreadManager`.
+**Data flow**: It receives authentication, provider information, a home path, an EnvironmentManager, and optionally a StateDbHandle. It passes all of that to the ThreadManager testing constructor and returns the configured ThreadManager.
 
-**Call relations**: Stateful integration tests use this when they need to exercise resume/state-db behavior.
+**Call relations**: This is the most configurable thread-manager constructor in this file. It hands setup off to ThreadManager::with_models_provider_home_and_state_for_tests for tests that need to exercise state-aware behavior.
 
 *Call graph*: calls 1 internal fn (with_models_provider_home_and_state_for_tests).
 
@@ -763,11 +765,11 @@ async fn start_thread_with_user_shell_override(
 ) -> codex_protocol::error::Result<crate::NewThrea
 ```
 
-**Purpose**: Starts a new thread in tests while forcing a specific shell configuration.
+**Purpose**: This starts a new test thread while forcing the user shell to a specific value. A shell is the command-line program used to run commands, and overriding it lets tests avoid depending on the machine they run on.
 
-**Data flow**: Consumes a borrowed `ThreadManager`, `Config`, and shell override, forwards them to `start_thread_with_user_shell_override_for_tests(...).await`, and returns `codex_protocol::error::Result<crate::NewThread>`.
+**Data flow**: It receives a ThreadManager reference, a Config, and a Shell value chosen by the test. It asks the thread manager to start a thread with that shell override, waits for the asynchronous work to finish, and returns either a NewThread or an error.
 
-**Call relations**: Test harnesses call this to create threads whose shell behavior is controlled independently of the host environment.
+**Call relations**: build_from_config calls this when a test needs to start a thread from configuration but with a controlled shell. This wrapper delegates to the thread manager’s test-only start method.
 
 *Call graph*: calls 1 internal fn (start_thread_with_user_shell_override_for_tests); called by 1 (build_from_config).
 
@@ -783,11 +785,11 @@ async fn resume_thread_from_rollout_with_user_shell_override(
     user_shell_over
 ```
 
-**Purpose**: Resumes a thread from rollout state in tests while forcing a specific shell configuration.
+**Purpose**: This resumes a saved thread rollout in a test while forcing a specific user shell. It lets tests replay an existing conversation state without depending on the host computer’s default shell.
 
-**Data flow**: Consumes a borrowed `ThreadManager`, `Config`, rollout path, `Arc<AuthManager>`, and shell override; forwards them to `resume_thread_from_rollout_with_user_shell_override_for_tests(...).await`; and returns the resulting `Result<crate::NewThread>`.
+**Data flow**: It receives a ThreadManager, configuration, the path to a rollout file, an AuthManager, and the shell override. It asks the thread manager to resume the thread using those inputs, waits for completion, and returns a NewThread or an error.
 
-**Call relations**: Resume-path tests use this to recreate threads from saved rollout data under controlled shell settings.
+**Call relations**: build_from_config calls this when testing resume behavior from a saved rollout. The function hands the real resume operation to ThreadManager::resume_thread_from_rollout_with_user_shell_override_for_tests.
 
 *Call graph*: calls 1 internal fn (resume_thread_from_rollout_with_user_shell_override_for_tests); called by 1 (build_from_config).
 
@@ -802,11 +804,11 @@ fn models_manager_with_provider(
 ) -> SharedModelsManager
 ```
 
-**Purpose**: Creates a shared models manager for tests from a provider descriptor and auth manager.
+**Purpose**: This builds a shared models manager for tests using a specific model provider. A models manager is the component that knows what models are available and how they should be described.
 
-**Data flow**: Consumes `codex_home`, `Arc<AuthManager>`, and `ModelProviderInfo`. It creates a provider with `create_model_provider(provider, Some(auth_manager))`, then calls `provider.models_manager(codex_home, None)` and returns the resulting `SharedModelsManager`.
+**Data flow**: It receives a Codex home path, a shared AuthManager, and provider information. It first creates a model provider using the authentication manager, then asks that provider to create a models manager for the given home directory, and returns the shared manager.
 
-**Call relations**: Many tests use this to obtain a models manager without constructing a full thread manager.
+**Call relations**: Many guardian and provider tests call this when they need realistic model lookup behavior without using the application’s normal startup path. It connects the external create_model_provider helper to the provider’s models_manager method.
 
 *Call graph*: called by 24 (guardian_review_request_layout_matches_model_visible_request_snapshot, guardian_review_surfaces_responses_api_errors_in_rejection_reason, guardian_test_session_and_turn_with_base_url, guardian_test_session_turn_and_rx, approve_mode_skips_guardian_in_every_permission_mode, guardian_mode_mcp_denial_returns_rationale_message, guardian_mode_skips_auto_when_annotations_do_not_require_approval, guardian_allows_shell_command_additional_permissions_requests_past_policy_validation, guardian_subagent_does_not_inherit_parent_exec_policy_rules, request_permissions_guardian_review_stops_when_cancelled (+14 more)); 2 external calls (create_model_provider, models_manager).
 
@@ -817,11 +819,11 @@ fn models_manager_with_provider(
 fn get_model_offline(model: Option<&str>) -> String
 ```
 
-**Purpose**: Returns the offline-test model slug chosen for an optional requested model name.
+**Purpose**: This returns a model name suitable for offline tests. It keeps tests from needing a network call just to choose a model.
 
-**Data flow**: Consumes `model: Option<&str>`, forwards it to `get_model_offline_for_tests`, and returns the resulting `String`.
+**Data flow**: It receives an optional model name. It passes that choice to the models-manager test helper, which either uses the requested model or picks an offline test default, then returns the model string.
 
-**Call relations**: Tests that need a stable offline model selection use this wrapper instead of reaching into codex-models-manager directly.
+**Call relations**: Tests for responses streams, Azure request details, and provider authentication call this when they need a stable model identifier. This function simply exposes get_model_offline_for_tests across crate boundaries.
 
 *Call graph*: calls 1 internal fn (get_model_offline_for_tests); called by 4 (responses_stream_includes_subagent_header_on_other, responses_stream_includes_subagent_header_on_review, azure_responses_request_includes_store_and_reasoning_ids, send_provider_auth_request).
 
@@ -832,11 +834,11 @@ fn get_model_offline(model: Option<&str>) -> String
 fn construct_model_info_offline(model: &str, config: &Config) -> ModelInfo
 ```
 
-**Purpose**: Builds offline `ModelInfo` for a given model slug using the supplied config's models-manager configuration.
+**Purpose**: This builds offline ModelInfo for a named model using the current test configuration. ModelInfo is the structured description of a model, such as its capabilities and settings.
 
-**Data flow**: Consumes `model: &str` and `config: &Config`, converts the config with `config.to_models_manager_config()`, forwards both to `construct_model_info_offline_for_tests`, and returns `ModelInfo`.
+**Data flow**: It receives a model name and a Config. It converts the Config into the form expected by the models manager, then asks the offline test helper to construct the ModelInfo, and returns that description.
 
-**Call relations**: Tests that need realistic `ModelInfo` objects derived from config use this helper.
+**Call relations**: Tests that need exact model capability data call this before making response requests or checking instruction behavior. It bridges Config to construct_model_info_offline_for_tests.
 
 *Call graph*: calls 1 internal fn (construct_model_info_offline_for_tests); called by 9 (responses_respects_model_info_overrides_from_config, responses_stream_includes_subagent_header_on_other, responses_stream_includes_subagent_header_on_review, azure_responses_request_includes_store_and_reasoning_ids, send_provider_auth_request, websocket_harness_with_provider_options, base_instructions_override_disables_personality_template, instructions_uses_base_if_feature_disabled, personality_does_not_mutate_base_instructions_without_template); 1 external calls (to_models_manager_config).
 
@@ -854,11 +856,11 @@ fn responses_metadata(
     parent_thread_id:
 ```
 
-**Purpose**: Constructs `CodexResponsesMetadata` for tests, including optional turn/request-kind fields and subagent headers derived from session source.
+**Purpose**: This builds Codex response metadata for tests. Metadata is the extra identifying information attached to a model request, such as session ID, thread ID, turn ID, and subagent details.
 
-**Data flow**: Consumes installation/session/thread ids, optional turn id, window id, `SessionSource`, optional parent thread id, and `TestCodexResponsesRequestKind`. It maps the test enum to `Option<CodexResponsesRequestKind>`, conditionally derives `turn_id` and `subagent_kind` only when a request kind exists, computes `subagent_header` from `subagent_header_value(session_source)`, and fills the remaining fields from `CodexResponsesMetadata::new(...)`. It returns the assembled metadata struct.
+**Data flow**: It receives IDs, window information, session source, an optional parent thread ID, and a test request kind. It converts the test request kind into the production request kind, fills in turn and subagent fields only when appropriate, creates the base metadata, and returns the completed CodexResponsesMetadata value.
 
-**Call relations**: Tests that validate outbound Responses API metadata call this helper to mirror production metadata construction while controlling request-kind semantics.
+**Call relations**: test_responses_metadata_for_client calls this to produce metadata shaped like real client requests. Inside, it uses CodexResponsesMetadata::new for the base object and helper functions to derive subagent header and subagent kind from the session source.
 
 *Call graph*: calls 2 internal fn (new, subagent_header_value); called by 1 (test_responses_metadata_for_client); 2 external calls (and, and_then).
 
@@ -869,11 +871,11 @@ fn responses_metadata(
 fn all_model_presets() -> &'static Vec<ModelPreset>
 ```
 
-**Purpose**: Returns the lazily initialized list of bundled model presets prepared for tests.
+**Purpose**: This returns the built-in model presets prepared for tests. Presets are ready-made model choices shown or used by the system.
 
-**Data flow**: Reads the static `TEST_MODEL_PRESETS` and returns `&'static Vec<ModelPreset>`.
+**Data flow**: It takes no input. It returns a shared reference to a lazily initialized static list that was built from bundled model data, sorted by priority, converted into presets, and marked with the default picker visibility.
 
-**Call relations**: Tests that need the full visible preset list use this shared fixture rather than reparsing bundled models each time.
+**Call relations**: Tests about model cache writing, visible models, service tiers, and default model selection call this when they need the same preset list every time. The expensive setup happens once in TEST_MODEL_PRESETS, and this function simply lends it out.
 
 *Call graph*: called by 5 (write_models_cache, expected_visible_models, service_tier_model_and_tier_id, turn_start_sends_service_tier_id_to_model_request, bundled_default_model_slug).
 
@@ -884,24 +886,26 @@ fn all_model_presets() -> &'static Vec<ModelPreset>
 fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask>
 ```
 
-**Purpose**: Returns the builtin collaboration mode presets exposed by the models-manager preset module.
+**Purpose**: This returns the built-in collaboration mode presets for tests. Collaboration modes describe allowed combinations of how Codex can work with the user.
 
-**Data flow**: Calls `collaboration_mode_presets::builtin_collaboration_mode_presets()` and returns the resulting `Vec<CollaborationModeMask>`.
+**Data flow**: It takes no input. It calls the collaboration-mode preset provider and returns the resulting list of CollaborationModeMask values.
 
-**Call relations**: Tests that enumerate or validate collaboration modes use this wrapper to access the production preset list.
+**Call relations**: list_collaboration_modes_returns_presets calls this to compare API output against the built-in preset list. This function exposes the production preset source through the test-support module.
 
 *Call graph*: calls 1 internal fn (builtin_collaboration_mode_presets); called by 1 (list_collaboration_modes_returns_presets).
 
 
 ### `core/tests/common/test_environment.rs`
 
-`config` · `test startup / environment detection`
+`test` · `test setup`
 
-This file defines the `TestEnvironment` enum and the parsing logic that maps process environment variables into one of three modes: `Local`, `Docker { container_name }`, or `WineExec`. The parser supports both the current `CODEX_TEST_ENVIRONMENT` variable and a legacy Docker-only variable pair for backward compatibility. Validation is strict: configured values must be valid UTF-8, container names must be non-empty after trimming, and unknown environment names produce descriptive errors.
+Tests in this project can run in more than one place. Most run locally, but some run in a Docker container, and some run through Wine, which lets Linux run Windows-style programs. This file turns environment variables into a small, reliable description of that choice.
 
-The enum carries behavior needed by remote test setup. `is_remote` distinguishes local from non-local modes. `docker_container_name` exposes the Docker container name only when applicable. `remote_cwd` computes a unique remote working directory path for a given instance ID, returning `None` for local mode, a POSIX `/tmp/codex-core-test-cwd-<id>` file URI for Docker, or a Windows-style `C:/codex-core-test-cwd-<id>` file URI for Wine-exec. It then converts that URI into a `LegacyAppPathString` using the environment's `PathConvention`, which is native for local, POSIX for Docker, and Windows for Wine-exec.
+The central type is `TestEnvironment`, which has three possibilities: `Local`, `Docker`, or `WineExec`. Other test code can ask simple questions such as “is this remote?” or “what Docker container should I use?” without needing to know which environment variables were set.
 
-`test_environment` is the public entrypoint: it reads the relevant environment variables, delegates to `parse_test_environment`, panics on invalid configuration, and additionally rejects `wine-exec` unless the host OS is Linux. `get_remote_test_env` simply returns `Some(environment)` when the parsed environment is remote. This module is used by higher-level test harnesses and by skip macros exported from the common test library.
+The file also protects against bad setup. For example, Docker tests need a non-empty container name, and all names must be valid UTF-8 text. If the setup is invalid, the code fails early with a clear error instead of letting a later test fail in a confusing way.
+
+One important detail is path style. A path inside Docker should look like a Unix path, while Wine uses Windows-style paths such as `C:/...`. The `remote_cwd` helper builds an isolated working directory for each test instance, like giving every test its own temporary desk so they do not bump into each other.
 
 #### Function details
 
@@ -911,11 +915,11 @@ The enum carries behavior needed by remote test setup. `is_remote` distinguishes
 fn is_remote(&self) -> bool
 ```
 
-**Purpose**: Returns whether the test environment is anything other than `Local`.
+**Purpose**: This answers whether the test environment is somewhere other than the local machine. It treats Docker and Wine execution as remote-style environments because tests need special path or execution setup there.
 
-**Data flow**: It matches on `self` and returns `false` for `Local`, `true` otherwise.
+**Data flow**: It reads the current `TestEnvironment` value. If the value is `Local`, it returns `false`; for `Docker` or `WineExec`, it returns `true`. It does not change anything.
 
-**Call relations**: `get_remote_test_env` uses this to decide whether to return the parsed environment or `None`.
+**Call relations**: This is used by `get_remote_test_env` after the full environment has been read. It acts as the simple yes-or-no filter that decides whether to return a remote test environment at all.
 
 *Call graph*: 1 external calls (matches!).
 
@@ -926,11 +930,11 @@ fn is_remote(&self) -> bool
 fn docker_container_name(&self) -> Option<&str>
 ```
 
-**Purpose**: Returns the Docker container name when the environment is Docker-backed.
+**Purpose**: This returns the Docker container name when the test environment is Docker. It lets callers get the container name without manually checking the enum themselves.
 
-**Data flow**: It matches on `self`, returning `Some(&container_name)` for `Docker` and `None` for `Local` or `WineExec`.
+**Data flow**: It reads the current `TestEnvironment`. If it is `Docker`, it gives back the stored container name as text; if it is `Local` or `WineExec`, it gives back nothing. It does not modify the environment.
 
-**Call relations**: Remote test setup and cleanup use this to decide whether Docker-specific cleanup commands are possible.
+**Call relations**: This is a convenience method for test code that only needs Docker-specific information. It sits on top of the parsed environment choice and avoids spreading Docker pattern checks throughout the test helpers.
 
 
 ##### `TestEnvironment::remote_cwd`  (lines 31–47)
@@ -939,11 +943,11 @@ fn docker_container_name(&self) -> Option<&str>
 fn remote_cwd(&self, instance_id: &str) -> Result<Option<LegacyAppPathString>>
 ```
 
-**Purpose**: Computes the remote working-directory path for a given test instance ID in the environment's path convention.
+**Purpose**: This builds the working directory path that a remote-style test should use. It returns no path for local tests, but gives Docker and Wine tests an isolated directory name based on the test instance ID.
 
-**Data flow**: It takes `instance_id`, returns `Ok(None)` for `Local`, otherwise formats a file URI under `/tmp` for Docker or `C:/` for Wine-exec, parses it as `PathUri`, converts it to `LegacyAppPathString` using `self.path_convention()`, and returns `Ok(Some(...))`.
+**Data flow**: It takes the current environment and an `instance_id`. For local tests, it immediately returns `None`. For Docker, it creates a Unix-style file URI under `/tmp`; for Wine, it creates a Windows-style file URI under `C:/`. It then converts that URI into the path string format expected by the application, using the environment’s path convention, and returns it wrapped in `Some`.
 
-**Call relations**: Higher-level remote test harness code calls this when provisioning a unique cwd inside the remote environment.
+**Call relations**: When test setup needs a current working directory for a remote run, it calls this method. The method asks `TestEnvironment::path_convention` which path style to use, then hands the URI to path conversion utilities so the result matches what the tested code expects.
 
 *Call graph*: calls 3 internal fn (path_convention, parse, from_path_uri); 1 external calls (format!).
 
@@ -954,11 +958,11 @@ fn remote_cwd(&self, instance_id: &str) -> Result<Option<LegacyAppPathString>>
 fn path_convention(&self) -> PathConvention
 ```
 
-**Purpose**: Returns the filesystem path convention associated with the environment.
+**Purpose**: This tells the rest of the test code which path style belongs to the current environment. Local tests use the machine’s native style, Docker uses Unix-style paths, and Wine uses Windows-style paths.
 
-**Data flow**: It matches on `self` and returns `PathConvention::native()` for `Local`, `PathConvention::Posix` for `Docker`, and `PathConvention::Windows` for `WineExec`.
+**Data flow**: It reads the `TestEnvironment` value and returns a `PathConvention`, which is a small description of how file paths should look. Nothing is changed; it only translates an environment choice into a path-format choice.
 
-**Call relations**: `remote_cwd` uses this to convert file URIs into the legacy path-string representation expected by remote environment APIs.
+**Call relations**: This is called by `TestEnvironment::remote_cwd` when building a remote working directory path. It supplies the path rules needed before the path URI can be converted into the application’s legacy path string format.
 
 *Call graph*: calls 1 internal fn (native); called by 1 (remote_cwd).
 
@@ -969,11 +973,11 @@ fn path_convention(&self) -> PathConvention
 fn test_environment() -> TestEnvironment
 ```
 
-**Purpose**: Parses the current process environment into a validated `TestEnvironment`, panicking on invalid configuration or unsupported Wine-exec host OS.
+**Purpose**: This is the main public way for tests to find out which environment they should run in. It reads the relevant environment variables, validates them, and returns a `TestEnvironment` value.
 
-**Data flow**: It reads `TEST_ENVIRONMENT_ENV_VAR`, `LEGACY_REMOTE_ENV_ENV_VAR`, and `DOCKER_CONTAINER_ENV_VAR` with `std::env::var_os`, passes them to `parse_test_environment`, panics if parsing fails, then additionally panics if the result is `WineExec` on a non-Linux host. It returns the validated `TestEnvironment`.
+**Data flow**: It reads three operating-system environment variables: the main test environment setting, the older remote-environment setting, and the Docker container name setting. It passes those raw values to `parse_test_environment`. If parsing succeeds, it checks one extra rule: `wine-exec` is only allowed on Linux. It returns the final environment or stops the test run with a clear failure if the setup is invalid.
 
-**Call relations**: This is the public environment-detection entrypoint used by `get_remote_test_env` and by skip macros in the common test library.
+**Call relations**: This is the front door for environment detection. `get_remote_test_env` calls it when it wants the same information but only cares about remote environments. Internally, it delegates the detailed interpretation of environment variables to `parse_test_environment`.
 
 *Call graph*: calls 1 internal fn (parse_test_environment); called by 1 (get_remote_test_env); 4 external calls (cfg!, matches!, panic!, var_os).
 
@@ -984,11 +988,11 @@ fn test_environment() -> TestEnvironment
 fn get_remote_test_env() -> Option<TestEnvironment>
 ```
 
-**Purpose**: Returns the parsed test environment only when it is remote.
+**Purpose**: This returns the current test environment only if it is remote-style, meaning Docker or Wine. It is useful for code that should do extra setup only when tests are not purely local.
 
-**Data flow**: It calls `test_environment()`, checks `environment.is_remote()`, and returns `Some(environment)` or `None` accordingly.
+**Data flow**: It first calls `test_environment` to get the validated environment. Then it asks that environment whether it is remote. If yes, it returns the environment inside `Some`; if no, it returns `None`.
 
-**Call relations**: Higher-level harness code uses this to branch between local and remote setup without reimplementing environment parsing.
+**Call relations**: This is a small wrapper around `test_environment`. It relies on `TestEnvironment::is_remote` to decide whether the parsed environment should be passed along or ignored.
 
 *Call graph*: calls 1 internal fn (test_environment).
 
@@ -1003,11 +1007,11 @@ fn parse_test_environment(
 ) -> Result<TestEnvironment, String>
 ```
 
-**Purpose**: Implements the detailed environment-variable parsing and backward-compatibility rules for selecting `Local`, `Docker`, or `WineExec` test mode.
+**Purpose**: This turns raw environment-variable values into a valid `TestEnvironment`. It contains the rules for modern and legacy configuration, including how Docker container names are found.
 
-**Data flow**: It takes optional `OsStr` values for the configured environment, legacy remote environment, and Docker container name. It first validates UTF-8 for the configured environment if present. With no configured environment, it falls back to legacy Docker mode when `legacy_remote_environment` is set, otherwise `Local`. For `local`, it returns `Local`. For `docker`, it requires a container name from `DOCKER_CONTAINER_ENV_VAR` or falls back to the legacy variable, validates it with `non_empty_utf8`, and returns `Docker { container_name }`. For `wine-exec`, it returns `WineExec`. Any other configured value yields an error string naming the allowed values.
+**Data flow**: It receives optional raw operating-system strings for the configured environment, the legacy remote setting, and the Docker container setting. It first makes sure the main environment value, if present, is valid UTF-8 text. Then it chooses the environment: missing means local unless the legacy remote variable is present; `local` means local; `docker` means Docker and requires a non-empty container name; `wine-exec` means Wine. If anything is invalid or unsupported, it returns an error message.
 
-**Call relations**: This parser is called only by `test_environment`, which turns its `Result` into a panic-on-invalid public API.
+**Call relations**: This is called by `test_environment` after the raw environment variables are read. Whenever it needs to validate a container name, it hands that value to `non_empty_utf8`, so the detailed text checks stay in one helper.
 
 *Call graph*: calls 1 internal fn (non_empty_utf8); called by 1 (test_environment); 1 external calls (format!).
 
@@ -1018,24 +1022,24 @@ fn parse_test_environment(
 fn non_empty_utf8(name: &str, value: &OsStr) -> Result<String, String>
 ```
 
-**Purpose**: Validates that an environment-variable value is valid UTF-8 and not empty after trimming.
+**Purpose**: This checks that an environment-variable value is usable text and not blank. It gives clear error messages naming the variable that caused the problem.
 
-**Data flow**: It takes the variable name and `&OsStr` value, converts it with `to_str()`, trims whitespace, returns an error string if conversion fails or the trimmed value is empty, and otherwise returns an owned `String`.
+**Data flow**: It receives the variable name and its raw operating-system value. It tries to convert the value to UTF-8 text, trims whitespace to check whether anything meaningful remains, and then returns the original text as a `String`. If the value is not valid text or is empty after trimming, it returns an error message.
 
-**Call relations**: `parse_test_environment` uses this helper for Docker container-name validation in both current and legacy configuration paths.
+**Call relations**: This is used by `parse_test_environment` when reading Docker container names from either the current or legacy environment variable. It acts as the final gatekeeper before a container name is stored in `TestEnvironment::Docker`.
 
 *Call graph*: called by 1 (parse_test_environment); 4 external calls (to_str, to_string, trim, format!).
 
 
 ### `core/tests/common/hooks.rs`
 
-`config` · `test config setup`
+`test` · `test setup`
 
-This file provides a narrow set of helpers used by tests that need Codex hooks to be treated as already trusted. The central operation is to take a `codex_core::config::Config`, inspect or synthesize its active user TOML layer, and inject per-hook trust records keyed by each `HookListEntry.key`. Each inserted record is a TOML table containing a single `trusted_hash` string set to the hook's `current_hash`, matching the shape expected by hook trust logic.
+Codex hooks are small pieces of extra behavior that can be discovered from configuration or the filesystem. Because hooks can run code, the system tracks whether each hook is trusted, using a stored hash of its current contents. In normal use, that protects people from silently running changed or unexpected hook code. In tests, though, that safety check can get in the way: a test fixture hook may be correctly present, but still need to be marked trusted before the feature under test can proceed.
 
-`trust_discovered_hooks` is the high-level convenience path: it first enables the `Feature::CodexHooks` feature flag on the mutable config, then calls `codex_hooks::list_hooks` with `feature_enabled: true` and the config's cloned `ConfigLayerStack` so discovery runs against the same layered configuration the test will use. It asserts that at least one hook was found, making fixture failures obvious, and then delegates to `trust_hooks`.
+This file provides shared helpers for tests that need that setup. It can turn on the hooks feature for a test `Config`, ask the hooks system which hooks are currently visible, and then write trust records for those hooks into the user configuration layer. Think of it like stamping each discovered hook with an “approved as of this exact version” label.
 
-`trust_hooks` simply replaces `config.config_layer_stack` with a rewritten stack returned by `trusted_config_layer_stack`. That lower-level function preserves any existing user config if present, otherwise starts from an empty TOML table; it then ensures `hooks`, `hooks.state`, and each hook entry are tables, panicking with explicit messages if the existing user config has an incompatible shape. Finally it rebuilds the stack with `with_user_config`, targeting `<codex_home>/config.toml` via `CONFIG_TOML_FILE`.
+The important detail is that it does not write a real user config file directly. Instead, it builds a new `ConfigLayerStack`, which is the layered view of settings used by Codex, and replaces the test config’s stack with one whose user layer contains `hooks.state.<hook>.trusted_hash`. That keeps tests realistic while still staying contained inside the test configuration.
 
 #### Function details
 
@@ -1045,11 +1049,11 @@ This file provides a narrow set of helpers used by tests that need Codex hooks t
 fn trust_discovered_hooks(config: &mut Config)
 ```
 
-**Purpose**: Enables the hooks feature in a test config, discovers hooks using the current layered configuration, asserts that discovery found at least one fixture hook, and marks those hooks trusted.
+**Purpose**: Turns on the hooks feature in a test configuration, discovers the hooks that are currently available, and marks all of them as trusted. Tests use this when they want hook behavior enabled without being blocked by trust checks.
 
-**Data flow**: It takes `&mut Config`, mutates `config.features` to enable `Feature::CodexHooks`, reads `config.config_layer_stack` to build a `codex_hooks::HooksConfig`, receives a discovered hook list from `list_hooks`, asserts the list is non-empty, and then passes the discovered `Vec<HookListEntry>` into `trust_hooks`, which updates `config.config_layer_stack`.
+**Data flow**: It receives a mutable test `Config`. First it enables the `CodexHooks` feature flag, then asks the hooks library to list hooks using the config’s current layer stack. If no hooks are found, it stops the test with an assertion because the fixture setup is not what the test expected. If hooks are found, it passes the list onward so the config can be rewritten with trust records.
 
-**Call relations**: This is the convenience entry used by higher-level test setup paths such as `configure` and `enable_hooks_and_rmcp_server` when they want fixture hooks trusted without manually enumerating them. After discovery it delegates all persistence of trust state to `trust_hooks`.
+**Call relations**: Higher-level test setup code, such as `configure` and `enable_hooks_and_rmcp_server`, calls this when a test needs hooks to be active and pre-approved. After discovery, it hands the actual trust-writing work to `trust_hooks`, keeping this function focused on “find what needs trusting first.”
 
 *Call graph*: calls 1 internal fn (trust_hooks); called by 2 (configure, enable_hooks_and_rmcp_server); 3 external calls (assert!, list_hooks, default).
 
@@ -1060,11 +1064,11 @@ fn trust_discovered_hooks(config: &mut Config)
 fn trust_hooks(config: &mut Config, hooks: Vec<HookListEntry>)
 ```
 
-**Purpose**: Replaces the config's layer stack with a version whose user layer contains trust records for the supplied hooks.
+**Purpose**: Marks a supplied list of hooks as trusted inside a mutable test configuration. Use this when a test already knows which hooks should be approved.
 
-**Data flow**: It accepts `&mut Config` plus a `Vec<HookListEntry>`, reads `config.config_layer_stack` and `config.codex_home`, computes a new `ConfigLayerStack` via `trusted_config_layer_stack`, and writes that stack back into `config.config_layer_stack`.
+**Data flow**: It takes the current `Config` and a list of `HookListEntry` values, where each entry includes a hook key and its current hash. It builds a replacement configuration layer stack that contains those trust records, then stores that new stack back into the config. The main visible change is that later hook checks see those hooks as trusted.
 
-**Call relations**: This is the shared mutation point used both after automatic discovery and by tests that already have a concrete hook list. It is a thin wrapper around `trusted_config_layer_stack`, which performs the actual TOML rewriting.
+**Call relations**: It is called by `trust_discovered_hooks` after hooks have been found automatically, and by other test helpers such as `trust_plugin_hooks` when the hook list is already known. It delegates the careful editing of the layered configuration data to `trusted_config_layer_stack`.
 
 *Call graph*: calls 1 internal fn (trusted_config_layer_stack); called by 2 (trust_discovered_hooks, trust_plugin_hooks).
 
@@ -1079,20 +1083,24 @@ fn trusted_config_layer_stack(
 ) -> ConfigLayerStack
 ```
 
-**Purpose**: Builds a new `ConfigLayerStack` whose active user config contains `hooks.state.<hook_key>.trusted_hash = <current_hash>` entries for every provided hook.
+**Purpose**: Creates a new configuration layer stack whose user config says that the given hooks are trusted. This is the low-level helper that writes the trust information into the same shape the real config system expects.
 
-**Data flow**: It takes an existing `&ConfigLayerStack`, the `&AbsolutePathBuf` for `codex_home`, and a `Vec<HookListEntry>`. It reads the active user layer if one exists and clones its `TomlValue`; otherwise it starts from `TomlValue::Table(Default::default())`. It then mutates nested TOML tables for `hooks` and `state`, inserts one table per hook keyed by `hook.key` with a `trusted_hash` string from `hook.current_hash`, and returns a new stack from `with_user_config` pointing at `codex_home.join(CONFIG_TOML_FILE)`.
+**Data flow**: It starts with an existing `ConfigLayerStack`, the Codex home directory, and a list of hooks. It copies the active user config if one exists, or starts with an empty TOML table if not. Then it makes sure the nested `hooks.state` tables exist, and for each hook stores its `current_hash` under `trusted_hash`. Finally it returns a new layer stack with that updated user config attached at the normal config file path under the test Codex home.
 
-**Call relations**: This is the core implementation called by `trust_hooks` and also reused directly by tests that need a precomputed trusted stack, such as hook-installation helpers. It does not perform discovery itself; it assumes callers already chose the hooks to trust.
+**Call relations**: This function is used whenever a test helper needs the exact config-layer rewrite rather than just a simple flag change. `trust_hooks` uses it for general hook approval, and `install_mcp_permission_request_hook` uses it when installing and trusting a specific hook. It relies on the config stack’s own methods to read the active user layer and produce a modified stack, so the result still behaves like normal Codex configuration.
 
 *Call graph*: calls 3 internal fn (get_active_user_layer, with_user_config, join); called by 2 (install_mcp_permission_request_hook, trust_hooks); 3 external calls (default, String, Table).
 
 
 ### `core/tests/common/tracing.rs`
 
-`util` · `test setup around tracing-sensitive request handling`
+`test` · `test setup`
 
-The module defines `TestTracingContext`, a simple holder for two resources that must not be dropped immediately: an `SdkTracerProvider` and a `tracing::dispatcher::DefaultGuard`. The sole constructor, `install_test_tracing`, performs the full setup sequence used by tracing-sensitive tests. It first installs a global `TraceContextPropagator`, so trace context can be injected and extracted using standard W3C traceparent semantics. It then builds a fresh `SdkTracerProvider`, derives a named tracer from the caller-supplied `tracer_name`, and wires that tracer into a `tracing_subscriber` registry via `tracing_opentelemetry::layer().with_tracer(tracer)`. Instead of globally initializing the subscriber for the whole process, it calls `set_default()` and stores the returned guard, making the subscriber active only within the current scope and restoring the previous dispatcher when the context is dropped. That design is important for tests: it avoids cross-test contamination while still enabling span propagation and trace-id assertions. The underscore-prefixed struct fields intentionally suppress unused-field warnings while making the ownership-based lifetime requirement explicit.
+Modern systems often attach a trace ID to a piece of work, so logs and events from different parts of the program can be tied back to the same original action. This file sets up that tracing machinery for tests. Without it, tests that check whether trace information is captured, inherited, or sent along would not have a real tracing environment to run inside.
+
+The main helper, `install_test_tracing`, prepares two things. First, it installs a W3C trace context propagator. In plain terms, that is the standard rulebook for how trace IDs are packed into and read from text-based metadata, such as request headers. Second, it creates an OpenTelemetry tracer provider and connects it to Rust's `tracing` system through a subscriber. A subscriber is the part that listens for tracing spans and events, like a microphone listening to what the code says it is doing.
+
+The returned `TestTracingContext` keeps the tracing provider and the default subscriber guard alive. This matters because the tracing setup is scoped: when the returned value is dropped, the default subscriber guard is dropped too, which ends that test's tracing setup. This keeps tests from leaking tracing state more than necessary.
 
 #### Function details
 
@@ -1102,24 +1110,26 @@ The module defines `TestTracingContext`, a simple holder for two resources that 
 fn install_test_tracing(tracer_name: &str) -> TestTracingContext
 ```
 
-**Purpose**: Installs a scoped tracing subscriber backed by an OpenTelemetry tracer and returns the resources that keep it active. It is the one-step setup used by tests that need trace propagation or trace-id emission.
+**Purpose**: This function turns on a test tracing environment with the given tracer name. Tests use it when they need spans, trace IDs, and trace-context propagation to behave like they would in a real instrumented run.
 
-**Data flow**: Accepts `tracer_name: &str` → sets the global text-map propagator to `TraceContextPropagator::new()`, builds an `SdkTracerProvider`, creates a tracer named from `tracer_name.to_string()`, attaches that tracer to a subscriber registry, and calls `set_default()` → returns `TestTracingContext { _provider, _guard }`, whose ownership preserves the provider and active subscriber until drop.
+**Data flow**: It takes a `tracer_name`, which is a label for the tracer being created. It installs the standard trace-context propagator, builds a tracer provider, creates a tracer from that provider, and connects that tracer to the current `tracing` subscriber. It returns a `TestTracingContext`, which keeps the provider and the active default-subscriber guard alive for as long as the test needs them.
 
-**Call relations**: Tracing-focused integration tests call this during setup before exercising code paths that emit spans or propagate trace context. The function delegates to OpenTelemetry and `tracing_subscriber` constructors to assemble the stack, but intentionally stops at returning a scoped context rather than running any test logic itself.
+**Call relations**: Several tracing-focused tests call this at the start of their scenario, before they create spans, submit work, or check trace payloads. Inside, it relies on OpenTelemetry and tracing-subscriber setup helpers to build the provider, create the propagation rulebook, create the tracing layer, and make the subscriber the default for the current scope.
 
 *Call graph*: called by 8 (new_default_turn_captures_current_span_trace_id, regular_turn_emits_turn_started_with_trace_id_without_waiting_for_startup_prewarm, spawn_task_turn_span_inherits_dispatch_trace_context, submission_dispatch_span_prefers_submission_trace_context, submission_dispatch_span_uses_debug_for_realtime_audio, submit_with_id_captures_current_span_trace_context, responses_websocket_preconnect_does_not_replace_turn_trace_payload, responses_websocket_reuses_connection_with_per_turn_trace_payloads); 5 external calls (builder, new, set_text_map_propagator, layer, registry).
 
 
 ### `core/tests/common/process.rs`
 
-`util` · `test process coordination`
+`test` · `test execution`
 
-This file contains focused helpers for tests that need to observe an external process indirectly. `wait_for_pid_file` polls a filesystem path for up to two seconds, repeatedly attempting `fs::read_to_string` and trimming the contents until it finds a non-empty PID string. The polling interval is 25 ms, and timeout errors are wrapped with `anyhow::Context` so failures clearly indicate that the pid file never became usable.
+Some tests in this project start a real operating-system process, then need to observe it from the outside. That can be fragile: the test may look for the process before it has written its process ID file, or it may check for shutdown before the operating system has fully removed it. This file provides small waiting helpers to make those checks reliable.
 
-`process_is_alive` uses the Unix `kill -0 <pid>` convention as a non-destructive liveness probe. It shells out to the `kill` command, returning `Ok(true)` when the command succeeds and `Ok(false)` when it exits unsuccessfully; command-launch failures become contextualized errors.
+The first helper waits until a PID file appears and contains text. A PID is a process ID, the number the operating system uses to identify a running program. The helper keeps checking the file every few milliseconds, but gives up after two seconds so a broken test does not hang forever.
 
-`wait_for_process_exit_inner` is the unbounded async loop that repeatedly calls `process_is_alive` and sleeps 25 ms until the process disappears. The public `wait_for_process_exit` wraps that loop in a two-second `tokio::time::timeout`, cloning the input `&str` PID into an owned `String` so the future can outlive the caller's borrow. Together these helpers let tests assert that long-running sessions survive or terminate at the expected times without embedding process-management logic in each test.
+The second helper asks the operating system whether a process is still alive. It does this with `kill -0`, a common Unix-style probe that does not actually kill the process; it only checks whether the process can be signaled.
+
+The final helpers wait for a process to disappear, again polling briefly and using a two-second timeout. Together, these functions act like a cautious observer: wait for the note saying “the process is here,” then later keep checking until the process is gone.
 
 #### Function details
 
@@ -1129,11 +1139,11 @@ This file contains focused helpers for tests that need to observe an external pr
 async fn wait_for_pid_file(path: &Path) -> anyhow::Result<String>
 ```
 
-**Purpose**: Polls a pid file until it contains a non-empty PID string or a two-second timeout elapses.
+**Purpose**: Waits for a file to contain a process ID and returns that ID as text. Tests use it after starting a background process, so they do not continue until the process has announced itself.
 
-**Data flow**: It takes a `&Path`, repeatedly tries `fs::read_to_string(path)`, trims the contents, and returns the first non-empty trimmed string. Between attempts it sleeps 25 ms, and the whole loop is wrapped in a two-second timeout that converts expiry into an `anyhow` error with context.
+**Data flow**: It receives a file path. It repeatedly tries to read that file, trims whitespace from the contents, and accepts the first non-empty value it finds. If that happens within two seconds, it returns the process ID string; if not, it returns an error explaining that waiting for the PID file timed out.
 
-**Call relations**: Tests that launch background processes call this first to obtain the PID written by the process before performing liveness or shutdown assertions.
+**Call relations**: The long-running session tests call this after launching a process that writes its PID to disk. Inside, it relies on file reading and short asynchronous sleeps so the test can wait patiently without blocking everything else.
 
 *Call graph*: called by 2 (unified_exec_interrupt_preserves_long_running_session, unified_exec_keeps_long_running_session_after_turn_end); 5 external calls (from_millis, from_secs, read_to_string, sleep, timeout).
 
@@ -1144,11 +1154,11 @@ async fn wait_for_pid_file(path: &Path) -> anyhow::Result<String>
 fn process_is_alive(pid: &str) -> anyhow::Result<bool>
 ```
 
-**Purpose**: Checks whether a process identified by PID string appears alive by invoking `kill -0`.
+**Purpose**: Checks whether a process with a given process ID still appears to be running. It is a small wrapper around the operating system’s process-probing behavior.
 
-**Data flow**: It takes a PID string slice, runs `std::process::Command::new("kill").args(["-0", pid]).status()`, and returns `Ok(status.success())` or an error if the probe command itself could not be executed.
+**Data flow**: It receives a process ID as text. It runs `kill -0 <pid>`, which asks the operating system whether that process can be signaled without sending a real signal. It returns `true` if the command succeeds, `false` if the process is not considered alive, or an error if the probe command itself could not be run.
 
-**Call relations**: This is the low-level liveness probe used by `wait_for_process_exit_inner`.
+**Call relations**: This function is called by `wait_for_process_exit_inner` during repeated shutdown checks. It provides the yes-or-no answer that lets the waiting loop decide whether to keep sleeping or finish.
 
 *Call graph*: called by 1 (wait_for_process_exit_inner); 1 external calls (new).
 
@@ -1159,11 +1169,11 @@ fn process_is_alive(pid: &str) -> anyhow::Result<bool>
 async fn wait_for_process_exit_inner(pid: String) -> anyhow::Result<()>
 ```
 
-**Purpose**: Loops until `process_is_alive` reports that the target PID is no longer running.
+**Purpose**: Repeatedly checks a process until it is no longer alive. This is the core polling loop used when a test expects a background process to stop.
 
-**Data flow**: It takes an owned `String` PID, repeatedly calls `process_is_alive(&pid)`, returns `Ok(())` once that becomes false, and otherwise sleeps 25 ms between checks.
+**Data flow**: It receives a process ID string. In a loop, it asks `process_is_alive` whether that process still exists. If the process is gone, it returns success; otherwise, it waits 25 milliseconds and checks again.
 
-**Call relations**: This internal future is wrapped by `wait_for_process_exit` so the public API can impose a timeout while owning the PID string.
+**Call relations**: This helper is called by `wait_for_process_exit`, which wraps it in a timeout. It delegates the actual liveness check to `process_is_alive`, keeping this function focused on the wait-and-retry pattern.
 
 *Call graph*: calls 1 internal fn (process_is_alive); called by 1 (wait_for_process_exit); 2 external calls (from_millis, sleep).
 
@@ -1174,11 +1184,11 @@ async fn wait_for_process_exit_inner(pid: String) -> anyhow::Result<()>
 async fn wait_for_process_exit(pid: &str) -> anyhow::Result<()>
 ```
 
-**Purpose**: Waits up to two seconds for a process to exit, returning an error if it remains alive too long.
+**Purpose**: Waits for a process to exit, but only for a limited time. Tests use it to confirm that a process ended without risking an endless wait if something goes wrong.
 
-**Data flow**: It takes a borrowed PID string, clones it into an owned `String`, runs `wait_for_process_exit_inner(pid)` under a two-second timeout, propagates inner errors, and returns `Ok(())` on successful exit detection.
+**Data flow**: It receives a process ID as borrowed text, copies it into an owned string for the asynchronous wait, and runs the inner waiting loop. If the process exits within two seconds, it returns success; if the timeout is reached or the inner check fails, it returns an error.
 
-**Call relations**: Tests use this after obtaining a PID to assert that a background process eventually terminates; it delegates the polling loop to `wait_for_process_exit_inner`.
+**Call relations**: The long-running session tests call this when they expect a launched process to be gone. It hands the repeated checking work to `wait_for_process_exit_inner` and adds the safety guard of a two-second timeout around it.
 
 *Call graph*: calls 1 internal fn (wait_for_process_exit_inner); called by 2 (unified_exec_interrupt_preserves_long_running_session, unified_exec_keeps_long_running_session_after_turn_end); 2 external calls (from_secs, timeout).
 
@@ -1188,13 +1198,15 @@ These files supply reusable mock HTTP/SSE infrastructure and fake external servi
 
 ### `core/tests/common/apps_test_server.rs`
 
-`test` · `integration test setup and request inspection`
+`test` · `test setup and fake request handling`
 
-This test support file defines constants and helpers for standing up a realistic mock Apps surface. `AppsTestServer` stores the base URL that tests inject into `Config`, and its mount methods compose three endpoint groups on a `wiremock::MockServer`: OAuth authorization-server metadata, connector-directory listing endpoints, and a streamable HTTP JSON-RPC endpoint at `/api/codex/apps`. Variants of the mount flow let tests choose a custom connector name, a searchable tool catalog, or inclusion of an app-only tool hidden from normal direct invocation.
+This test helper gives the rest of the test suite a small, predictable “app store and app server” to talk to. Without it, tests for Codex Apps would need real ChatGPT connector services, real OAuth metadata, and real tool responses, which would make them slow, fragile, and hard to run offline.
 
-The configuration helpers mutate `codex_core::config::Config` for tests: `configure_apps` enables `Feature::Apps` and points `chatgpt_base_url` at the mock server, while `configure_search_capable_model` edits the bundled model catalog so `gpt-5.4` advertises `supports_search_tool = true`. Builder helpers wrap those mutations into `TestCodexBuilder` instances with dummy ChatGPT auth.
+The file sets up a wiremock server, which is a pretend HTTP server used in tests. It teaches that server to answer a few important routes: OAuth discovery information, a connectors directory, and the main Codex Apps endpoint. The main endpoint speaks JSON-RPC, a request-and-response format where each message names a method such as “initialize”, “tools/list”, or “tools/call”.
 
-For assertions, the file can inspect recorded requests and filter them down to Apps `tools/call` JSON-RPC bodies, then select exactly one by `_codex_apps.call_id` or by tool name. The heart of the fake server is `CodexAppsJsonRpcResponder::respond`, which parses incoming JSON, validates the `method` field, and returns realistic JSON-RPC responses for `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, generic notifications, and unknown methods. The `tools/list` response includes rich `_meta` payloads, schemas, optional searchable filler tools up to `SEARCHABLE_TOOL_COUNT`, and an optional app-only tool with `ui.visibility = ["app"]`, allowing higher-level tests to exercise discovery, filtering, deferred loading, file parameters, and metadata propagation.
+The fake app is mostly a calendar connector. It can advertise tools like creating an event, listing events, or extracting text from an uploaded document. Some setup modes make the tools “searchable”, meaning tests can check behavior when there are many tools and the system must find the right one by search. Another mode adds an “app-only” tool, used to verify that tools meant only for a visual app surface are not exposed to code-mode models.
+
+The file also provides small helpers for configuring test Codex instances and for inspecting which fake tool calls were actually sent.
 
 #### Function details
 
@@ -1204,11 +1216,11 @@ For assertions, the file can inspect recorded requests and filter them down to A
 async fn mount(server: &MockServer) -> Result<Self>
 ```
 
-**Purpose**: Mounts the standard fake Apps server using the default connector name.
+**Purpose**: Starts the standard fake Apps server using the default Calendar connector name. Tests use this when they need the normal calendar app behavior without special variations.
 
-**Data flow**: Accepts a `&MockServer`, delegates to `Self::mount_with_connector_name(server, CONNECTOR_NAME)`, and returns the resulting `AppsTestServer` in a `Result`.
+**Data flow**: It receives a mock server that already exists. It passes that server and the default connector name into the more general setup path. It returns an AppsTestServer containing the mock server’s base URL, so test Codex instances know where to send app requests.
 
-**Call relations**: Many integration tests call this as the simplest setup path. It is a thin wrapper over `mount_with_connector_name`.
+**Call relations**: This is the simple entry point used by many tests that need Apps enabled. It delegates the real setup to AppsTestServer::mount_with_connector_name, so all the OAuth, directory, and JSON-RPC routes are installed in one shared way.
 
 *Call graph*: called by 12 (includes_apps_guidance_as_developer_message_for_chatgpt_auth, omits_apps_guidance_for_api_key_auth_even_when_feature_enabled, omits_apps_guidance_when_configured_off, approved_mcp_tool_call_metadata_records_prior_user_input_request, apps_default_auto_review_routes_actual_mcp_approval_to_guardian, mcp_tool_call_metadata_records_prior_request_user_input_tool, codex_apps_file_params_pass_uploaded_file_to_post_tool_use_hook, codex_apps_file_params_upload_environment_files_before_mcp_tool_call, request_plugin_install_is_available_without_search_tool_after_discovery_attempts, always_defer_feature_hides_small_app_tool_sets (+2 more)); 1 external calls (mount_with_connector_name).
 
@@ -1219,11 +1231,11 @@ async fn mount(server: &MockServer) -> Result<Self>
 async fn mount_searchable(server: &MockServer) -> Result<Self>
 ```
 
-**Purpose**: Mounts the fake Apps server with a large searchable tool catalog suitable for tool-search tests.
+**Purpose**: Starts a fake Apps server whose calendar tools are meant to be found through tool search. Tests use it to check behavior when the model should search for tools instead of seeing every tool directly.
 
-**Data flow**: Given a `&MockServer`, it awaits `mount_oauth_metadata`, `mount_connectors_directory`, and `mount_streamable_http_json_rpc` with `searchable = true` and `include_app_only_tool = false`, then returns `AppsTestServer { chatgpt_base_url: server.uri() }`.
+**Data flow**: It takes a mock server, mounts OAuth metadata, mounts the connectors directory, then mounts the fake JSON-RPC app endpoint with the searchable option turned on and app-only tools turned off. It returns the server wrapper with the base URL for later configuration.
 
-**Call relations**: Search-related integration tests invoke this variant so the responder's `tools/list` branch will append many extra tools for indexing and deferred-loading scenarios.
+**Call relations**: Search-related tests call this when they need a large searchable tool set. It hands setup work to mount_oauth_metadata, mount_connectors_directory, and mount_streamable_http_json_rpc, then exposes the resulting server URL to the test.
 
 *Call graph*: calls 3 internal fn (mount_connectors_directory, mount_oauth_metadata, mount_streamable_http_json_rpc); called by 9 (code_mode_only_guides_all_tools_search_and_calls_deferred_app_tools, search_tool_adds_discovery_instructions_to_tool_description, search_tool_enabled_by_default_adds_tool_search, search_tool_hides_apps_tools_without_search, tool_search_indexes_only_enabled_non_app_mcp_tools, tool_search_matches_mcp_tools_by_distinct_name_description_and_schema_terms, tool_search_returns_deferred_tools_without_follow_up_tool_injection, tool_search_surfaced_mcp_tool_errors_are_returned_to_model, tool_search_uses_non_app_mcp_server_instructions_as_namespace_description); 1 external calls (uri).
 
@@ -1237,11 +1249,11 @@ async fn mount_with_connector_name(
     ) -> Result<Self>
 ```
 
-**Purpose**: Mounts the fake Apps server while allowing tests to override the connector display name returned in tool metadata.
+**Purpose**: Starts the fake Apps server while allowing a test to choose the connector’s display name. This is useful for tests that check how connector names appear in prompts or conflict resolution.
 
-**Data flow**: Accepts a `&MockServer` and `&str` connector name, mounts OAuth metadata and connector-directory endpoints, mounts the JSON-RPC responder with the provided connector name, default description, `searchable = false`, and `include_app_only_tool = false`, then returns an `AppsTestServer` containing `server.uri()`.
+**Data flow**: It receives a mock server and a connector name string. It installs the OAuth route, connector directory routes, and JSON-RPC app route using that name and the standard calendar description. It returns an AppsTestServer pointing at the mock server’s URL.
 
-**Call relations**: Tests that care about connector naming call this directly. `AppsTestServer::mount` delegates here for the default-name case.
+**Call relations**: The default mount path calls this with the normal Calendar name, while some tests call it directly with a custom name. It uses the shared mounting helpers so the only changed piece is the human-visible connector name.
 
 *Call graph*: calls 3 internal fn (mount_connectors_directory, mount_oauth_metadata, mount_streamable_http_json_rpc); called by 3 (capability_sections_render_in_developer_message_in_order, explicit_plugin_mentions_keep_non_conflicting_mcp_for_chatgpt_auth, explicit_plugin_mentions_use_apps_for_chatgpt_dual_surface_plugins); 1 external calls (uri).
 
@@ -1255,11 +1267,11 @@ async fn mount_with_app_only_tool(
     ) -> Result<Self>
 ```
 
-**Purpose**: Mounts the fake Apps server with an additional app-only tool, optionally in searchable mode.
+**Purpose**: Starts the fake Apps server with an extra tool that should only be visible inside the app user interface. Tests use this to make sure such tools are hidden from model-facing tool lists and cannot be called directly by mistake.
 
-**Data flow**: Accepts a `&MockServer` and `AppsTestToolLoading`, mounts OAuth metadata and connector-directory endpoints, computes `searchable` with `matches!(tool_loading, AppsTestToolLoading::Searchable)`, mounts the JSON-RPC responder with `include_app_only_tool = true`, and returns an `AppsTestServer` with the server URI.
+**Data flow**: It receives a mock server and a choice of direct versus searchable loading. It mounts the standard fake routes, tells the JSON-RPC responder whether to make tools searchable, and asks it to include the app-only tool. It returns the server wrapper with the mock server URL.
 
-**Call relations**: Tests that verify app-only tool visibility and invocation behavior use this setup path. It differs from the other mount helpers only in responder configuration.
+**Call relations**: App-only visibility tests call this setup path. It relies on the same route-mounting helpers as the other setup methods, but passes a flag into mount_streamable_http_json_rpc so the responder advertises the special app-only tool.
 
 *Call graph*: calls 3 internal fn (mount_connectors_directory, mount_oauth_metadata, mount_streamable_http_json_rpc); called by 2 (app_only_tools_are_not_visible_or_runnable_by_code_mode_model, app_only_tools_are_not_visible_or_runnable_by_direct_model_calls); 2 external calls (uri, matches!).
 
@@ -1270,11 +1282,11 @@ async fn mount_with_app_only_tool(
 fn configure_search_capable_model(config: &mut Config)
 ```
 
-**Purpose**: Mutates test config so model `gpt-5.4` is selected and marked as supporting the search tool.
+**Purpose**: Changes a test configuration so it uses a model that is marked as able to use tool search. This lets tests exercise search behavior even if the default model catalog would not allow it.
 
-**Data flow**: Loads the bundled model catalog with `bundled_models_response()`, finds the mutable model whose `slug` is `"gpt-5.4"`, sets `config.model = Some("gpt-5.4".to_string())`, flips `model.supports_search_tool = true`, and stores the modified catalog in `config.model_catalog`.
+**Data flow**: It receives a mutable Config. It loads the bundled model catalog, finds the gpt-5.4 model, marks that model as supporting the search tool, sets the config’s selected model to gpt-5.4, and stores the modified catalog back into the config.
 
-**Call relations**: This helper is called by `configure_search_capable_apps` to make Apps tests exercise search-capable model behavior.
+**Call relations**: configure_search_capable_apps calls this after enabling Apps. It depends on the bundled model list and intentionally edits it for tests, so downstream test Codex instances believe they are using a search-capable model.
 
 *Call graph*: called by 1 (configure_search_capable_apps); 1 external calls (bundled_models_response).
 
@@ -1285,11 +1297,11 @@ fn configure_search_capable_model(config: &mut Config)
 fn configure_apps(config: &mut Config, apps_base_url: &str)
 ```
 
-**Purpose**: Enables the Apps feature and points the config at the mock Apps base URL.
+**Purpose**: Turns on the Apps feature in a test configuration and points it at the fake Apps server. This is the basic switch that makes Codex talk to the test server instead of a real service.
 
-**Data flow**: Mutably borrows `Config`, enables `Feature::Apps` on `config.features`, and writes `apps_base_url.to_string()` into `config.chatgpt_base_url`.
+**Data flow**: It receives a mutable Config and a base URL string. It enables the Apps feature flag and stores the fake server URL as the ChatGPT base URL. The config is changed in place and no separate value is returned.
 
-**Call relations**: It is the shared base configuration step used by `configure_search_capable_apps` and indirectly by the builder helpers.
+**Call relations**: This private helper is used by both normal and search-capable test setup. configure_search_capable_apps builds on it, while apps_enabled_builder installs it into a TestCodexBuilder callback.
 
 *Call graph*: called by 1 (configure_search_capable_apps).
 
@@ -1300,11 +1312,11 @@ fn configure_apps(config: &mut Config, apps_base_url: &str)
 fn configure_search_capable_apps(config: &mut Config, apps_base_url: &str)
 ```
 
-**Purpose**: Combines Apps enablement with search-capable model configuration for tests that need both.
+**Purpose**: Prepares a test configuration for Apps plus tool search. It combines the fake Apps server settings with a model configuration that allows search.
 
-**Data flow**: Takes mutable `Config` and an Apps base URL, calls `configure_apps(config, apps_base_url)`, then `configure_search_capable_model(config)`. It returns unit after mutating the config in place.
+**Data flow**: It receives a mutable Config and the fake Apps server URL. First it enables Apps and sets the base URL. Then it edits the model catalog so the selected model supports search. The Config is updated in place.
 
-**Call relations**: This helper is used by `search_capable_apps_builder` to prepare a fully search-enabled test configuration.
+**Call relations**: search_capable_apps_builder uses this as its configuration callback. It is a small orchestration helper that chains configure_apps and configure_search_capable_model in the order tests need.
 
 *Call graph*: calls 2 internal fn (configure_apps, configure_search_capable_model).
 
@@ -1315,11 +1327,11 @@ fn configure_search_capable_apps(config: &mut Config, apps_base_url: &str)
 fn apps_enabled_builder(apps_base_url: impl Into<String>) -> TestCodexBuilder
 ```
 
-**Purpose**: Builds a `TestCodexBuilder` configured with dummy ChatGPT auth and Apps enabled against the supplied mock base URL.
+**Purpose**: Creates a TestCodexBuilder for tests that need Apps enabled with fake ChatGPT authentication. It saves test authors from repeating the same authentication and configuration setup.
 
-**Data flow**: Consumes any `apps_base_url` convertible into `String`, stores the owned string, starts from `test_codex()`, injects dummy ChatGPT auth via `with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())`, and adds a config mutation closure that calls `configure_apps` with the captured URL.
+**Data flow**: It receives an Apps base URL, converts it into an owned string, starts from the standard test_codex builder, attaches dummy ChatGPT authentication, and registers a config callback that enables Apps and points them at that URL. It returns the prepared builder.
 
-**Call relations**: Integration tests that need Apps but not search capability call this builder helper. It packages auth and config wiring into one reusable setup step.
+**Call relations**: Tests that only need normal Apps behavior call this before creating a test Codex instance. Internally it uses test_codex as the base, creates dummy ChatGPT auth, and hands configuration changes to configure_apps.
 
 *Call graph*: calls 2 internal fn (test_codex, create_dummy_chatgpt_auth_for_testing); called by 3 (codex_apps_file_params_pass_uploaded_file_to_post_tool_use_hook, codex_apps_file_params_upload_environment_files_before_mcp_tool_call, app_only_tools_are_not_visible_or_runnable_by_direct_model_calls); 1 external calls (into).
 
@@ -1330,11 +1342,11 @@ fn apps_enabled_builder(apps_base_url: impl Into<String>) -> TestCodexBuilder
 fn search_capable_apps_builder(apps_base_url: impl Into<String>) -> TestCodexBuilder
 ```
 
-**Purpose**: Builds a `TestCodexBuilder` configured for Apps plus a search-capable model against the supplied mock base URL.
+**Purpose**: Creates a TestCodexBuilder for tests that need Apps and tool search at the same time. It is the search-enabled version of apps_enabled_builder.
 
-**Data flow**: Converts the base URL into an owned `String`, starts from `test_codex()`, injects dummy ChatGPT auth, and adds a config mutation closure that calls `configure_search_capable_apps` with the captured URL.
+**Data flow**: It receives the fake Apps server URL, stores it as an owned string, starts a standard test Codex builder, adds dummy ChatGPT authentication, and registers a config callback that enables Apps and marks the model as search-capable. It returns the prepared builder.
 
-**Call relations**: Search-oriented Apps integration tests use this helper instead of `apps_enabled_builder` so both feature and model capabilities are enabled.
+**Call relations**: Many search and deferred-tool tests call this to get a Codex instance with the right feature flags, authentication, server URL, and model catalog. It hands the detailed config edits to configure_search_capable_apps.
 
 *Call graph*: calls 2 internal fn (test_codex, create_dummy_chatgpt_auth_for_testing); called by 14 (app_only_tools_are_not_visible_or_runnable_by_code_mode_model, approved_mcp_tool_call_metadata_records_prior_user_input_request, apps_default_auto_review_routes_actual_mcp_approval_to_guardian, mcp_tool_call_metadata_records_prior_request_user_input_tool, always_defer_feature_hides_small_app_tool_sets, explicit_app_mentions_respect_always_defer, search_tool_adds_discovery_instructions_to_tool_description, search_tool_enabled_by_default_adds_tool_search, search_tool_hides_apps_tools_without_search, tool_search_indexes_only_enabled_non_app_mcp_tools (+4 more)); 1 external calls (into).
 
@@ -1345,11 +1357,11 @@ fn search_capable_apps_builder(apps_base_url: impl Into<String>) -> TestCodexBui
 fn apps_tool_call_id(body: &Value) -> Option<&str>
 ```
 
-**Purpose**: Extracts the `_codex_apps.call_id` field from a JSON-RPC request body if present.
+**Purpose**: Pulls the Codex Apps call ID out of a recorded JSON tool-call request. Tests use that call ID to match a specific model-side tool call with the HTTP request sent to the fake server.
 
-**Data flow**: Traverses a `serde_json::Value` through `params -> _meta -> _codex_apps -> call_id`, returning `Some(&str)` if each level exists and the final value is a string, otherwise `None`.
+**Data flow**: It receives a JSON value representing a request body. It walks through params, then _meta, then the _codex_apps metadata, then call_id. If that field exists and is a string, it returns it; otherwise it returns nothing.
 
-**Call relations**: This private helper is used by `recorded_apps_tool_call_by_call_id` when filtering captured `tools/call` requests.
+**Call relations**: This is a small inspection helper for the request-recording checks. recorded_apps_tool_call_by_call_id uses this kind of extraction when narrowing the recorded fake-server traffic down to the one request a test expects.
 
 *Call graph*: 1 external calls (get).
 
@@ -1360,11 +1372,11 @@ fn apps_tool_call_id(body: &Value) -> Option<&str>
 async fn recorded_apps_tool_calls(server: &MockServer) -> Vec<Value>
 ```
 
-**Purpose**: Returns all captured Apps `tools/call` JSON-RPC request bodies received by the mock server.
+**Purpose**: Collects all Apps tool-call requests that the fake server received. This lets tests verify what Codex actually sent over HTTP after a tool was approved or invoked.
 
-**Data flow**: Awaits `server.received_requests()`, expects capture support to succeed, iterates over requests, parses each body as JSON, filters to requests whose URL path is `/api/codex/apps` and whose `method` field is `"tools/call"`, and collects the matching JSON bodies into a `Vec<Value>`.
+**Data flow**: It asks the mock server for every recorded request. For each one, it tries to parse the body as JSON, keeps only requests sent to /api/codex/apps with method tools/call, and returns those JSON bodies as a list.
 
-**Call relations**: This is the common request-inspection primitive used by both `recorded_apps_tool_call_by_call_id` and `recorded_apps_tool_call_by_name`.
+**Call relations**: The more specific lookup helpers call this first, then filter the returned list by call ID or tool name. It is the broad “show me all app tool calls” inspection point for tests.
 
 *Call graph*: called by 2 (recorded_apps_tool_call_by_call_id, recorded_apps_tool_call_by_name); 1 external calls (received_requests).
 
@@ -1375,11 +1387,11 @@ async fn recorded_apps_tool_calls(server: &MockServer) -> Vec<Value>
 async fn recorded_apps_tool_call_by_call_id(server: &MockServer, call_id: &str) -> Value
 ```
 
-**Purpose**: Finds exactly one recorded Apps `tools/call` request matching a specific `_codex_apps.call_id`.
+**Purpose**: Finds exactly one recorded Apps tool call with a given call ID. It fails the test if there are none or more than one, which catches missing calls and duplicate calls.
 
-**Data flow**: Awaits `recorded_apps_tool_calls(server)`, filters the resulting bodies with `apps_tool_call_id(body) == Some(call_id)`, collects matches, asserts there is exactly one, and returns that single `Value`.
+**Data flow**: It receives the mock server and the expected call ID. It gathers all recorded Apps tool calls, keeps only the ones whose metadata call_id matches, asserts there is exactly one, and returns that matching JSON body.
 
-**Call relations**: Tests that need to inspect metadata propagation for a specific tool call invoke this helper. It builds on `recorded_apps_tool_calls` and the `apps_tool_call_id` extractor.
+**Call relations**: Tests that track approval metadata or prior user input call this after exercising Codex. It builds on recorded_apps_tool_calls and uses the call ID extraction logic to prove the right HTTP request was made.
 
 *Call graph*: calls 1 internal fn (recorded_apps_tool_calls); called by 4 (approved_mcp_tool_call_metadata_records_prior_user_input_request, apps_default_auto_review_routes_actual_mcp_approval_to_guardian, mcp_tool_call_metadata_records_prior_request_user_input_tool, tool_search_returns_deferred_tools_without_follow_up_tool_injection); 1 external calls (assert_eq!).
 
@@ -1390,11 +1402,11 @@ async fn recorded_apps_tool_call_by_call_id(server: &MockServer, call_id: &str) 
 async fn recorded_apps_tool_call_by_name(server: &MockServer, tool_name: &str) -> Value
 ```
 
-**Purpose**: Finds exactly one recorded Apps `tools/call` request by the tool name in `/params/name`.
+**Purpose**: Finds exactly one recorded Apps tool call for a given tool name. This is useful when a test cares which tool was invoked, not which internal call ID was used.
 
-**Data flow**: Awaits `recorded_apps_tool_calls(server)`, filters bodies whose `/params/name` string equals `tool_name`, collects matches, asserts there is exactly one, and returns that body.
+**Data flow**: It receives the mock server and a tool name. It gathers all recorded Apps tool-call JSON bodies, filters them by params.name, asserts that exactly one remains, and returns that request body.
 
-**Call relations**: This helper is used by tests that care about a specific tool invocation but not its call ID, such as file-parameter upload flows.
+**Call relations**: File-upload related tests use this to inspect the request sent for a particular tool. It reuses recorded_apps_tool_calls for the broad collection step, then applies the tool-name check.
 
 *Call graph*: calls 1 internal fn (recorded_apps_tool_calls); called by 1 (codex_apps_file_params_upload_environment_files_before_mcp_tool_call); 1 external calls (assert_eq!).
 
@@ -1405,11 +1417,11 @@ async fn recorded_apps_tool_call_by_name(server: &MockServer, tool_name: &str) -
 async fn mount_oauth_metadata(server: &MockServer)
 ```
 
-**Purpose**: Registers the OAuth authorization-server metadata endpoint expected by Apps clients.
+**Purpose**: Adds a fake OAuth discovery endpoint to the mock server. OAuth is the login and permission system; this endpoint tells clients where authorization and token URLs would be.
 
-**Data flow**: Builds a wiremock `Mock` matching `GET /.well-known/oauth-authorization-server/mcp`, responds with HTTP 200 and JSON containing authorization and token endpoints derived from `server.uri()` plus a trivial `scopes_supported` array, mounts it on the server, and awaits completion.
+**Data flow**: It receives the mock server. It registers a GET response for the well-known OAuth metadata path, returning JSON with authorization and token endpoints based on the mock server’s own URL. It changes the server by adding that route.
 
-**Call relations**: All Apps server mount variants call this first so client initialization can discover OAuth metadata.
+**Call relations**: All Apps server setup paths call this before tests talk to the fake server. It gives Codex enough login metadata to proceed as if a real ChatGPT Apps service had advertised OAuth support.
 
 *Call graph*: called by 3 (mount_searchable, mount_with_app_only_tool, mount_with_connector_name); 5 external calls (given, new, json!, method, path).
 
@@ -1420,11 +1432,11 @@ async fn mount_oauth_metadata(server: &MockServer)
 async fn mount_connectors_directory(server: &MockServer)
 ```
 
-**Purpose**: Registers mock connector-directory endpoints for discoverable and workspace-specific apps.
+**Purpose**: Adds fake connector-directory endpoints to the mock server. These endpoints act like a small app catalog, listing discoverable apps such as Google Calendar and Gmail.
 
-**Data flow**: Mounts one `GET /connectors/directory/list` mock returning two discoverable apps (Google Calendar and Gmail) with IDs, names, descriptions, and `nextToken: null`, then mounts a second `GET /connectors/directory/list_workspace` mock returning an empty app list and `nextToken: null`.
+**Data flow**: It receives the mock server. It registers one GET route that returns two public apps and another workspace-list route that returns no apps. The mock server is updated so later requests to those paths get predictable JSON.
 
-**Call relations**: Every Apps server mount helper calls this so tests can exercise connector discovery alongside JSON-RPC tool access.
+**Call relations**: Every Apps mounting path calls this as part of test setup. Tests that check app discovery or connector guidance rely on these directory responses being stable.
 
 *Call graph*: called by 3 (mount_searchable, mount_with_app_only_tool, mount_with_connector_name); 5 external calls (given, new, json!, method, path).
 
@@ -1441,11 +1453,11 @@ async fn mount_streamable_http_json_rpc(
 )
 ```
 
-**Purpose**: Registers the main Apps JSON-RPC endpoint and binds it to a configurable responder instance.
+**Purpose**: Adds the main fake Codex Apps JSON-RPC endpoint to the mock server. This is where initialization, tool listing, and tool calls are answered during tests.
 
-**Data flow**: Accepts server plus connector metadata and behavior flags, creates a wiremock `Mock` matching `POST` requests whose path matches `^/api/codex/apps/?$`, attaches a `CodexAppsJsonRpcResponder` populated with those fields, mounts it on the server, and awaits completion.
+**Data flow**: It receives the mock server, connector display information, and flags for searchable and app-only behavior. It registers a POST route for /api/codex/apps and attaches a CodexAppsJsonRpcResponder containing those settings. The server is then ready to answer app protocol requests.
 
-**Call relations**: This is called by all `AppsTestServer` mount variants after metadata and directory endpoints are installed. It is the entry point to `CodexAppsJsonRpcResponder::respond`.
+**Call relations**: The different AppsTestServer mounting methods call this after installing OAuth and directory routes. It hands actual request decisions to CodexAppsJsonRpcResponder::respond, which builds the JSON-RPC responses.
 
 *Call graph*: called by 3 (mount_searchable, mount_with_app_only_tool, mount_with_connector_name); 3 external calls (given, method, path_regex).
 
@@ -1456,22 +1468,24 @@ async fn mount_streamable_http_json_rpc(
 fn respond(&self, request: &Request) -> ResponseTemplate
 ```
 
-**Purpose**: Implements the fake Apps JSON-RPC protocol, returning realistic responses for initialization, tool listing, tool invocation, notifications, and unknown methods.
+**Purpose**: Builds fake JSON-RPC responses for the Codex Apps endpoint. It lets tests exercise the same kinds of messages a real Apps server would send, but with fixed calendar-focused data.
 
-**Data flow**: Receives a wiremock `Request`, parses `request.body` as `serde_json::Value`, and returns HTTP 400 with an error JSON if parsing fails or if `method` is missing. For `initialize`, it echoes the request `id`, uses the requested protocol version or a default, and returns server capabilities and server info. For `notifications/initialized` and any `notifications/*` method it returns HTTP 202. For `tools/list`, it builds a JSON-RPC result containing three base tools with schemas and `_meta` blocks, optionally appends many searchable filler tools when `self.searchable` is true, and optionally appends an app-only tool when `self.include_app_only_tool` is true. For `tools/call`, it extracts request fields like tool name, title, starts_at, file_id, and `_codex_apps` metadata, then returns a success result whose text content echoes those values and whose `structuredContent._codex_apps` mirrors the incoming metadata. For any other method, it returns a JSON-RPC error with code `-32601` and a `method not found` message.
+**Data flow**: It receives an HTTP request from the mock server. It parses the body as JSON, checks the method field, and returns a response: initialization metadata, an accepted notification, a list of tools, a successful tool-call result, a generic notification acknowledgement, or a JSON-RPC “method not found” error. If the body is not valid JSON or has no method, it returns a bad-request response.
 
-**Call relations**: Wiremock invokes this responder for requests matched by `mount_streamable_http_json_rpc`. Higher-level integration tests depend on its branch behavior to simulate Apps discovery, deferred tool loading, file parameter handling, and metadata round-tripping.
+**Call relations**: mount_streamable_http_json_rpc installs this responder on the fake Apps endpoint. During tests, Codex sends POST requests there, and this method supplies the protocol-level answers that drive app discovery, tool listing, and tool-call verification.
 
 *Call graph*: 3 external calls (new, json!, from_slice).
 
 
 ### `core/tests/common/context_snapshot.rs`
 
-`test` · `test snapshot rendering`
+`test` · `test assertion and snapshot comparison`
 
-This test utility file turns `ResponsesRequest` inputs and raw response-item arrays into deterministic snapshot strings. `ContextSnapshotOptions` controls rendering with four modes: fully redacted text, full text, kind-only summaries, or kind plus a text prefix, along with booleans to strip capability-instruction fragments from developer messages and AGENTS.md user-context fragments from user messages. The main formatter, `format_response_items_snapshot`, walks each JSON item, emits a numbered line, and branches by item `type`. Message items receive the richest handling: it inspects each content entry, preserves text after optional stripping and normalization, renders non-text spans as `<type>` or `<type:key1,key2>`, collapses single-part messages to one line, and expands multi-part messages into indented numbered sublines. Other item types summarize function calls, shell commands, reasoning summaries plus encrypted-content presence, and compaction markers.
+Tests often need to compare what the system sent to the model. Raw JSON is hard to read and contains unstable details like temporary paths, timestamps, UUIDs (random-looking unique IDs), and long instruction blocks. This file acts like a camera with filters: it takes a snapshot of request items, labels each item clearly, and replaces distracting or private details with simple placeholders such as `<AGENTS_MD>` or `<UUID>`.
 
-For full request-body parity tests, `format_request_body_snapshot` obtains `request.body_json()`, recursively canonicalizes all JSON values, sorts object keys for stable ordering, and normalizes every string through `format_snapshot_json_string`. That string path canonicalizes known instruction payloads into placeholders like `<APPS_INSTRUCTIONS>`, `<AGENTS_MD>`, and `<ENVIRONMENT_CONTEXT:cwd=<CWD>:subagents=N>`, normalizes line endings, rewrites dynamic filesystem skill paths, and redacts UUIDs, sandbox names, and turn timestamps with regexes cached in `OnceLock<Regex>`. `format_changed_lines_diff` then computes a line diff using `similar::TextDiff`, emitting only inserted and deleted lines with `---/+++` headers. The embedded tests cover each rendering mode and the key normalization rules, ensuring snapshots stay stable across environments and runs.
+The main options let tests choose how much text to show. They can keep redacted text, show full text, show only the kind of each item, or show only a short prefix. The formatter understands common item types: user/developer messages, function calls, shell commands, reasoning summaries, and compaction records. For messages with multiple parts, such as text plus an image, it prints each part separately so the shape of the request remains visible.
+
+The file also formats whole request bodies and produces compact diffs that show only changed JSON lines. Before printing JSON, it sorts object keys and normalizes strings so output is consistent across machines and runs. Without this helper, snapshot tests would be noisy, fragile, and much harder for humans to inspect.
 
 #### Function details
 
@@ -1481,11 +1495,11 @@ For full request-body parity tests, `format_request_body_snapshot` obtains `requ
 fn default() -> Self
 ```
 
-**Purpose**: Constructs snapshot options with redacted-text rendering and no stripping of capability or AGENTS.md fragments.
+**Purpose**: Creates the standard snapshot settings used by most tests. By default, text is redacted into stable placeholders, and no optional instruction blocks are stripped out.
 
-**Data flow**: Returns `ContextSnapshotOptions { render_mode: RedactedText, strip_capability_instructions: false, strip_agents_md_user_context: false }` with no inputs or side effects.
+**Data flow**: It takes no input. It builds a `ContextSnapshotOptions` value with redacted-text rendering and both stripping switches turned off, then returns that value for a test or helper to customize.
 
-**Call relations**: This default is the starting point for most snapshot tests and helper builders, which then optionally chain the mutating builder-style methods below.
+**Call relations**: Many snapshot tests and helper setup paths start here so they all share the same baseline behavior. Callers can then chain option methods when a test needs full text, kind-only output, or stripped instruction sections.
 
 *Call graph*: called by 19 (guardian_snapshot_options, fork_startup_context_then_first_turn_diff_snapshot, full_text_mode_normalizes_crlf_line_endings, full_text_mode_preserves_unredacted_text, image_only_message_is_rendered_as_non_text_span, kind_with_text_prefix_mode_normalizes_crlf_line_endings, mixed_text_and_image_message_keeps_image_span, redacted_text_mode_keeps_canonical_placeholders, redacted_text_mode_keeps_capability_instruction_placeholders, redacted_text_mode_normalizes_environment_context_with_subagents (+9 more)).
 
@@ -1496,11 +1510,11 @@ fn default() -> Self
 fn render_mode(mut self, render_mode: ContextSnapshotRenderMode) -> Self
 ```
 
-**Purpose**: Sets the desired rendering mode on a snapshot-options value in builder style.
+**Purpose**: Changes how much text a snapshot should show. A test uses it when it needs full text, only item kinds, or a shortened text prefix instead of the default redacted view.
 
-**Data flow**: Consumes `self`, overwrites `self.render_mode` with the provided `ContextSnapshotRenderMode`, and returns the updated options value.
+**Data flow**: It receives an existing options value and the desired render mode. It updates the render mode inside that options value and returns the updated options so calls can be chained.
 
-**Call relations**: Callers chain this after `default()` to switch between redacted, full-text, kind-only, or prefix modes before passing options into formatting helpers.
+**Call relations**: Tests call this after `ContextSnapshotOptions::default` when the standard redacted output is not right for the case being checked. The resulting options are passed into the snapshot formatting functions.
 
 
 ##### `ContextSnapshotOptions::strip_capability_instructions`  (lines 46–49)
@@ -1509,11 +1523,11 @@ fn render_mode(mut self, render_mode: ContextSnapshotRenderMode) -> Self
 fn strip_capability_instructions(mut self) -> Self
 ```
 
-**Purpose**: Enables omission of Apps/Skills/Plugins instruction fragments from developer-message snapshots.
+**Purpose**: Tells snapshot rendering to omit app, skill, and plugin instruction blocks from developer messages. This is useful when a test cares about the rest of the context and not those large repeated capability instructions.
 
-**Data flow**: Consumes `self`, sets `self.strip_capability_instructions = true`, and returns the updated options.
+**Data flow**: It receives an options value, turns on the `strip_capability_instructions` flag, and returns the changed options value.
 
-**Call relations**: This flag is consulted inside `format_response_items_snapshot` when iterating developer-message text parts.
+**Call relations**: Tests or shared snapshot setup can chain this after the default options. Later, `format_response_items_snapshot` reads the flag while walking message content and skips matching developer-message parts.
 
 
 ##### `ContextSnapshotOptions::strip_agents_md_user_context`  (lines 51–54)
@@ -1522,11 +1536,11 @@ fn strip_capability_instructions(mut self) -> Self
 fn strip_agents_md_user_context(mut self) -> Self
 ```
 
-**Purpose**: Enables omission of AGENTS.md instruction fragments from user-message snapshots.
+**Purpose**: Tells snapshot rendering to omit `AGENTS.md` instruction text from user messages. This keeps snapshots focused when that project-guidance block is not the thing under test.
 
-**Data flow**: Consumes `self`, sets `self.strip_agents_md_user_context = true`, and returns the updated options.
+**Data flow**: It receives an options value, turns on the `strip_agents_md_user_context` flag, and returns the changed options value.
 
-**Call relations**: This flag is checked by `format_response_items_snapshot` when processing user-message text entries.
+**Call relations**: Callers set this option before formatting request items. During message formatting, the snapshot renderer checks the flag and drops matching user-message content.
 
 
 ##### `format_request_input_snapshot`  (lines 57–63)
@@ -1538,11 +1552,11 @@ fn format_request_input_snapshot(
 ) -> String
 ```
 
-**Purpose**: Formats the input items of a `ResponsesRequest` using the standard response-item snapshot renderer.
+**Purpose**: Formats the input items from a `ResponsesRequest` into the compact snapshot text used by tests. It is the request-level wrapper around the item formatter.
 
-**Data flow**: Reads `request.input()`, takes the resulting collection as a slice, passes it with `options` to `format_response_items_snapshot`, and returns the produced snapshot string.
+**Data flow**: It receives a request and snapshot options. It reads the request's input list, passes those JSON items to `format_response_items_snapshot`, and returns the resulting multi-line text.
 
-**Call relations**: This is a convenience wrapper over `format_response_items_snapshot` for callers that have a full `ResponsesRequest` rather than a raw item slice.
+**Call relations**: Higher-level test helpers call this when they have a full request object rather than a raw list of JSON items. It hands the actual rendering work to `format_response_items_snapshot`.
 
 *Call graph*: calls 2 internal fn (format_response_items_snapshot, input).
 
@@ -1553,11 +1567,11 @@ fn format_request_input_snapshot(
 fn format_response_items_snapshot(items: &[Value], options: &ContextSnapshotOptions) -> String
 ```
 
-**Purpose**: Renders a numbered textual snapshot of response/input items, with type-specific formatting and optional text redaction or stripping.
+**Purpose**: Turns a list of response/request items into readable lines that show their order, kind, role, and important content. This is the central formatter for context snapshots.
 
-**Data flow**: Iterates over `&[Value]` with indices, extracts each item's `type`, and emits a fallback `<MISSING_TYPE>` line when absent. In `KindOnly` mode it emits only item kinds and message roles. Otherwise it branches by type: `message` items inspect `role` and `content`, optionally drop capability or AGENTS.md text parts based on options, normalize text via `format_snapshot_text`, render non-text content as angle-bracket spans with extra keys, and choose single-line or multi-line output depending on part count; `function_call` emits the function name; `function_call_output` formats string output or `<NON_STRING_OUTPUT>`; `local_shell_call` joins command parts and formats them or emits `<NO_COMMAND>`; `reasoning` summarizes the first summary text and whether encrypted content exists; `compaction` reports only encrypted-content presence; unknown types are emitted by raw type name. It joins all rendered lines with newlines and returns the final string.
+**Data flow**: It receives JSON items plus rendering options. For each item, it reads fields such as `type`, `role`, `content`, `name`, `output`, or command data, redacts or shortens text as requested, and produces one line or a small block of lines. It returns all rendered items joined with newlines.
 
-**Call relations**: This is the central formatter used by `format_request_input_snapshot`, `format_labeled_requests_snapshot`, `format_labeled_items_snapshot`, and many unit tests in the embedded test module.
+**Call relations**: This function is called by `format_request_input_snapshot` and many tests. The rest of the snapshot helper code depends on it to give a stable human-readable view of messages, function calls, shell calls, reasoning, and other request parts.
 
 *Call graph*: called by 13 (format_request_input_snapshot, full_text_mode_normalizes_crlf_line_endings, full_text_mode_preserves_unredacted_text, image_only_message_is_rendered_as_non_text_span, kind_with_text_prefix_mode_normalizes_crlf_line_endings, mixed_text_and_image_message_keeps_image_span, redacted_text_mode_keeps_canonical_placeholders, redacted_text_mode_keeps_capability_instruction_placeholders, redacted_text_mode_normalizes_environment_context_with_subagents, redacted_text_mode_normalizes_system_skill_temp_paths (+3 more)); 1 external calls (iter).
 
@@ -1572,11 +1586,11 @@ fn format_labeled_requests_snapshot(
 ) -> String
 ```
 
-**Purpose**: Formats multiple labeled `ResponsesRequest` snapshots under a scenario heading.
+**Purpose**: Builds a larger snapshot with a scenario name and several titled request sections. It helps tests compare multiple stages of a scenario in one readable block.
 
-**Data flow**: Accepts a scenario string, a slice of `(title, &ResponsesRequest)` pairs, and options. It maps each section to `## <title>` plus the result of `format_request_input_snapshot`, joins sections with blank lines, prefixes `Scenario: <scenario>`, and returns the combined string.
+**Data flow**: It receives a scenario label, a list of section titles paired with requests, and snapshot options. For each section, it formats the request input, adds a markdown-style heading, and returns one combined text document.
 
-**Call relations**: Higher-level tests use this to compare several request snapshots in one assertion. It delegates per-request rendering to `format_request_input_snapshot`.
+**Call relations**: Scenario-style tests call this when they want to show more than one request side by side, such as startup context followed by a later turn. It uses the request input snapshot formatter for each section.
 
 *Call graph*: called by 5 (fork_startup_context_then_first_turn_diff_snapshot, format_labeled_requests_snapshot, format_labeled_requests_snapshot, format_labeled_requests_snapshot, new_context_tool_starts_new_window_before_follow_up); 2 external calls (iter, format!).
 
@@ -1591,11 +1605,11 @@ fn format_labeled_items_snapshot(
 ) -> String
 ```
 
-**Purpose**: Formats multiple labeled raw item slices under a scenario heading.
+**Purpose**: Builds a scenario snapshot from already-extracted item lists rather than full request objects. It is useful for tests that collect or compare raw response items directly.
 
-**Data flow**: Accepts a scenario string, a slice of `(title, &[Value])` pairs, and options. It maps each section to a heading plus `format_response_items_snapshot(items, options)`, joins sections with blank lines, and returns the final scenario-prefixed string.
+**Data flow**: It receives a scenario label, titled sections of JSON item slices, and options. It formats each item slice, places it under its title, and returns one combined text document.
 
-**Call relations**: This is the raw-items counterpart to `format_labeled_requests_snapshot`, used when tests already have item arrays rather than full requests.
+**Call relations**: A higher-level assertion helper calls this when it already has item arrays to compare. It delegates the item-by-item rendering to `format_response_items_snapshot`.
 
 *Call graph*: called by 1 (assert_two_responses_input_snapshot); 2 external calls (iter, format!).
 
@@ -1612,11 +1626,11 @@ fn format_request_body_diff_snapshot(
     options: &Cont
 ```
 
-**Purpose**: Produces a snapshot containing only changed lines between two full `/responses` request bodies after canonicalization and redaction.
+**Purpose**: Shows what changed between two complete `/responses` request bodies while keeping the output short. It is meant for tests that need request parity checks without dumping the whole JSON payload.
 
-**Data flow**: Formats `before_request` and `after_request` through `format_request_body_snapshot`, computes a changed-lines diff with `format_changed_lines_diff(before_title, &before, after_title, &after)`, prefixes the scenario heading, and returns the resulting string.
+**Data flow**: It receives a scenario name, titles for the before and after requests, the two requests, and options. It converts each request body into a normalized pretty JSON string, computes only the changed lines, and returns the scenario header plus that diff.
 
-**Call relations**: Request-parity tests call this when they need a compact diff of whole JSON payloads rather than item-level summaries. It delegates body rendering and diffing to dedicated helpers.
+**Call relations**: Tests use this when comparing two full request payloads. It calls `format_request_body_snapshot` for each side, then passes both rendered bodies to `format_changed_lines_diff`.
 
 *Call graph*: calls 2 internal fn (format_changed_lines_diff, format_request_body_snapshot); 1 external calls (format!).
 
@@ -1630,11 +1644,11 @@ fn format_request_body_snapshot(
 ) -> String
 ```
 
-**Purpose**: Canonicalizes and pretty-prints a request's full JSON body for stable snapshot comparison.
+**Purpose**: Converts a full request body into stable, pretty-printed JSON for snapshot comparison. It prepares the data so later diffs are about real changes, not random ordering or run-specific values.
 
-**Data flow**: Calls `request.body_json()` to obtain a mutable `Value`, recursively canonicalizes it with `canonicalize_json_snapshot_value`, then serializes it with `serde_json::to_string_pretty`, panicking if serialization fails.
+**Data flow**: It receives a request and options. It reads the request body as JSON, normalizes the JSON values in place, serializes the result with indentation, and returns that string.
 
-**Call relations**: This helper is used by `format_request_body_diff_snapshot` as the normalized input to line-based diffing.
+**Call relations**: `format_request_body_diff_snapshot` calls this once for the before request and once for the after request. It relies on `canonicalize_json_snapshot_value` to clean and stabilize the JSON before printing.
 
 *Call graph*: calls 2 internal fn (canonicalize_json_snapshot_value, body_json); called by 1 (format_request_body_diff_snapshot); 1 external calls (to_string_pretty).
 
@@ -1645,11 +1659,11 @@ fn format_request_body_snapshot(
 fn canonicalize_json_snapshot_value(value: &mut Value, options: &ContextSnapshotOptions)
 ```
 
-**Purpose**: Recursively normalizes a JSON value for snapshot stability by sorting object keys and rewriting all strings through snapshot string formatting.
+**Purpose**: Walks through a JSON value and makes it stable for snapshots. It sorts object keys and normalizes every string it finds.
 
-**Data flow**: Mutably matches on a `serde_json::Value`. For arrays it recursively canonicalizes each element. For objects it `take`s the map, collects entries into a vector, sorts by key, recursively canonicalizes each value, and reinserts entries in sorted order. For strings it replaces the text with `format_snapshot_json_string(text, options)`. Nulls, booleans, and numbers are left unchanged.
+**Data flow**: It receives a mutable JSON value and options. If the value is an array, it processes each element; if it is an object, it sorts keys and processes each field; if it is a string, it replaces the string with its snapshot-safe version. It changes the JSON value in place and returns nothing.
 
-**Call relations**: This function is called only by `format_request_body_snapshot` and is the recursive engine behind stable full-body snapshots.
+**Call relations**: `format_request_body_snapshot` calls this before pretty-printing JSON. When it reaches strings, it hands them to `format_snapshot_json_string` so text redaction and dynamic-value cleanup are applied consistently.
 
 *Call graph*: calls 1 internal fn (format_snapshot_json_string); called by 1 (format_request_body_snapshot); 1 external calls (take).
 
@@ -1660,11 +1674,11 @@ fn canonicalize_json_snapshot_value(value: &mut Value, options: &ContextSnapshot
 fn format_snapshot_json_string(text: &str, options: &ContextSnapshotOptions) -> String
 ```
 
-**Purpose**: Normalizes a JSON string value according to snapshot options, including canonical placeholders, dynamic-value redaction, line-ending normalization, and optional prefix truncation.
+**Purpose**: Normalizes one JSON string for stable snapshot output. It can redact known large context blocks, clean line endings, replace dynamic values, and optionally shorten long text.
 
-**Data flow**: Accepts raw `text` and options. In redacted or prefix modes it canonicalizes known text blocks with `canonicalize_snapshot_text`, normalizes line endings, then redacts dynamic values with `normalize_snapshot_dynamic_values`; in full-text mode it only normalizes line endings. If the mode is `KindWithTextPrefix` and the normalized string exceeds `max_chars`, it truncates to that many characters and appends `...`; otherwise it returns the normalized string. `KindOnly` is treated as unreachable.
+**Data flow**: It receives a text string and options. Depending on the render mode, it canonicalizes known text patterns, normalizes line endings, replaces dynamic values like UUIDs and timestamps, and may truncate to a maximum character count. It returns the cleaned string.
 
-**Call relations**: It is used by `canonicalize_json_snapshot_value` for every JSON string in full-body snapshots, and is also directly tested by the dynamic-turn-metadata unit test.
+**Call relations**: `canonicalize_json_snapshot_value` uses this for every string inside a request body. A focused unit test also calls it directly to prove dynamic metadata is replaced as expected.
 
 *Call graph*: calls 3 internal fn (canonicalize_snapshot_text, normalize_snapshot_dynamic_values, normalize_snapshot_line_endings); called by 2 (canonicalize_json_snapshot_value, redacted_text_mode_normalizes_turn_metadata_dynamic_json_strings); 2 external calls (format!, unreachable!).
 
@@ -1680,11 +1694,11 @@ fn format_changed_lines_diff(
 ) -> String
 ```
 
-**Purpose**: Builds a compact unified-style diff containing only inserted and deleted lines between two strings.
+**Purpose**: Creates a small diff showing only inserted and deleted lines between two text blocks. Equal lines are left out so the reader sees only what changed.
 
-**Data flow**: Starts a string with `--- <before_title>` and `+++ <after_title>`, computes a line diff via `TextDiff::from_lines(before, after)`, iterates all changes, ignores equal lines, prefixes deleted lines with `-` and inserted lines with `+`, appends each changed line's original text, and returns the diff string.
+**Data flow**: It receives titles and two text bodies. It starts with diff headers, compares the bodies line by line, appends deleted lines with `-` and inserted lines with `+`, and returns the resulting diff text.
 
-**Call relations**: This helper is called by `format_request_body_diff_snapshot` after both request bodies have been canonicalized and pretty-printed.
+**Call relations**: `format_request_body_diff_snapshot` calls this after preparing the before and after request-body snapshots. It is the final step that turns two full JSON documents into a concise test failure display.
 
 *Call graph*: called by 1 (format_request_body_diff_snapshot); 2 external calls (from_lines, format!).
 
@@ -1695,11 +1709,11 @@ fn format_changed_lines_diff(
 fn format_snapshot_text(text: &str, options: &ContextSnapshotOptions) -> String
 ```
 
-**Purpose**: Formats free-form text content for item-level snapshots according to the selected render mode.
+**Purpose**: Formats ordinary message text for item snapshots. It applies the chosen render mode and turns real newlines into visible `\n` text so each snapshot item can stay on one line when possible.
 
-**Data flow**: In `RedactedText` mode it canonicalizes known text blocks, normalizes line endings, and escapes newlines as `\n`. In `FullText` mode it only normalizes line endings and escapes newlines. In `KindWithTextPrefix` mode it canonicalizes and normalizes similarly, escapes newlines, and truncates to `max_chars` with `...` if needed. `KindOnly` is unreachable.
+**Data flow**: It receives message text and options. In redacted mode it replaces known context blocks with placeholders; in full mode it keeps the text; in prefix mode it normalizes and shortens the text. It returns the display-ready string.
 
-**Call relations**: This function is used inside `format_response_items_snapshot` for message text, function-call output strings, shell commands, and reasoning summaries.
+**Call relations**: The item formatter uses this whenever it needs to print message text, function-call output, shell commands, or reasoning summaries. It depends on the lower-level text normalization helpers.
 
 *Call graph*: calls 2 internal fn (canonicalize_snapshot_text, normalize_snapshot_line_endings); 2 external calls (format!, unreachable!).
 
@@ -1710,11 +1724,11 @@ fn format_snapshot_text(text: &str, options: &ContextSnapshotOptions) -> String
 fn normalize_snapshot_line_endings(text: &str) -> String
 ```
 
-**Purpose**: Converts CRLF and lone CR line endings to LF for snapshot stability across platforms.
+**Purpose**: Makes line endings consistent across operating systems. It converts Windows-style and old Mac-style line breaks into normal newline characters.
 
-**Data flow**: Takes `&str`, replaces `"\r\n"` with `"\n"`, then replaces remaining `\r` with `\n`, and returns the normalized string.
+**Data flow**: It receives text that may contain `\r\n` or `\r`. It replaces those line endings with `\n` and returns the normalized text.
 
-**Call relations**: Both `format_snapshot_json_string` and `format_snapshot_text` call this before further rendering so snapshots are insensitive to platform-specific line endings.
+**Call relations**: Both `format_snapshot_json_string` and `format_snapshot_text` call this before comparing or printing text. This prevents snapshots from changing just because a file or system used different newline conventions.
 
 *Call graph*: called by 2 (format_snapshot_json_string, format_snapshot_text).
 
@@ -1725,11 +1739,11 @@ fn normalize_snapshot_line_endings(text: &str) -> String
 fn canonicalize_snapshot_text(text: &str) -> String
 ```
 
-**Purpose**: Rewrites known large or environment-specific text blocks into stable placeholders while preserving meaningful structure where needed.
+**Purpose**: Replaces known bulky or machine-specific context text with short, meaningful placeholders. This keeps snapshots readable while still showing what kind of context was present.
 
-**Data flow**: Examines the start of `text` and returns fixed placeholders for permissions instructions, Apps/Skills/Plugins instruction blocks, AGENTS.md instructions, summarization prompts, and compaction summaries. For `<environment_context>` blocks it optionally counts `- ` lines inside `<subagents>`, extracts `<cwd>...</cwd>` when present, and returns placeholders such as `<ENVIRONMENT_CONTEXT:cwd=<CWD>:subagents=2>` or a special `PRETURN_CONTEXT_DIFF_CWD` variant. If no special case matches, it delegates to `normalize_dynamic_snapshot_paths(text)`.
+**Data flow**: It receives raw text. It checks for known prefixes such as permissions instructions, apps/skills/plugins instructions, `AGENTS.md`, environment context, summarization prompts, and compaction summaries. It returns a placeholder or normalized version of the text, including normalized skill file paths when needed.
 
-**Call relations**: This is the main semantic redaction helper used by both `format_snapshot_json_string` and `format_snapshot_text`.
+**Call relations**: `format_snapshot_text` and `format_snapshot_json_string` call this when redacted or prefix rendering is requested. If no special block is recognized, it hands the text to `normalize_dynamic_snapshot_paths` to clean temporary system-skill paths.
 
 *Call graph*: calls 1 internal fn (normalize_dynamic_snapshot_paths); called by 2 (format_snapshot_json_string, format_snapshot_text); 2 external calls (new, format!).
 
@@ -1740,11 +1754,11 @@ fn canonicalize_snapshot_text(text: &str) -> String
 fn is_capability_instruction_text(text: &str) -> bool
 ```
 
-**Purpose**: Recognizes whether a text fragment is one of the capability-instruction blocks that may be stripped from developer messages.
+**Purpose**: Recognizes app, skill, and plugin instruction blocks. It is used when tests ask to remove those capability instructions from developer-message snapshots.
 
-**Data flow**: Checks whether `text` starts with any of `APPS_INSTRUCTIONS_OPEN_TAG`, `SKILLS_INSTRUCTIONS_OPEN_TAG`, or `PLUGINS_INSTRUCTIONS_OPEN_TAG`, and returns the resulting boolean.
+**Data flow**: It receives a text string. It checks whether the string starts with one of the known capability instruction opening tags and returns true or false.
 
-**Call relations**: It is consulted inside `format_response_items_snapshot` when `strip_capability_instructions` is enabled.
+**Call relations**: `format_response_items_snapshot` uses this while processing developer message parts. When the strip option is enabled and this function returns true, that message part is omitted from the rendered snapshot.
 
 
 ##### `normalize_dynamic_snapshot_paths`  (lines 434–443)
@@ -1753,11 +1767,11 @@ fn is_capability_instruction_text(text: &str) -> bool
 fn normalize_dynamic_snapshot_paths(text: &str) -> String
 ```
 
-**Purpose**: Rewrites environment-specific system-skill file paths into a stable placeholder rooted at `<SYSTEM_SKILLS_ROOT>`.
+**Purpose**: Replaces temporary system-skill file paths with a stable placeholder. This prevents snapshots from depending on a machine's random temporary directory names.
 
-**Data flow**: Uses a lazily initialized `Regex` stored in `OnceLock` to match paths ending in `/skills/.system/<name>/SKILL.md`, replaces matches with `<SYSTEM_SKILLS_ROOT>/$1/SKILL.md`, and returns the owned normalized string.
+**Data flow**: It receives text that may include a path to `skills/.system/.../SKILL.md`. It uses a cached regular expression, which is a reusable text-matching pattern, to replace the changing root path with `<SYSTEM_SKILLS_ROOT>`. It returns the cleaned text.
 
-**Call relations**: This helper is the fallback path from `canonicalize_snapshot_text` when no higher-level placeholder rule applies.
+**Call relations**: `canonicalize_snapshot_text` calls this when the text is not one of the larger recognized context blocks. It is the path-cleanup fallback for ordinary text.
 
 *Call graph*: called by 1 (canonicalize_snapshot_text); 1 external calls (new).
 
@@ -1768,11 +1782,11 @@ fn normalize_dynamic_snapshot_paths(text: &str) -> String
 fn normalize_snapshot_dynamic_values(text: &str) -> String
 ```
 
-**Purpose**: Redacts dynamic scalar values embedded inside JSON-like strings, such as UUIDs, sandbox names, and turn timestamps.
+**Purpose**: Replaces run-specific values inside snapshot text, such as UUIDs, timestamps, and sandbox names. This keeps tests from failing just because a new run generated different metadata.
 
-**Data flow**: Uses three lazily initialized regexes in `OnceLock`s: one replaces UUIDs with `<UUID>`, one rewrites `"turn_started_at_unix_ms":<number>` to `"turn_started_at_unix_ms":<UNIX_MS>`, and one rewrites `"sandbox":"..."` to `"sandbox":"<SANDBOX>"`. It applies them in sequence and returns the final owned string.
+**Data flow**: It receives text. It applies cached regular expressions that find UUID-shaped strings, `turn_started_at_unix_ms` values, and `sandbox` values, replacing them with fixed placeholders. It returns the normalized text.
 
-**Call relations**: This helper is called by `format_snapshot_json_string` in redacted and prefix modes so full-body snapshots remain stable across runs.
+**Call relations**: `format_snapshot_json_string` calls this after canonicalizing text for JSON snapshots. It is especially important for full request-body comparisons where metadata changes every run.
 
 *Call graph*: called by 1 (format_snapshot_json_string); 1 external calls (new).
 
@@ -1783,11 +1797,11 @@ fn normalize_snapshot_dynamic_values(text: &str) -> String
 fn full_text_mode_preserves_unredacted_text()
 ```
 
-**Purpose**: Verifies that full-text rendering leaves AGENTS.md content intact instead of replacing it with a placeholder.
+**Purpose**: Checks that full-text mode does not replace `AGENTS.md` content with a placeholder. This protects the mode that is meant to show the original text.
 
-**Data flow**: Builds a one-item message array containing AGENTS.md text, formats it with `format_response_items_snapshot` using `ContextSnapshotOptions::default().render_mode(FullText)`, and asserts the exact unredacted rendered string.
+**Data flow**: It builds a sample user message containing `AGENTS.md` instructions, creates default options changed to full-text mode, formats the item list, and compares the result with the expected unredacted string.
 
-**Call relations**: This unit test is run by the test harness and validates the `FullText` branch of `format_snapshot_text` through the main item formatter.
+**Call relations**: This test calls `ContextSnapshotOptions::default` and `format_response_items_snapshot`. It verifies that the central item formatter respects the full-text option.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1798,11 +1812,11 @@ fn full_text_mode_preserves_unredacted_text()
 fn full_text_mode_normalizes_crlf_line_endings()
 ```
 
-**Purpose**: Verifies that full-text rendering still normalizes CRLF line endings to LF.
+**Purpose**: Checks that full-text mode still normalizes Windows-style line endings. Full text means unredacted content, not platform-dependent newline output.
 
-**Data flow**: Creates a message item whose text contains `\r\n`, formats it in `FullText` mode, and asserts the output contains normalized `\n` escapes.
+**Data flow**: It builds a message containing `\r\n` line breaks, formats it in full-text mode, and asserts that the output uses normalized `\n` line breaks displayed in the snapshot string.
 
-**Call relations**: This test exercises `normalize_snapshot_line_endings` as reached through `format_response_items_snapshot` and `format_snapshot_text` in full-text mode.
+**Call relations**: This test exercises `format_response_items_snapshot` through the full-text path. It indirectly protects the line-ending normalization used by snapshot text formatting.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1813,11 +1827,11 @@ fn full_text_mode_normalizes_crlf_line_endings()
 fn redacted_text_mode_keeps_canonical_placeholders()
 ```
 
-**Purpose**: Verifies that redacted mode replaces AGENTS.md instruction text with the canonical `<AGENTS_MD>` placeholder.
+**Purpose**: Checks that redacted mode replaces `AGENTS.md` instructions with the standard `<AGENTS_MD>` placeholder. This confirms that large project guidance is hidden consistently.
 
-**Data flow**: Builds a message item with AGENTS.md text, formats it with default redacted options, and asserts the rendered snapshot is exactly `00:message/user:<AGENTS_MD>`.
+**Data flow**: It builds a user message containing `AGENTS.md` instructions, formats it with default redacted options, and compares the output to the expected placeholder line.
 
-**Call relations**: This test validates the AGENTS.md branch in `canonicalize_snapshot_text` as used by the main item formatter.
+**Call relations**: This test calls the default options and the main item formatter. It protects the redaction path used by most snapshots.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1828,11 +1842,11 @@ fn redacted_text_mode_keeps_canonical_placeholders()
 fn redacted_text_mode_keeps_capability_instruction_placeholders()
 ```
 
-**Purpose**: Verifies that Apps, Skills, and Plugins instruction blocks are each canonicalized to their dedicated placeholders in redacted mode.
+**Purpose**: Checks that app, skill, and plugin instruction blocks become clear placeholders in redacted mode. The snapshot should show that those blocks existed without printing their full contents.
 
-**Data flow**: Creates a developer message with three text parts, one for each capability instruction block, formats it with default redacted options, and asserts the multi-part rendered output contains `<APPS_INSTRUCTIONS>`, `<SKILLS_INSTRUCTIONS>`, and `<PLUGINS_INSTRUCTIONS>` in order.
+**Data flow**: It builds a developer message with three instruction text parts, formats it with default redacted options, and asserts that each part is shown as its matching placeholder in a multi-part message block.
 
-**Call relations**: This test covers multiple branches of `canonicalize_snapshot_text` and the multi-part message rendering path in `format_response_items_snapshot`.
+**Call relations**: This test drives `format_response_items_snapshot` with a multi-part developer message. It protects the canonicalization rules for capability instruction text.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1843,11 +1857,11 @@ fn redacted_text_mode_keeps_capability_instruction_placeholders()
 fn strip_capability_instructions_omits_capability_parts_from_developer_messages()
 ```
 
-**Purpose**: Verifies that enabling capability stripping removes Apps/Skills/Plugins instruction parts from developer messages while leaving other parts intact.
+**Purpose**: Checks that the strip option removes app, skill, and plugin instruction parts from developer messages. It also confirms that permissions instructions are not removed by that specific option.
 
-**Data flow**: Builds a developer message containing permissions, skills, and plugins text parts, formats it with redacted options plus `.strip_capability_instructions()`, and asserts only the permissions placeholder remains in the output.
+**Data flow**: It builds a developer message containing permissions, skills, and plugins instruction parts. It enables capability-instruction stripping, formats the items, and expects only the permissions placeholder to remain.
 
-**Call relations**: This test exercises the `strip_capability_instructions` option and `is_capability_instruction_text` filtering inside `format_response_items_snapshot`.
+**Call relations**: This test chains `strip_capability_instructions` onto default options before calling `format_response_items_snapshot`. It verifies the interaction between the option flag and capability-text detection.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1858,11 +1872,11 @@ fn strip_capability_instructions_omits_capability_parts_from_developer_messages(
 fn strip_agents_md_user_context_omits_agents_fragment_from_user_messages()
 ```
 
-**Purpose**: Verifies that enabling AGENTS.md stripping removes that fragment from user messages while preserving other user-context content.
+**Purpose**: Checks that the strip option removes `AGENTS.md` user context while keeping other user context. This helps tests focus on environment details without repeated project instructions.
 
-**Data flow**: Creates a user message with an AGENTS.md text part and an environment-context text part, formats it with redacted options plus `.strip_agents_md_user_context()`, and asserts the output contains only the normalized environment-context placeholder.
+**Data flow**: It builds a user message with an `AGENTS.md` part and an environment-context part. It enables `AGENTS.md` stripping, formats the items, and expects only the normalized environment context to appear.
 
-**Call relations**: This test covers the `strip_agents_md_user_context` branch in `format_response_items_snapshot`.
+**Call relations**: This test uses the option setter and then calls the main item formatter. It protects the user-message filtering path controlled by `strip_agents_md_user_context`.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1873,11 +1887,11 @@ fn strip_agents_md_user_context_omits_agents_fragment_from_user_messages()
 fn redacted_text_mode_normalizes_environment_context_with_subagents()
 ```
 
-**Purpose**: Verifies that environment-context text is canonicalized with both cwd redaction and subagent counting.
+**Purpose**: Checks that environment context is summarized and includes the number of subagents. This keeps the snapshot short while preserving an important fact about the request setup.
 
-**Data flow**: Builds a user message containing an `<environment_context>` block with a cwd and two `- ` subagent lines, formats it in default redacted mode, and asserts the output is `<ENVIRONMENT_CONTEXT:cwd=<CWD>:subagents=2>`.
+**Data flow**: It builds a user message containing environment context with a current working directory and two subagent lines. It formats the items in default redacted mode and expects a placeholder that includes `cwd=<CWD>` and `subagents=2`.
 
-**Call relations**: This test targets the environment-context parsing logic inside `canonicalize_snapshot_text`.
+**Call relations**: This test calls the main item formatter with default options. It protects the special environment-context logic inside text canonicalization.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1888,11 +1902,11 @@ fn redacted_text_mode_normalizes_environment_context_with_subagents()
 fn kind_with_text_prefix_mode_normalizes_crlf_line_endings()
 ```
 
-**Purpose**: Verifies that prefix mode normalizes line endings and truncates long text to the configured prefix length.
+**Purpose**: Checks that prefix mode both normalizes line endings and shortens long text. Prefix mode is useful when tests need a hint of the text without printing everything.
 
-**Data flow**: Creates a developer message with CRLF-containing text, formats it with `KindWithTextPrefix { max_chars: 64 }`, and asserts the output contains normalized `\n` escapes and an ellipsis after the prefix.
+**Data flow**: It builds a developer message with Windows-style line endings, sets render mode to a 64-character prefix, formats the items, and compares the output with the expected shortened normalized text.
 
-**Call relations**: This test exercises the prefix branch of `format_snapshot_text` through the main item formatter.
+**Call relations**: This test starts from default options, changes the render mode, and calls `format_response_items_snapshot`. It protects the prefix-rendering branch of snapshot text formatting.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1903,11 +1917,11 @@ fn kind_with_text_prefix_mode_normalizes_crlf_line_endings()
 fn image_only_message_is_rendered_as_non_text_span()
 ```
 
-**Purpose**: Verifies that a message containing only non-text image content is rendered as a typed span with its extra key names.
+**Purpose**: Checks that an image-only message is still represented clearly in the snapshot. The formatter should not lose non-text content just because there is no text field.
 
-**Data flow**: Builds a user message whose content contains one `input_image` object with `image_url`, formats it with default options, and asserts the output is `00:message/user:<input_image:image_url>`.
+**Data flow**: It builds a user message whose content is an image item with an image URL. It formats the items with default options and expects a compact marker showing an `input_image` with the `image_url` extra field.
 
-**Call relations**: This test covers the non-text content-item rendering path in `format_response_items_snapshot`.
+**Call relations**: This test calls `format_response_items_snapshot` directly. It protects the branch that renders non-text message content as angle-bracket markers.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1918,11 +1932,11 @@ fn image_only_message_is_rendered_as_non_text_span()
 fn mixed_text_and_image_message_keeps_image_span()
 ```
 
-**Purpose**: Verifies that mixed text and image content is preserved as a multi-part message with the image represented as a non-text span between text parts.
+**Purpose**: Checks that a message containing both text and an image keeps all parts in order. This matters because the structure of a multi-part message can affect what the model sees.
 
-**Data flow**: Creates a three-part user message containing text `<image>`, an `input_image` object, and text `</image>`, formats it with default options, and asserts the output is a three-line multi-part rendering with the image shown as `<input_image:image_url>`.
+**Data flow**: It builds a user message with text, an image item, and more text. It formats the items and asserts that the snapshot shows a three-part message with the image marker in the middle.
 
-**Call relations**: This test exercises both text and non-text content handling plus the multi-part message formatting branch.
+**Call relations**: This test exercises the multi-part path in `format_response_items_snapshot`. It verifies that text rendering and non-text markers work together.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1933,11 +1947,11 @@ fn mixed_text_and_image_message_keeps_image_span()
 fn redacted_text_mode_normalizes_system_skill_temp_paths()
 ```
 
-**Purpose**: Verifies that environment-specific temporary system-skill file paths are rewritten to the stable `<SYSTEM_SKILLS_ROOT>` placeholder.
+**Purpose**: Checks that temporary system-skill paths are replaced with a stable root placeholder. This prevents snapshots from depending on random temporary folder names.
 
-**Data flow**: Builds a developer message containing a concrete temp path ending in `/skills/.system/openai-docs/SKILL.md`, formats it with default options, and asserts the path is normalized in the rendered output.
+**Data flow**: It builds a developer message containing a long temporary path to a system skill file. It formats the item with default redacted options and expects the path root to become `<SYSTEM_SKILLS_ROOT>` while keeping the skill name and file name.
 
-**Call relations**: This test specifically validates `normalize_dynamic_snapshot_paths` as reached through `canonicalize_snapshot_text` and `format_snapshot_text`.
+**Call relations**: This test calls the main item formatter. It protects the dynamic path normalization used by text canonicalization.
 
 *Call graph*: calls 2 internal fn (default, format_response_items_snapshot); 2 external calls (assert_eq!, vec!).
 
@@ -1948,26 +1962,24 @@ fn redacted_text_mode_normalizes_system_skill_temp_paths()
 fn redacted_text_mode_normalizes_turn_metadata_dynamic_json_strings()
 ```
 
-**Purpose**: Verifies that JSON-like strings containing dynamic turn metadata are redacted to stable placeholders.
+**Purpose**: Checks that dynamic metadata inside a JSON-looking string is replaced with placeholders. This covers UUIDs, sandbox names, and millisecond timestamps.
 
-**Data flow**: Calls `format_snapshot_json_string` directly on a JSON string containing a UUID turn ID, sandbox name, and numeric `turn_started_at_unix_ms`, using default options, and asserts the returned string replaces them with `<UUID>`, `<SANDBOX>`, and `<UNIX_MS>`.
+**Data flow**: It passes a string containing a turn ID, sandbox value, and start time into `format_snapshot_json_string` using default options. It asserts that those unstable values become `<UUID>`, `<SANDBOX>`, and `<UNIX_MS>`.
 
-**Call relations**: This test directly targets `normalize_snapshot_dynamic_values` through `format_snapshot_json_string`, rather than going through item or request-body formatting.
+**Call relations**: Unlike most tests here, this one calls the JSON-string formatter directly. It protects the dynamic-value cleanup used during full request-body snapshot formatting.
 
 *Call graph*: calls 2 internal fn (default, format_snapshot_json_string); 1 external calls (assert_eq!).
 
 
 ### `core/tests/common/responses.rs`
 
-`io_transport` · `test request/response simulation`
+`test` · `test setup and mocked request handling`
 
-This file is the main transport-level test toolkit for remote model interactions. It defines `ResponseMock`, which captures `wiremock::Request` values for `/responses` POSTs inside `Arc<Mutex<Vec<ResponsesRequest>>>`, and `ResponsesRequest`, a wrapper with rich JSON inspection helpers. Those helpers decode zstd-compressed bodies when `content-encoding` includes `zstd`, parse JSON, extract instructions, input items, message text/image spans, headers, query params, and specific tool-output records. Several methods intentionally panic when expected structure is absent, making malformed requests fail tests immediately.
+Tests for an API client need a safe, predictable stand-in for the real service. This file provides that stand-in. It builds mock `/responses`, `/responses/compact`, and `/models` endpoints, plus a small WebSocket server for realtime tests. Tests can say, “when the client sends a request, answer with these stream events,” then inspect the exact request body, headers, path, query string, messages, images, tools, or tool-call outputs the client sent.
 
-The file also provides a large catalog of event constructors for SSE-based Responses API simulations: response lifecycle events, assistant messages, reasoning items and deltas, web search calls, image generation calls, function/custom/local-shell/tool-search calls, and convenience wrappers for shell-command and apply-patch shapes. `sse` serializes these JSON events into `text/event-stream` bodies, omitting `data:` lines for events that contain only a `type` field.
+A big part of the file is convenience builders for Server-Sent Events, or SSE: a simple text format where the server sends named events one after another. These helpers create realistic events such as “response created,” “assistant message,” “function call,” “tool search,” “reasoning text,” or “failure.” That keeps tests short and readable.
 
-For HTTP mocking, helper builders mount one-shot or sequential responders for `/responses`, `/responses/compact`, and `/models`, including a compaction responder that preserves only user/developer messages and appends a synthetic compaction item. `start_mock_server` always pre-mounts an empty `/models` response to keep tests hermetic.
-
-For websocket coverage, `WebSocketTestServer` spins up a real `TcpListener`, records handshake metadata and per-connection JSON requests, optionally delays handshake acceptance, streams scripted event batches per incoming request, and can either close normally or stay open to simulate incomplete close handshakes. Finally, every captured `/responses` POST is validated by `validate_request_body_invariants`, which enforces symmetry between tool-call items and their corresponding output items and rejects orphan or empty `call_id` outputs except for legacy server-executed tool-search outputs.
+The file also protects tests from accidentally accepting bad request history. Every captured `/responses` POST is checked for matching tool calls and tool outputs. For example, if the client sends a tool result without the original tool call, the mock panics immediately. Think of it like a rehearsal stage with a strict script supervisor: it not only performs the fake server role, it also catches continuity errors before they reach production.
 
 #### Function details
 
@@ -1977,11 +1989,11 @@ For websocket coverage, `WebSocketTestServer` spins up a real `TcpListener`, rec
 fn new() -> Self
 ```
 
-**Purpose**: Creates an empty request-capturing mock for `/responses` endpoints.
+**Purpose**: Creates an empty recorder for `/responses` requests. Tests use it so they can later inspect what the client sent.
 
-**Data flow**: It allocates a new `Vec<ResponsesRequest>` inside `Arc<Mutex<_>>` and returns a `ResponseMock` holding that shared state.
+**Data flow**: It starts with no inputs, creates a shared list protected by a mutex (a lock that stops two test tasks changing the list at once), and returns a `ResponseMock` that owns that shared recorder.
 
-**Call relations**: This constructor is used by `base_mock` and `compact_mock` when building wiremock matchers that both capture requests and validate them.
+**Call relations**: The mock-building helpers create this recorder before mounting fake `/responses` or `/responses/compact` endpoints, then wire it into Wiremock so every matching request is saved.
 
 *Call graph*: called by 2 (base_mock, compact_mock); 3 external calls (new, new, new).
 
@@ -1992,11 +2004,11 @@ fn new() -> Self
 fn single_request(&self) -> ResponsesRequest
 ```
 
-**Purpose**: Returns the only captured request, panicking unless exactly one request was recorded.
+**Purpose**: Returns the only captured `/responses` request, and fails the test if there were zero or more than one. This is useful when a test expects exactly one API call.
 
-**Data flow**: It locks the internal request vector, checks `len() == 1`, clones the first `ResponsesRequest`, and returns it. It panics with the observed count otherwise.
+**Data flow**: It reads the shared request list, checks its length, and returns a cloned request if the length is exactly one. If the count is wrong, it panics with a clear count.
 
-**Call relations**: Tests use this when they expect a single `/responses` call and want a concise assertion failure if extra or missing calls occurred.
+**Call relations**: Higher-level test helpers call this after a mocked turn completes to examine the single request body without manually checking the list.
 
 *Call graph*: called by 1 (command_result); 1 external calls (panic!).
 
@@ -2007,11 +2019,11 @@ fn single_request(&self) -> ResponsesRequest
 fn requests(&self) -> Vec<ResponsesRequest>
 ```
 
-**Purpose**: Returns a cloned snapshot of all captured `/responses` requests.
+**Purpose**: Returns all captured `/responses` requests. Tests use it when they expect multiple calls or need to search the history.
 
-**Data flow**: It locks the internal mutex, clones the `Vec<ResponsesRequest>`, and returns it.
+**Data flow**: It locks the shared list, clones the saved `ResponsesRequest` values, and gives the caller an independent snapshot.
 
-**Call relations**: Many higher-level test assertions build on this method to inspect request history, count calls, or search for specific tool-call patterns.
+**Call relations**: Many waiting and assertion helpers call this repeatedly while polling for expected requests or scanning request contents.
 
 *Call graph*: called by 7 (wait_for_request_count, function_call_output_text, saw_function_call, capture_from_requests, wait_for_matching_request, wait_for_requests, wait_for_request).
 
@@ -2022,11 +2034,11 @@ fn requests(&self) -> Vec<ResponsesRequest>
 fn last_request(&self) -> Option<ResponsesRequest>
 ```
 
-**Purpose**: Returns the most recently captured request if any exist.
+**Purpose**: Returns the most recent captured request, if any. It is a quick way to inspect the latest API call without caring about earlier ones.
 
-**Data flow**: It locks the internal request vector, clones the last element if present, and returns `Option<ResponsesRequest>`.
+**Data flow**: It reads the shared request list, clones the last item when present, and returns `None` if no request has arrived.
 
-**Call relations**: This is a convenience accessor for tests that only care about the latest outbound request.
+**Call relations**: This is a direct inspection helper for tests that care about the latest request state.
 
 
 ##### `ResponseMock::saw_function_call`  (lines 68–72)
@@ -2035,11 +2047,11 @@ fn last_request(&self) -> Option<ResponsesRequest>
 fn saw_function_call(&self, call_id: &str) -> bool
 ```
 
-**Purpose**: Checks whether any captured request contains a `function_call` input item with the specified `call_id`.
+**Purpose**: Checks whether any captured request includes a function call with a given call id. Tests use it to prove the client preserved or resent a specific tool call.
 
-**Data flow**: It takes `call_id`, clones all requests via `requests()`, scans them with `ResponsesRequest::has_function_call`, and returns a boolean.
+**Data flow**: It receives a call id, takes a snapshot of all requests, asks each request whether it contains that function call, and returns true as soon as one matches.
 
-**Call relations**: Tests use this across multi-request flows to verify that a particular function call was ever emitted, regardless of which turn request contained it.
+**Call relations**: It builds on `ResponseMock::requests` and `ResponsesRequest::has_function_call`, giving tests a one-line search across request history.
 
 *Call graph*: calls 1 internal fn (requests).
 
@@ -2050,11 +2062,11 @@ fn saw_function_call(&self, call_id: &str) -> bool
 fn function_call_output_text(&self, call_id: &str) -> Option<String>
 ```
 
-**Purpose**: Finds the first matching `function_call_output` text across all captured requests for a given `call_id`.
+**Purpose**: Finds the output text for a particular function call result across all captured requests. This helps tests confirm that tool results were sent back to the model correctly.
 
-**Data flow**: It takes `call_id`, clones all requests via `requests()`, calls `ResponsesRequest::function_call_output_text` on each, and returns the first non-`None` `String`.
+**Data flow**: It receives a call id, scans saved requests in order, and returns the first matching output string. If no matching output exists, it returns `None`.
 
-**Call relations**: This helper lets tests inspect tool output across retries or follow-up requests without manually iterating request history.
+**Call relations**: It uses `ResponseMock::requests` and each request’s own function-output lookup to hide the repeated search work from test code.
 
 *Call graph*: calls 1 internal fn (requests).
 
@@ -2065,11 +2077,11 @@ fn function_call_output_text(&self, call_id: &str) -> Option<String>
 fn is_zstd_encoding(value: &str) -> bool
 ```
 
-**Purpose**: Determines whether a `content-encoding` header value includes `zstd` among possibly comma-separated encodings.
+**Purpose**: Checks whether a `Content-Encoding` header says the body is compressed with zstd. zstd is a compression format, like a zip file for request bodies.
 
-**Data flow**: It takes a header string, splits on commas, trims each entry, compares case-insensitively to `zstd`, and returns `true` if any entry matches.
+**Data flow**: It receives a header string, splits comma-separated encoding names, trims spaces, compares each name case-insensitively with `zstd`, and returns true if found.
 
-**Call relations**: This helper is used by `decode_body_bytes` to decide whether request bodies need decompression before JSON parsing.
+**Call relations**: Body-decoding code uses this before trying to read JSON from a request, so tests can inspect both plain and compressed requests.
 
 
 ##### `decode_body_bytes`  (lines 92–99)
@@ -2078,11 +2090,11 @@ fn is_zstd_encoding(value: &str) -> bool
 fn decode_body_bytes(body: &[u8], content_encoding: Option<&str>) -> Vec<u8>
 ```
 
-**Purpose**: Returns decoded request-body bytes, transparently decompressing zstd-encoded payloads when indicated by headers.
+**Purpose**: Turns a captured request body into readable bytes, decompressing it if the client used zstd compression.
 
-**Data flow**: It takes raw body bytes and an optional content-encoding string. If the encoding contains `zstd`, it decodes the bytes with `zstd::stream::decode_all`; otherwise it clones the original bytes into a `Vec<u8>`.
+**Data flow**: It receives raw body bytes and an optional encoding header. If the header includes zstd, it decompresses the bytes; otherwise it copies them unchanged.
 
-**Call relations**: Both request-inspection helpers and invariant validation call this so compressed and uncompressed requests are treated uniformly.
+**Call relations**: Request inspection and invariant validation call this before parsing JSON, so the rest of the test helpers do not need to care whether the client compressed the request.
 
 *Call graph*: calls 1 internal fn (new); called by 2 (body_json, validate_request_body_invariants); 1 external calls (decode_all).
 
@@ -2093,11 +2105,11 @@ fn decode_body_bytes(body: &[u8], content_encoding: Option<&str>) -> Vec<u8>
 fn body_json(&self) -> Value
 ```
 
-**Purpose**: Parses the captured request body as JSON, decoding zstd compression first when necessary.
+**Purpose**: Parses the captured request body as JSON. Tests use this as the main doorway into the request payload.
 
-**Data flow**: It reads `self.0.body` and the optional `content-encoding` header from `self.0.headers`, decodes bytes via `decode_body_bytes`, parses them with `serde_json::from_slice`, and returns a `serde_json::Value`, panicking on invalid JSON.
+**Data flow**: It reads the raw body and `content-encoding` header, decodes compression when needed, parses the bytes as JSON, and returns a `serde_json::Value` tree.
 
-**Call relations**: Most higher-level request-inspection methods delegate to this method as their starting point.
+**Call relations**: Most request-inspection helpers build on this, including checks for instructions, input items, tools, and text fragments.
 
 *Call graph*: calls 1 internal fn (decode_body_bytes); called by 9 (format_request_body_snapshot, body_contains_text, input, instructions_text, tool_by_name, assert_request_contains_custom_realtime_start, assert_request_contains_realtime_end, assert_request_contains_realtime_start, tool_names); 1 external calls (from_slice).
 
@@ -2108,11 +2120,11 @@ fn body_json(&self) -> Value
 fn body_bytes(&self) -> Vec<u8>
 ```
 
-**Purpose**: Returns the raw captured request body bytes without decoding or parsing.
+**Purpose**: Returns the original raw request body bytes exactly as captured. This is useful when a test needs to inspect compression or low-level payload data.
 
-**Data flow**: It clones `self.0.body` and returns the resulting `Vec<u8>`.
+**Data flow**: It clones the stored byte buffer from the Wiremock request and returns it unchanged.
 
-**Call relations**: Tests use this when they need exact byte-level assertions rather than JSON inspection.
+**Call relations**: This sits beside the JSON helpers for tests that need the body before parsing.
 
 
 ##### `ResponsesRequest::body_contains_text`  (lines 117–123)
@@ -2121,11 +2133,11 @@ fn body_bytes(&self) -> Vec<u8>
 fn body_contains_text(&self, text: &str) -> bool
 ```
 
-**Purpose**: Checks whether the parsed JSON body contains a given text fragment in JSON-escaped form.
+**Purpose**: Checks whether the request JSON contains a particular text fragment. It accounts for JSON escaping so tests can search for text reliably.
 
-**Data flow**: It serializes the target text with `serde_json::to_string`, strips the surrounding quotes, converts the whole body JSON to a string via `body_json().to_string()`, and returns whether that serialized fragment appears.
+**Data flow**: It receives text, converts it to its JSON string form, removes the outer quotes, turns the full body JSON into a string, and checks for the fragment.
 
-**Call relations**: This is a loose containment helper for tests that want to assert presence of text anywhere in the request payload.
+**Call relations**: It builds on `body_json` and is used by assertions that only need to know whether text appears somewhere in the request.
 
 *Call graph*: calls 1 internal fn (body_json); 1 external calls (to_string).
 
@@ -2136,11 +2148,11 @@ fn body_contains_text(&self, text: &str) -> bool
 fn tool_by_name(&self, namespace: &str, tool_name: &str) -> Option<Value>
 ```
 
-**Purpose**: Finds a child tool definition by namespace and tool name inside the request body's `tools` array.
+**Purpose**: Finds a tool nested inside a named tool namespace in the request. A namespace is a grouping, like a folder containing related tools.
 
-**Data flow**: It parses the body with `body_json`, searches via `namespace_child_tool`, clones the matched `Value`, and returns it as `Option<Value>`.
+**Data flow**: It parses the body JSON, searches the `tools` array for a namespace with the requested name, then searches that namespace’s child tools for the requested tool name.
 
-**Call relations**: Tests use this to inspect tool exposure in outbound requests without manually traversing nested namespace-tool JSON.
+**Call relations**: It delegates the search to `namespace_child_tool`, making request assertions about nested tools concise.
 
 *Call graph*: calls 2 internal fn (body_json, namespace_child_tool).
 
@@ -2151,11 +2163,11 @@ fn tool_by_name(&self, namespace: &str, tool_name: &str) -> Option<Value>
 fn instructions_text(&self) -> String
 ```
 
-**Purpose**: Extracts the top-level `instructions` string from the request body.
+**Purpose**: Returns the request’s top-level instructions text. Tests use this to verify the prompt or developer instructions sent to the model.
 
-**Data flow**: It parses the body JSON, indexes `body_json()["instructions"]`, converts it to `&str`, clones it into `String`, and returns it, panicking if absent or non-string.
+**Data flow**: It parses the body JSON, reads the `instructions` field as a string, and returns an owned copy.
 
-**Call relations**: Compaction and instruction-related tests call this to inspect the exact instructions sent to the model.
+**Call relations**: Token-estimation and prompt-checking helpers call this when they need the exact instruction text from a captured request.
 
 *Call graph*: calls 1 internal fn (body_json); called by 1 (estimate_compact_payload_tokens).
 
@@ -2166,11 +2178,11 @@ fn instructions_text(&self) -> String
 fn message_input_texts(&self, role: &str) -> Vec<String>
 ```
 
-**Purpose**: Collects all `input_text` spans from `message` input items for a specific role.
+**Purpose**: Collects all text spans from message inputs with a chosen role, such as user or developer. This lets tests focus on human-readable message text.
 
-**Data flow**: It filters `inputs_of_type("message")` by `role`, flattens each message's `content` array, keeps spans whose `type` is `input_text`, extracts their `text` strings, and returns them as `Vec<String>`.
+**Data flow**: It receives a role, filters request input items to messages with that role, walks their content array, keeps `input_text` spans, and returns their text strings.
 
-**Call relations**: Many tests use this to inspect user, developer, or assistant message text fragments embedded in request history.
+**Call relations**: Many prompt and instruction assertion helpers call this after a request is captured to verify what text the client sent.
 
 *Call graph*: calls 1 internal fn (inputs_of_type); called by 9 (instruction_fragments, message_input_text_contains, instruction_fragments, request_hook_prompt_texts, user_instructions_wrapper_count, permissions_texts, has_subagent_notification, token_budget_texts, phase2_prompt_text).
 
@@ -2181,11 +2193,11 @@ fn message_input_texts(&self, role: &str) -> Vec<String>
 fn message_input_text_groups(&self, role: &str) -> Vec<Vec<String>>
 ```
 
-**Purpose**: Returns `input_text` spans grouped per `message` input item for a specific role.
+**Purpose**: Collects input text spans by message instead of flattening them all together. This preserves which text pieces belonged to the same message.
 
-**Data flow**: It filters `inputs_of_type("message")` by role, maps each message's `content` array to a `Vec<String>` of `input_text` span texts, and returns `Vec<Vec<String>>` preserving message grouping.
+**Data flow**: It filters message inputs by role, then for each message gathers its `input_text` content into a separate list. The result is a list of message-sized text groups.
 
-**Call relations**: This grouped form supports predicates that reason about message boundaries rather than flattened text.
+**Call relations**: The predicate-based helper `has_message_with_input_texts` uses this when tests need to check whole messages, not just individual spans.
 
 *Call graph*: calls 1 internal fn (inputs_of_type); called by 1 (has_message_with_input_texts).
 
@@ -2200,11 +2212,11 @@ fn has_message_with_input_texts(
     ) -> bool
 ```
 
-**Purpose**: Checks whether any message for a given role has a group of input texts satisfying a caller-provided predicate.
+**Purpose**: Checks whether any message for a role satisfies a custom condition over its text spans. This gives tests flexible matching without repeating JSON walking code.
 
-**Data flow**: It takes a role and predicate, computes grouped texts with `message_input_text_groups`, applies the predicate to each `&[String]`, and returns whether any group matches.
+**Data flow**: It receives a role and a predicate function, groups message text by message, applies the predicate to each group, and returns true if any group matches.
 
-**Call relations**: Tests use this when they need to assert message-level structure, such as a specific combination of spans in one message.
+**Call relations**: It wraps `message_input_text_groups` for tests that need more expressive checks than simple text containment.
 
 *Call graph*: calls 1 internal fn (message_input_text_groups).
 
@@ -2215,11 +2227,11 @@ fn has_message_with_input_texts(
 fn message_input_image_urls(&self, role: &str) -> Vec<String>
 ```
 
-**Purpose**: Collects all `image_url` values from `input_image` spans inside `message` inputs for a given role.
+**Purpose**: Collects image URLs from message inputs with a chosen role. Tests use it to verify that image inputs were sent correctly.
 
-**Data flow**: It filters `inputs_of_type("message")` by role, flattens `content` arrays, keeps spans with `type == "input_image"`, extracts `image_url` strings, and returns them as `Vec<String>`.
+**Data flow**: It filters message inputs by role, walks content spans, keeps `input_image` spans, extracts their `image_url` strings, and returns them.
 
-**Call relations**: Image-related tests use this to verify that image inputs were forwarded correctly.
+**Call relations**: It shares the same input-filtering path as the text helpers, but focuses on image content instead.
 
 *Call graph*: calls 1 internal fn (inputs_of_type).
 
@@ -2230,11 +2242,11 @@ fn message_input_image_urls(&self, role: &str) -> Vec<String>
 fn input(&self) -> Vec<Value>
 ```
 
-**Purpose**: Extracts the request body's top-level `input` array as owned JSON values.
+**Purpose**: Returns the request’s `input` array. In Responses API calls, this array is the main history sent to the model.
 
-**Data flow**: It parses the body JSON, indexes `body_json()["input"]`, expects an array, clones it, and returns `Vec<Value>`.
+**Data flow**: It parses the body JSON, reads `input` as an array, clones it, and fails the test if the field is missing or not an array.
 
-**Call relations**: Most item-level inspection helpers build on this method.
+**Call relations**: Almost every helper that inspects messages, calls, or outputs starts here, because those items live inside `input`.
 
 *Call graph*: calls 1 internal fn (body_json); called by 6 (format_request_input_snapshot, call_output, function_call_output_text, has_function_call, inputs_of_type, estimate_compact_input_tokens).
 
@@ -2245,11 +2257,11 @@ fn input(&self) -> Vec<Value>
 fn inputs_of_type(&self, ty: &str) -> Vec<Value>
 ```
 
-**Purpose**: Filters the request `input` array to items whose `type` field matches the requested string.
+**Purpose**: Filters the request input array to items of one specific `type`. Tests use this to find messages, function calls, or other item kinds.
 
-**Data flow**: It takes a type string, obtains `input()`, filters items by `item.get("type") == Some(ty)`, clones matching items, and returns them.
+**Data flow**: It receives a type string, reads the full input array, keeps items whose `type` field matches, clones them, and returns the filtered list.
 
-**Call relations**: Message-text and image helpers use this to isolate message items before deeper traversal.
+**Call relations**: Message text and image helpers call this first so they can work only with message items.
 
 *Call graph*: calls 1 internal fn (input); called by 3 (message_input_image_urls, message_input_text_groups, message_input_texts).
 
@@ -2260,11 +2272,11 @@ fn inputs_of_type(&self, ty: &str) -> Vec<Value>
 fn function_call_output(&self, call_id: &str) -> Value
 ```
 
-**Purpose**: Returns the `function_call_output` item for a specific `call_id`, panicking if absent.
+**Purpose**: Returns the `function_call_output` item for a given call id. This helps tests verify the result sent back for a normal function/tool call.
 
-**Data flow**: It takes `call_id`, delegates to `call_output(call_id, "function_call_output")`, and returns the matching `Value`.
+**Data flow**: It receives a call id, asks the generic call-output finder for type `function_call_output`, and returns the matching JSON item or fails if missing.
 
-**Call relations**: Tests that need the full output item rather than just text use this typed wrapper around `call_output`.
+**Call relations**: It is a typed wrapper around `call_output`, used by test assertions that know they are checking normal function-call results.
 
 *Call graph*: calls 1 internal fn (call_output); called by 4 (function_tool_output_items, call_output, call_output_content_and_success, call_output).
 
@@ -2275,11 +2287,11 @@ fn function_call_output(&self, call_id: &str) -> Value
 fn custom_tool_call_output(&self, call_id: &str) -> Value
 ```
 
-**Purpose**: Returns the `custom_tool_call_output` item for a specific `call_id`, panicking if absent.
+**Purpose**: Returns the `custom_tool_call_output` item for a given call id. Tests use it for custom tools whose output format differs from normal functions.
 
-**Data flow**: It takes `call_id`, delegates to `call_output(call_id, "custom_tool_call_output")`, and returns the matching `Value`.
+**Data flow**: It receives a call id, searches the input array for a matching custom tool output item, and returns the JSON item or fails if it cannot be found.
 
-**Call relations**: This is the custom-tool analogue of `function_call_output`.
+**Call relations**: It narrows `call_output` to the custom-tool case so callers do not have to pass the type string themselves.
 
 *Call graph*: calls 1 internal fn (call_output); called by 3 (custom_tool_output_items, custom_tool_output_last_non_empty_text, custom_call_output).
 
@@ -2290,11 +2302,11 @@ fn custom_tool_call_output(&self, call_id: &str) -> Value
 fn tool_search_output(&self, call_id: &str) -> Value
 ```
 
-**Purpose**: Returns the `tool_search_output` item for a specific `call_id`, panicking if absent.
+**Purpose**: Returns the `tool_search_output` item for a given call id. Tests use it to inspect search results returned to the model.
 
-**Data flow**: It takes `call_id`, delegates to `call_output(call_id, "tool_search_output")`, and returns the matching `Value`.
+**Data flow**: It receives a call id, searches the request input for a matching tool-search output item, and returns the JSON object or fails if absent.
 
-**Call relations**: Tool-search tests use this typed wrapper to inspect the exact output item.
+**Call relations**: It is another typed wrapper over `call_output`, focused on tool-search tests.
 
 *Call graph*: calls 1 internal fn (call_output); called by 1 (tool_search_output_item).
 
@@ -2305,11 +2317,11 @@ fn tool_search_output(&self, call_id: &str) -> Value
 fn call_output(&self, call_id: &str, call_type: &str) -> Value
 ```
 
-**Purpose**: Finds and returns a specific output item in the request `input` array by `call_id` and output type.
+**Purpose**: Finds one output item in the request input by call id and output type. It is the shared lookup behind the specific output helpers.
 
-**Data flow**: It takes `call_id` and `call_type`, scans `input()` for an item whose `type` and `call_id` fields match, clones that item, and returns it, panicking if not found.
+**Data flow**: It receives a call id and an item type, scans the `input` array for an item whose `type` and `call_id` both match, clones it, and fails the test if no match exists.
 
-**Call relations**: This is the shared implementation behind the typed output-item accessors and content-extraction helpers.
+**Call relations**: Function, custom tool, and tool-search output helpers all delegate to this to avoid repeating the same JSON search.
 
 *Call graph*: calls 1 internal fn (input); called by 4 (call_output_content_and_success, custom_tool_call_output, function_call_output, tool_search_output).
 
@@ -2320,11 +2332,11 @@ fn call_output(&self, call_id: &str, call_type: &str) -> Value
 fn has_function_call(&self, call_id: &str) -> bool
 ```
 
-**Purpose**: Checks whether the request `input` contains a `function_call` item with the specified `call_id`.
+**Purpose**: Checks whether this request contains a `function_call` with a given call id. It answers whether the model call history includes that tool call.
 
-**Data flow**: It takes `call_id`, scans `input()` for an item with `type == "function_call"` and matching `call_id`, and returns a boolean.
+**Data flow**: It reads the input array, checks each item’s `type` and `call_id`, and returns true if one is a matching function call.
 
-**Call relations**: This method is used by `ResponseMock::saw_function_call` to search across captured requests.
+**Call relations**: The broader `ResponseMock::saw_function_call` helper uses this across all captured requests.
 
 *Call graph*: calls 1 internal fn (input).
 
@@ -2335,11 +2347,11 @@ fn has_function_call(&self, call_id: &str) -> bool
 fn function_call_output_text(&self, call_id: &str) -> Option<String>
 ```
 
-**Purpose**: Returns the `output` string from a matching `function_call_output` item if present and string-typed.
+**Purpose**: Returns the plain output string for a matching function-call result, if it exists. It is useful for simple text tool outputs.
 
-**Data flow**: It takes `call_id`, scans `input()` for a `function_call_output` item with that ID, then reads `item["output"]` as a string and returns `Option<String>`.
+**Data flow**: It receives a call id, finds a `function_call_output` item with that id, reads its `output` field as a string, and returns it as `Some`; missing or non-string output becomes `None`.
 
-**Call relations**: This is the per-request primitive used by `ResponseMock::function_call_output_text` to search request history.
+**Call relations**: The response-wide lookup helper calls this on each captured request while searching for a tool result.
 
 *Call graph*: calls 1 internal fn (input).
 
@@ -2353,11 +2365,11 @@ fn function_call_output_content_and_success(
     ) -> Option<(Option<String>, Option<bool>)>
 ```
 
-**Purpose**: Extracts normalized content text and optional success flag from a `function_call_output` item.
+**Purpose**: Extracts a function-call result’s content text and optional success flag in a normalized form. This covers both older simple outputs and newer object-shaped outputs.
 
-**Data flow**: It takes `call_id`, delegates to `call_output_content_and_success(call_id, "function_call_output")`, and returns `Option<(Option<String>, Option<bool>)>`.
+**Data flow**: It receives a call id, delegates to the shared output normalizer for `function_call_output`, and returns optional content plus optional success status.
 
-**Call relations**: Tests use this when outputs may be encoded either as plain strings, single `input_text` arrays, or structured objects with `content` and `success`.
+**Call relations**: Test assertion helpers use this when they need to compare both the body of a function result and whether it was marked successful.
 
 *Call graph*: calls 1 internal fn (call_output_content_and_success); called by 3 (call_output, call_output_content_and_success, call_output).
 
@@ -2371,11 +2383,11 @@ fn custom_tool_call_output_content_and_success(
     ) -> Option<(Option<String>, Option<bool>)>
 ```
 
-**Purpose**: Extracts normalized content text and optional success flag from a `custom_tool_call_output` item.
+**Purpose**: Extracts content text and optional success status from a custom tool result. It gives custom-tool tests the same normalized view as normal function-call tests.
 
-**Data flow**: It takes `call_id`, delegates to `call_output_content_and_success(call_id, "custom_tool_call_output")`, and returns `Option<(Option<String>, Option<bool>)>`.
+**Data flow**: It receives a call id, delegates to the shared output normalizer for `custom_tool_call_output`, and returns optional content plus optional success status.
 
-**Call relations**: This is the custom-tool analogue of the function-call output normalization helper.
+**Call relations**: It shares the normalization logic with function-call outputs while keeping the public helper specific to custom tools.
 
 *Call graph*: calls 1 internal fn (call_output_content_and_success); called by 2 (custom_tool_output_body_and_success, custom_call_output).
 
@@ -2390,11 +2402,11 @@ fn call_output_content_and_success(
     ) -> Option<(Option<String>, Option<bool>)>
 ```
 
-**Purpose**: Normalizes an output item's `output` field into optional text plus optional success metadata across multiple payload shapes.
+**Purpose**: Normalizes different output shapes into “content text” and “success flag.” This hides whether the JSON output was a string, a single text content item, or an object.
 
-**Data flow**: It takes `call_id` and `call_type`, fetches the full item via `call_output`, clones its `output` field or `Null`, and matches on the JSON shape: strings and arrays are converted to text via `output_value_to_text` with no success flag; objects yield `content` and `success`; other shapes return `(None, None)`.
+**Data flow**: It finds the matching output item, reads its `output` field, then interprets strings and single text arrays as content without success, objects as `content` plus `success`, and other shapes as empty values.
 
-**Call relations**: This shared implementation backs both typed `*_content_and_success` methods.
+**Call relations**: Both function-call and custom-tool content helpers rely on this shared parser, and the local unit test checks its edge cases.
 
 *Call graph*: calls 2 internal fn (call_output, output_value_to_text); called by 2 (custom_tool_call_output_content_and_success, function_call_output_content_and_success).
 
@@ -2405,11 +2417,11 @@ fn call_output_content_and_success(
 fn header(&self, name: &str) -> Option<String>
 ```
 
-**Purpose**: Returns a request header value as a string if present and valid UTF-8.
+**Purpose**: Reads one HTTP header from the captured request. Tests use it to check metadata sent alongside the JSON body.
 
-**Data flow**: It takes a header name, looks it up in `self.0.headers`, converts it with `to_str()`, clones it into `String`, and returns `Option<String>`.
+**Data flow**: It receives a header name, looks it up in the request headers, converts it to text if possible, and returns an owned string or `None`.
 
-**Call relations**: Tests use this for assertions on custom headers attached to outbound requests.
+**Call relations**: Header-specific assertions call this when they need a simple string view of a captured request header.
 
 *Call graph*: called by 1 (window_id_parts).
 
@@ -2420,11 +2432,11 @@ fn header(&self, name: &str) -> Option<String>
 fn path(&self) -> String
 ```
 
-**Purpose**: Returns the request URL path component.
+**Purpose**: Returns the URL path of the captured request. This helps tests confirm which endpoint was called.
 
-**Data flow**: It reads `self.0.url.path()`, converts it to `String`, and returns it.
+**Data flow**: It reads the request URL path and returns it as a string.
 
-**Call relations**: This is a simple accessor for route-level assertions.
+**Call relations**: It is a small inspection helper available after Wiremock captures a request.
 
 
 ##### `ResponsesRequest::query_param`  (lines 297–303)
@@ -2433,11 +2445,11 @@ fn path(&self) -> String
 fn query_param(&self, name: &str) -> Option<String>
 ```
 
-**Purpose**: Looks up a named query parameter from the request URL.
+**Purpose**: Reads one query-string parameter from the request URL. Tests use it when behavior is controlled by URL parameters.
 
-**Data flow**: It iterates `self.0.url.query_pairs()`, finds the first pair whose key matches `name`, converts the value to `String`, and returns `Option<String>`.
+**Data flow**: It receives a parameter name, searches the URL query pairs, and returns the matching value as a string if present.
 
-**Call relations**: Tests use this to inspect query-string options on outbound requests.
+**Call relations**: It complements body and header inspection by exposing the request’s URL parameters.
 
 
 ##### `output_value_to_text`  (lines 306–317)
@@ -2446,11 +2458,11 @@ fn query_param(&self, name: &str) -> Option<String>
 fn output_value_to_text(value: &Value) -> Option<String>
 ```
 
-**Purpose**: Converts supported output JSON shapes into plain text, accepting either a string or a single `input_text` content item.
+**Purpose**: Turns supported output JSON shapes into plain text. It accepts either a string or one single `input_text` content item.
 
-**Data flow**: It takes a `&Value` and returns `Some(String)` for `Value::String` or for a one-element array whose sole item has `type == "input_text"` and a `text` field. Arrays of other sizes or shapes and all non-string/object scalar types return `None`.
+**Data flow**: It receives a JSON value. If it is a string, it returns that string; if it is an array with exactly one `input_text` item, it returns that item’s text; all other shapes return `None`.
 
-**Call relations**: This normalization helper is used by output-content extraction code in both this file and the higher-level `test_codex` harness.
+**Call relations**: Output normalizers and custom output helpers use this to avoid treating mixed text-and-image output as plain text by mistake.
 
 *Call graph*: called by 2 (call_output_content_and_success, custom_tool_call_output_text).
 
@@ -2465,11 +2477,11 @@ fn namespace_child_tool(
 ) -> Option<&'a Value>
 ```
 
-**Purpose**: Finds a named child tool inside a namespace tool definition in a request body.
+**Purpose**: Finds a named child tool inside a named namespace in a request body. This supports tests for grouped tools.
 
-**Data flow**: It takes a body `Value`, namespace name, and child tool name; reads `body["tools"]` as an array; finds a tool with matching `name` and `type == "namespace"`; then searches its nested `tools` array for a child with the requested name and returns `Option<&Value>`.
+**Data flow**: It receives a body JSON value, namespace name, and tool name. It walks the top-level `tools` array, locates the namespace entry, then returns a reference to the matching child tool if present.
 
-**Call relations**: This is the traversal primitive used by `ResponsesRequest::tool_by_name` and by tests that inspect namespace-tool exposure directly.
+**Call relations**: Request helpers and tool-search tests call this instead of duplicating the nested JSON search.
 
 *Call graph*: called by 6 (tool_by_name, tool_search_indexes_only_enabled_non_app_mcp_tools, tool_search_output_has_namespace_child, tool_search_returns_deferred_v1_multi_agent_tools, spawn_agent_description, spawn_agent_tool_description_mentions_role_locked_settings); 1 external calls (get).
 
@@ -2480,11 +2492,11 @@ fn namespace_child_tool(
 fn request_with_input(input: Value) -> ResponsesRequest
 ```
 
-**Purpose**: Builds a synthetic `ResponsesRequest` containing a supplied `input` JSON array for unit tests of request-inspection helpers.
+**Purpose**: Builds a minimal fake `ResponsesRequest` around a supplied `input` JSON value. The unit test uses it to exercise request-parsing helpers without running a server.
 
-**Data flow**: It takes a JSON `Value` for `input`, constructs a `wiremock::Request` with a fixed `/v1/responses` URL, POST method, empty headers, and a serialized body `{ "input": input }`, then wraps it in `ResponsesRequest`.
+**Data flow**: It receives an input JSON value, wraps it in a request body shaped like `{ input: ... }`, creates a dummy POST request to `/v1/responses`, and returns it as `ResponsesRequest`.
 
-**Call relations**: This helper is only used by the local unit tests in this file.
+**Call relations**: The local unit test calls this to feed controlled inputs into output-normalization methods.
 
 *Call graph*: 3 external calls (new, json!, to_vec).
 
@@ -2495,11 +2507,11 @@ fn request_with_input(input: Value) -> ResponsesRequest
 fn call_output_content_and_success_returns_only_single_text_content_item()
 ```
 
-**Purpose**: Verifies that output normalization returns text only for supported single-text-item shapes and not for mixed or non-text arrays.
+**Purpose**: Verifies that output normalization only accepts a single text content item as plain text. It protects against accidentally treating mixed media output as text.
 
-**Data flow**: It constructs synthetic requests with `request_with_input`, calls the typed content-and-success helpers, and asserts the returned tuples match expected `Some`/`None` combinations.
+**Data flow**: It builds fake requests with single-text outputs and mixed/image outputs, calls the function and custom-tool normalizers, and asserts the expected results.
 
-**Call relations**: This unit test exercises `ResponsesRequest::call_output_content_and_success` behavior for both function and custom tool outputs.
+**Call relations**: This test directly covers the behavior of `call_output_content_and_success` and `output_value_to_text` through the public request helpers.
 
 *Call graph*: 3 external calls (assert_eq!, request_with_input, json!).
 
@@ -2510,11 +2522,11 @@ fn call_output_content_and_success_returns_only_single_text_content_item()
 fn body_json(&self) -> Value
 ```
 
-**Purpose**: Returns the recorded websocket request payload as owned JSON.
+**Purpose**: Returns the JSON body of a captured WebSocket message. Realtime tests use it to inspect what the client sent over the socket.
 
-**Data flow**: It clones the stored `body: Value` and returns it.
+**Data flow**: It clones the stored JSON value and returns it to the caller.
 
-**Call relations**: Tests use this accessor after `WebSocketTestServer` records inbound websocket messages.
+**Call relations**: WebSocket assertion helpers call this after retrieving messages from `WebSocketTestServer`.
 
 *Call graph*: called by 2 (websocket_request_instructions, websocket_request_text); 1 external calls (clone).
 
@@ -2525,11 +2537,11 @@ fn body_json(&self) -> Value
 fn uri(&self) -> &str
 ```
 
-**Purpose**: Returns the URI observed during a websocket handshake.
+**Purpose**: Returns the URI used during the WebSocket handshake. Tests use it to verify that the client connected to the expected path or query.
 
-**Data flow**: It returns `&self.uri`.
+**Data flow**: It borrows the stored URI string and returns it as text.
 
-**Call relations**: Handshake assertions use this to inspect the requested websocket path and query.
+**Call relations**: Handshake inspection code calls this after the fake WebSocket server records a connection attempt.
 
 
 ##### `WebSocketHandshake::header`  (lines 434–439)
@@ -2538,11 +2550,11 @@ fn uri(&self) -> &str
 fn header(&self, name: &str) -> Option<String>
 ```
 
-**Purpose**: Looks up a handshake header value case-insensitively.
+**Purpose**: Looks up one header from the WebSocket handshake, ignoring letter case. This helps tests verify authentication or feature headers.
 
-**Data flow**: It scans the stored `(String, String)` header pairs, compares names with `eq_ignore_ascii_case`, clones the matching value, and returns `Option<String>`.
+**Data flow**: It receives a header name, searches the saved header list case-insensitively, and returns the matching value as a string if found.
 
-**Call relations**: Tests use this to verify websocket handshake headers such as auth or attestation metadata.
+**Call relations**: Tests that inspect WebSocket setup use this after `WebSocketTestServer` records handshakes.
 
 
 ##### `WebSocketTestServer::uri`  (lines 468–470)
@@ -2551,11 +2563,11 @@ fn header(&self, name: &str) -> Option<String>
 fn uri(&self) -> &str
 ```
 
-**Purpose**: Returns the websocket server base URI.
+**Purpose**: Returns the address clients should connect to for the fake WebSocket server.
 
-**Data flow**: It returns `&self.uri`.
+**Data flow**: It borrows the stored `ws://...` URI and returns it as text.
 
-**Call relations**: Harness builders call this to point Codex at the test websocket server.
+**Call relations**: Test builders use this URI when configuring the client to talk to the local fake realtime server.
 
 *Call graph*: called by 1 (remote_realtime_test_codex_builder).
 
@@ -2566,11 +2578,11 @@ fn uri(&self) -> &str
 fn connections(&self) -> Vec<Vec<WebSocketRequest>>
 ```
 
-**Purpose**: Returns a cloned log of all recorded websocket requests grouped by connection.
+**Purpose**: Returns all recorded WebSocket connections and their received messages. Tests use it to inspect multi-connection behavior.
 
-**Data flow**: It locks `self.connections`, clones the nested `Vec<Vec<WebSocketRequest>>`, and returns it.
+**Data flow**: It locks the connection log, clones the list of per-connection request lists, and returns the snapshot.
 
-**Call relations**: Tests use this for bulk inspection of websocket traffic after a scenario completes.
+**Call relations**: Polling helpers call this while waiting for a matching WebSocket request to arrive.
 
 *Call graph*: called by 1 (wait_for_matching_websocket_request).
 
@@ -2581,11 +2593,11 @@ fn connections(&self) -> Vec<Vec<WebSocketRequest>>
 fn single_connection(&self) -> Vec<WebSocketRequest>
 ```
 
-**Purpose**: Returns the only recorded websocket connection log, panicking unless exactly one connection was observed.
+**Purpose**: Returns the only recorded WebSocket connection, failing if the test saw a different number. This is for tests expecting exactly one connection.
 
-**Data flow**: It locks `self.connections`, checks the length, clones the first connection log or returns an empty default if absent, and panics on any count other than one.
+**Data flow**: It reads the connection log, checks that there is exactly one entry, and returns that connection’s messages. If the count differs, it panics.
 
-**Call relations**: This is a convenience assertion helper for single-connection websocket tests.
+**Call relations**: Realtime tests can call this after a scenario ends to inspect the one expected connection without extra bookkeeping.
 
 *Call graph*: 1 external calls (panic!).
 
@@ -2600,11 +2612,11 @@ async fn wait_for_request(
     ) -> WebSocketRequest
 ```
 
-**Purpose**: Asynchronously waits until a specific request index exists within a specific connection log and returns that recorded request.
+**Purpose**: Waits until a specific WebSocket request has been recorded. This avoids race conditions where the test checks the log before the background server receives the message.
 
-**Data flow**: It takes `connection_index` and `request_index`, repeatedly locks `self.connections` to look up the requested entry, returns a clone when found, and otherwise awaits `self.request_log_updated.notified()` before retrying.
+**Data flow**: It receives a connection index and request index, repeatedly checks the log, and waits on a notification when the request is not yet present. Once found, it returns a cloned request.
 
-**Call relations**: Tests that need to synchronize on background websocket traffic use this instead of polling manually.
+**Call relations**: WebSocket request assertion helpers call this while the fake server task is receiving messages in the background.
 
 *Call graph*: called by 2 (sideband_outbound_request, wait_for_websocket_request).
 
@@ -2615,11 +2627,11 @@ async fn wait_for_request(
 fn handshakes(&self) -> Vec<WebSocketHandshake>
 ```
 
-**Purpose**: Returns a cloned log of all observed websocket handshakes.
+**Purpose**: Returns all recorded WebSocket handshake attempts. Tests use it to inspect connection metadata.
 
-**Data flow**: It locks `self.handshakes`, clones the `Vec<WebSocketHandshake>`, and returns it.
+**Data flow**: It locks the handshake log, clones the saved handshakes, and returns them.
 
-**Call relations**: This accessor supports assertions on handshake count and metadata.
+**Call relations**: Handshake assertions call this after starting or waiting for realtime client activity.
 
 
 ##### `WebSocketTestServer::wait_for_handshakes`  (lines 512–530)
@@ -2628,11 +2640,11 @@ fn handshakes(&self) -> Vec<WebSocketHandshake>
 async fn wait_for_handshakes(&self, expected: usize, timeout: Duration) -> bool
 ```
 
-**Purpose**: Polls until at least a target number of websocket handshakes have been recorded or a timeout expires.
+**Purpose**: Waits until a minimum number of WebSocket handshakes have been observed, or until a timeout expires. This makes asynchronous connection tests deterministic.
 
-**Data flow**: It takes an expected count and timeout, checks the current handshake count, then loops sleeping in 10 ms increments until either the count threshold is reached or the deadline passes, returning `true` on success and `false` on timeout.
+**Data flow**: It receives an expected count and timeout, checks the handshake log, sleeps in short intervals, and returns true if enough handshakes appear before the deadline.
 
-**Call relations**: Tests use this to deterministically wait for background websocket connection attempts without busy-spinning.
+**Call relations**: Realtime tests use this when connection setup happens in a background task and needs a bounded wait instead of a blind sleep.
 
 *Call graph*: 4 external calls (from_millis, min, now, sleep).
 
@@ -2643,11 +2655,11 @@ async fn wait_for_handshakes(&self, expected: usize, timeout: Duration) -> bool
 fn single_handshake(&self) -> WebSocketHandshake
 ```
 
-**Purpose**: Returns the only recorded websocket handshake, panicking unless exactly one handshake was observed.
+**Purpose**: Returns the only recorded WebSocket handshake, failing if there was not exactly one. It is the handshake counterpart to `single_connection`.
 
-**Data flow**: It locks `self.handshakes`, checks the length, clones the first handshake, and panics if the count is not one.
+**Data flow**: It reads the handshake log, checks the count, clones the first handshake when exactly one exists, and panics otherwise.
 
-**Call relations**: This is the handshake analogue of `single_connection` for simple one-connection tests.
+**Call relations**: Tests call this after a simple one-connection scenario to inspect URI and headers.
 
 *Call graph*: 1 external calls (panic!).
 
@@ -2658,11 +2670,11 @@ fn single_handshake(&self) -> WebSocketHandshake
 async fn shutdown(self)
 ```
 
-**Purpose**: Signals the websocket server task to stop and waits for it to finish, aborting if it does not exit within ten seconds.
+**Purpose**: Stops the fake WebSocket server task cleanly. If it does not stop quickly, it aborts the task so the test cannot hang forever.
 
-**Data flow**: It consumes `self`, sends on the `shutdown` oneshot, then awaits the server task under a ten-second timeout. On timeout it aborts the task and awaits its termination.
+**Data flow**: It sends a shutdown signal, waits up to ten seconds for the background task to finish, and aborts it if the timeout is reached.
 
-**Call relations**: Tests call this during teardown to ensure the background websocket server does not outlive the scenario.
+**Call relations**: Test teardown paths call this to clean up a running realtime mock server.
 
 *Call graph*: called by 1 (shutdown); 3 external calls (from_secs, send, timeout).
 
@@ -2673,11 +2685,11 @@ async fn shutdown(self)
 fn new() -> Self
 ```
 
-**Purpose**: Creates an empty request-capturing mock for `/models` requests.
+**Purpose**: Creates an empty recorder for `/models` requests. Tests use it to verify model-catalog fetches.
 
-**Data flow**: It allocates a new `Vec<wiremock::Request>` inside `Arc<Mutex<_>>` and returns a `ModelsMock`.
+**Data flow**: It creates a shared, mutex-protected list of raw Wiremock requests and returns a `ModelsMock` pointing at that list.
 
-**Call relations**: This constructor is used by `models_mock` when mounting `/models` responders.
+**Call relations**: The `models_mock` builder creates this before mounting fake `/models` endpoints.
 
 *Call graph*: called by 1 (models_mock); 3 external calls (new, new, new).
 
@@ -2688,11 +2700,11 @@ fn new() -> Self
 fn requests(&self) -> Vec<wiremock::Request>
 ```
 
-**Purpose**: Returns a cloned snapshot of all captured `/models` requests.
+**Purpose**: Returns all captured `/models` requests. This lets tests inspect how often and how the client queried the model catalog.
 
-**Data flow**: It locks the internal mutex, clones the request vector, and returns it.
+**Data flow**: It locks the shared list, clones the saved requests, and returns the snapshot.
 
-**Call relations**: Tests use this to inspect model-catalog fetch behavior.
+**Call relations**: Tests can call this directly after a fake `/models` endpoint has been exercised.
 
 
 ##### `ModelsMock::single_request_path`  (lines 568–574)
@@ -2701,11 +2713,11 @@ fn requests(&self) -> Vec<wiremock::Request>
 fn single_request_path(&self) -> String
 ```
 
-**Purpose**: Returns the path of the only captured `/models` request, panicking unless exactly one request was recorded.
+**Purpose**: Returns the path of the only captured `/models` request, failing if the count is not exactly one.
 
-**Data flow**: It locks the request vector, checks that its length is one, reads the first request's URL path, converts it to `String`, and returns it.
+**Data flow**: It reads the request list, checks that it contains one request, and returns that request’s URL path as a string.
 
-**Call relations**: This is a convenience assertion helper for tests expecting a single models fetch.
+**Call relations**: Model-catalog tests use this when they expect one fetch and want to confirm the endpoint path.
 
 *Call graph*: 1 external calls (panic!).
 
@@ -2716,11 +2728,11 @@ fn single_request_path(&self) -> String
 fn matches(&self, request: &wiremock::Request) -> bool
 ```
 
-**Purpose**: Implements `wiremock::Match` by recording every incoming `/models` request and always matching it.
+**Purpose**: Records every request that matches the `/models` mock and always allows the mock to match. This is how Wiremock captures model-catalog calls.
 
-**Data flow**: It takes a `&wiremock::Request`, clones it into the internal request log, and returns `true`.
+**Data flow**: Wiremock passes in a request, the function clones and stores it, then returns true so the configured response can be served.
 
-**Call relations**: Wiremock invokes this matcher during request handling so mounted `/models` mocks both capture and accept requests.
+**Call relations**: Wiremock invokes this automatically for `/models` mocks built by `models_mock`.
 
 *Call graph*: 1 external calls (clone).
 
@@ -2731,11 +2743,11 @@ fn matches(&self, request: &wiremock::Request) -> bool
 fn matches(&self, request: &wiremock::Request) -> bool
 ```
 
-**Purpose**: Implements `wiremock::Match` by recording every incoming `/responses` request, validating request-body invariants, and always matching it.
+**Purpose**: Records every matching `/responses` request and checks its tool-call history for consistency. It both captures the request and acts as a guardrail.
 
-**Data flow**: It takes a `&wiremock::Request`, clones and wraps it as `ResponsesRequest` into the internal log, calls `validate_request_body_invariants(request)`, and returns `true`.
+**Data flow**: Wiremock passes in a request, the function clones it into a `ResponsesRequest`, saves it, validates the body invariants, and returns true so the fake response is served.
 
-**Call relations**: Wiremock invokes this matcher for mounted `/responses` mocks; it is the enforcement point that turns malformed tool-call request bodies into immediate test failures.
+**Call relations**: Wiremock invokes this for mocks built by `base_mock` and `compact_mock`; it hands each captured request to `validate_request_body_invariants`.
 
 *Call graph*: calls 1 internal fn (validate_request_body_invariants); 1 external calls (clone).
 
@@ -2746,11 +2758,11 @@ fn matches(&self, request: &wiremock::Request) -> bool
 fn sse(events: Vec<Value>) -> String
 ```
 
-**Purpose**: Serializes a sequence of JSON event objects into an SSE stream body.
+**Purpose**: Builds a Server-Sent Events response body from JSON event objects. SSE is a text stream where each event has an `event:` line and optional `data:` JSON.
 
-**Data flow**: It takes `Vec<Value>`, iterates each event, writes `event: <type>` lines, writes `data: <json>` plus a blank line when the event has fields beyond `type`, or just a blank line for type-only events, and returns the accumulated `String`.
+**Data flow**: It receives a list of JSON events, reads each event’s `type`, writes the SSE event name, writes the JSON data when the object has more than just `type`, and returns the combined text body.
 
-**Call relations**: Most mock-response builders use this serializer to turn event constructors into `text/event-stream` payloads.
+**Call relations**: Nearly all event-response helpers and many tests use this to turn realistic JSON events into a stream response body.
 
 *Call graph*: called by 455 (create_mock_responses_server_repeating_assistant, create_apply_patch_sse_response, create_exec_command_sse_response, create_final_assistant_message_sse_response, create_request_permissions_sse_response, create_request_user_input_sse_response, create_shell_command_sse_response, external_auth_refreshes_on_unauthorized, review_start_sends_parent_lineage_in_turn_metadata_for_thread_fork_v2, turn_start_forwards_client_metadata_to_responses_request_v2 (+15 more)); 3 external calls (new, write!, writeln!).
 
@@ -2761,11 +2773,11 @@ fn sse(events: Vec<Value>) -> String
 fn sse_completed(id: &str) -> String
 ```
 
-**Purpose**: Builds a minimal SSE stream containing `response.created` followed by `response.completed` for a given response ID.
+**Purpose**: Creates a minimal successful SSE stream: response created, then response completed. Tests use it when the content of the response is not important.
 
-**Data flow**: It takes an ID, constructs the two event values with `ev_response_created` and `ev_completed`, passes them to `sse`, and returns the stream string.
+**Data flow**: It receives a response id, builds created and completed event JSON objects, passes them to `sse`, and returns the stream text.
 
-**Call relations**: Tests use this convenience helper for simple successful-turn responses.
+**Call relations**: Simple request-shape tests call this to give the client a valid, finished response.
 
 *Call graph*: calls 1 internal fn (sse); called by 12 (default_service_tier_override_is_omitted_from_http_turn, flex_service_tier_is_applied_to_http_turn, null_service_tier_override_is_omitted_from_http_turn_with_catalog_default, unsupported_service_tier_is_omitted_from_http_turn, config_personality_none_sends_no_personality, config_personality_some_sets_instructions_template, default_personality_is_pragmatic_without_config_toml, remote_model_friendly_personality_instructions_with_feature, user_turn_personality_none_does_not_add_update_message, openai_model_header_casing_only_mismatch_does_not_warn (+2 more)); 1 external calls (vec!).
 
@@ -2776,11 +2788,11 @@ fn sse_completed(id: &str) -> String
 fn ev_completed(id: &str) -> Value
 ```
 
-**Purpose**: Constructs a `response.completed` event with zeroed usage counters for a given response ID.
+**Purpose**: Builds a JSON event meaning the response finished successfully with zero token usage. It is a reusable piece for fake streams.
 
-**Data flow**: It takes an ID and returns a JSON `Value` containing the event type and nested response usage fields.
+**Data flow**: It receives a response id and returns a JSON object with type `response.completed`, response id, and zeroed usage fields.
 
-**Call relations**: This event constructor is used directly in SSE sequences and by higher-level convenience wrappers.
+**Call relations**: SSE builders and tests combine this with other event helpers to script successful turns.
 
 *Call graph*: called by 3 (plan_mode_streaming_citations_are_stripped_across_added_deltas_and_done, plan_mode_streaming_proposed_plan_tag_split_across_added_and_delta_is_parsed, unified_exec_prunes_exited_sessions_first); 1 external calls (json!).
 
@@ -2791,11 +2803,11 @@ fn ev_completed(id: &str) -> Value
 fn ev_response_created(id: &str) -> Value
 ```
 
-**Purpose**: Constructs a `response.created` event for a given response ID.
+**Purpose**: Builds a JSON event meaning the service created a response. This starts many fake response streams.
 
-**Data flow**: It takes an ID and returns the corresponding JSON `Value`.
+**Data flow**: It receives a response id and returns a `response.created` JSON object containing that id.
 
-**Call relations**: This is commonly paired with completion or tool-call events in SSE streams.
+**Call relations**: Higher-level stream helpers include this before completion or output events.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2806,11 +2818,11 @@ fn ev_response_created(id: &str) -> Value
 fn ev_model_verification_metadata(id: &str, verifications: Vec<&str>) -> Value
 ```
 
-**Purpose**: Constructs a `response.metadata` event carrying model-verification recommendation strings.
+**Purpose**: Builds a metadata event carrying model verification recommendations. Tests use it to simulate backend guidance or warnings.
 
-**Data flow**: It takes a response ID and a vector of verification strings, embeds them under `metadata.openai_verification_recommendation`, and returns the JSON event.
+**Data flow**: It receives a response id and a list of verification strings, then returns a `response.metadata` JSON object containing those values.
 
-**Call relations**: Tests use this to simulate verification metadata emitted by the remote service.
+**Call relations**: Tests can place this event in an SSE stream to check how the client surfaces model verification metadata.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2821,11 +2833,11 @@ fn ev_model_verification_metadata(id: &str, verifications: Vec<&str>) -> Value
 fn ev_completed_with_tokens(id: &str, total_tokens: i64) -> Value
 ```
 
-**Purpose**: Constructs a `response.completed` event whose usage totals are set to a caller-specified token count.
+**Purpose**: Builds a completion event with a chosen token count. Tokens are chunks of text counted for model context and billing-like limits.
 
-**Data flow**: It takes an ID and `total_tokens`, fills both `input_tokens` and `total_tokens` with that value, and returns the JSON event.
+**Data flow**: It receives a response id and total token count, then returns a `response.completed` event whose input and total usage fields equal that count.
 
-**Call relations**: Token-budget and compaction tests use this to simulate responses with nonzero usage.
+**Call relations**: Compaction and context-window tests use this to simulate responses that report specific usage.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2836,11 +2848,11 @@ fn ev_completed_with_tokens(id: &str, total_tokens: i64) -> Value
 fn ev_assistant_message(id: &str, text: &str) -> Value
 ```
 
-**Purpose**: Constructs a completed assistant message output item containing one `output_text` span.
+**Purpose**: Builds an event for a finished assistant message containing text. This simulates the model producing a final message item.
 
-**Data flow**: It takes an item ID and text, embeds them in a `response.output_item.done` event with `type: message` and `role: assistant`, and returns the JSON value.
+**Data flow**: It receives an item id and text, then returns a `response.output_item.done` JSON object with a message item and `output_text` content.
 
-**Call relations**: This is a common building block for successful assistant-output SSE streams.
+**Call relations**: Tests combine this with stream helpers to make the fake model answer in natural language.
 
 *Call graph*: called by 2 (plan_mode_streaming_citations_are_stripped_across_added_deltas_and_done, plan_mode_streaming_proposed_plan_tag_split_across_added_and_delta_is_parsed); 1 external calls (json!).
 
@@ -2851,11 +2863,11 @@ fn ev_assistant_message(id: &str, text: &str) -> Value
 fn user_message_item(text: &str) -> ResponseItem
 ```
 
-**Purpose**: Builds a `codex_protocol::models::ResponseItem::Message` representing a user input text item.
+**Purpose**: Creates a protocol-level user message item from plain text. Unlike most helpers here, it returns the project’s typed `ResponseItem` model, not raw JSON.
 
-**Data flow**: It takes text, constructs a `ResponseItem::Message` with `role = "user"`, one `ContentItem::InputText`, and `None` for optional metadata fields, and returns it.
+**Data flow**: It receives text, wraps it as an input text content item with role `user`, leaves optional fields empty, and returns the typed response item.
 
-**Call relations**: Tests use this typed helper when constructing protocol-model values rather than raw JSON.
+**Call relations**: Tests that need typed protocol objects rather than wire JSON use this helper.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -2866,11 +2878,11 @@ fn user_message_item(text: &str) -> ResponseItem
 fn ev_message_item_added(id: &str, text: &str) -> Value
 ```
 
-**Purpose**: Constructs an incremental `response.output_item.added` assistant message event.
+**Purpose**: Builds an event saying an assistant message item was added to the response stream. This represents the start or announcement of an output item.
 
-**Data flow**: It takes an item ID and text and returns the corresponding JSON event with one `output_text` content span.
+**Data flow**: It receives an item id and text, then returns a `response.output_item.added` JSON object for an assistant message with output text content.
 
-**Call relations**: Streaming tests use this to simulate partial item addition before later deltas or completion.
+**Call relations**: Streaming tests use this with delta events and done events to mimic incremental model output.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2881,11 +2893,11 @@ fn ev_message_item_added(id: &str, text: &str) -> Value
 fn ev_output_text_delta(delta: &str) -> Value
 ```
 
-**Purpose**: Constructs a `response.output_text.delta` event carrying a text fragment.
+**Purpose**: Builds a text-delta event, meaning the model streamed another piece of output text.
 
-**Data flow**: It takes a delta string and returns the JSON event.
+**Data flow**: It receives a text fragment and returns a `response.output_text.delta` JSON object containing that fragment.
 
-**Call relations**: Streaming text tests combine this with added/done events to simulate incremental output.
+**Call relations**: Streaming-output tests place this between item-added and completion events to verify incremental rendering.
 
 *Call graph*: called by 2 (plan_mode_streaming_citations_are_stripped_across_added_deltas_and_done, plan_mode_streaming_proposed_plan_tag_split_across_added_and_delta_is_parsed); 1 external calls (json!).
 
@@ -2896,11 +2908,11 @@ fn ev_output_text_delta(delta: &str) -> Value
 fn ev_reasoning_item(id: &str, summary: &[&str], raw_content: &[&str]) -> Value
 ```
 
-**Purpose**: Constructs a completed reasoning output item with summary entries, encrypted content, and optional raw reasoning content entries.
+**Purpose**: Builds a completed reasoning item, including summary text and optionally raw reasoning text. It also includes encoded `encrypted_content` to resemble real backend payloads.
 
-**Data flow**: It takes an item ID, summary strings, and raw-content strings; converts summaries into `summary_text` entries; concatenates raw content, prefixes 550 `b` characters as overhead, base64-encodes the result into `encrypted_content`, optionally adds explicit `reasoning_text` content entries when raw content is non-empty, and returns the JSON event.
+**Data flow**: It receives an id, summary strings, and raw content strings. It turns summaries into JSON entries, base64-encodes padded raw content, optionally adds raw reasoning content entries, and returns the event JSON.
 
-**Call relations**: Reasoning-related tests use this to simulate the richer reasoning item shape emitted by the Responses API.
+**Call relations**: Reasoning and compaction tests use this to simulate model reasoning items in the response stream.
 
 *Call graph*: called by 2 (multiple_auto_compact_per_task_runs_after_token_limit_hit, reasoning_item_is_emitted); 2 external calls (Array, json!).
 
@@ -2911,11 +2923,11 @@ fn ev_reasoning_item(id: &str, summary: &[&str], raw_content: &[&str]) -> Value
 fn ev_reasoning_item_added(id: &str, summary: &[&str]) -> Value
 ```
 
-**Purpose**: Constructs an incremental reasoning item-added event containing summary entries only.
+**Purpose**: Builds an event saying a reasoning item was added. This supports tests for streaming reasoning output before it is complete.
 
-**Data flow**: It takes an item ID and summary strings, maps them to `summary_text` entries, and returns a `response.output_item.added` JSON event.
+**Data flow**: It receives an id and summary strings, converts each summary into a JSON summary entry, and returns a `response.output_item.added` event.
 
-**Call relations**: Streaming reasoning tests use this before summary or content deltas.
+**Call relations**: Streaming reasoning tests can combine it with reasoning delta helpers.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2926,11 +2938,11 @@ fn ev_reasoning_item_added(id: &str, summary: &[&str]) -> Value
 fn ev_reasoning_summary_text_delta(delta: &str) -> Value
 ```
 
-**Purpose**: Constructs a reasoning-summary delta event for summary index 0.
+**Purpose**: Builds a delta event for reasoning summary text. This simulates the model streaming a piece of its reasoning summary.
 
-**Data flow**: It takes a delta string and returns the JSON event with `summary_index: 0`.
+**Data flow**: It receives a text fragment and returns a JSON event with that fragment and summary index zero.
 
-**Call relations**: This helper supports incremental reasoning-summary streaming scenarios.
+**Call relations**: Realtime or streaming tests use it when checking incremental reasoning summary handling.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2941,11 +2953,11 @@ fn ev_reasoning_summary_text_delta(delta: &str) -> Value
 fn ev_reasoning_text_delta(delta: &str) -> Value
 ```
 
-**Purpose**: Constructs a reasoning-content delta event for content index 0.
+**Purpose**: Builds a delta event for raw reasoning text. This simulates incremental reasoning content.
 
-**Data flow**: It takes a delta string and returns the JSON event with `content_index: 0`.
+**Data flow**: It receives a text fragment and returns a JSON event with that fragment and content index zero.
 
-**Call relations**: This helper supports incremental raw reasoning-content streaming scenarios.
+**Call relations**: Reasoning stream tests use it alongside reasoning item events.
 
 *Call graph*: 1 external calls (json!).
 
@@ -2956,11 +2968,11 @@ fn ev_reasoning_text_delta(delta: &str) -> Value
 fn ev_web_search_call_added_partial(id: &str, status: &str) -> Value
 ```
 
-**Purpose**: Constructs an incremental web-search call item with partial status.
+**Purpose**: Builds an event for a web search call that has been added but is not fully described yet. This supports tests of partial tool status updates.
 
-**Data flow**: It takes an item ID and status string and returns a `response.output_item.added` JSON event for `type: web_search_call`.
+**Data flow**: It receives an id and status, then returns a `response.output_item.added` event with a `web_search_call` item.
 
-**Call relations**: Web-search tests use this to simulate partial tool-call lifecycle updates.
+**Call relations**: Web-search item tests pair this with the completed web-search helper.
 
 *Call graph*: called by 1 (web_search_item_is_emitted); 1 external calls (json!).
 
@@ -2971,11 +2983,11 @@ fn ev_web_search_call_added_partial(id: &str, status: &str) -> Value
 fn ev_web_search_call_done(id: &str, status: &str, query: &str) -> Value
 ```
 
-**Purpose**: Constructs a completed web-search call item including the search query.
+**Purpose**: Builds a completed web search call event with the search query included.
 
-**Data flow**: It takes an item ID, status, and query string and returns a `response.output_item.done` JSON event with an `action` object of type `search`.
+**Data flow**: It receives an id, status, and query, then returns a `response.output_item.done` event with a search action containing the query.
 
-**Call relations**: This is the completed counterpart to `ev_web_search_call_added_partial`.
+**Call relations**: Web-search tests use this to simulate the final form of a search tool call.
 
 *Call graph*: called by 1 (web_search_item_is_emitted); 1 external calls (json!).
 
@@ -2991,11 +3003,11 @@ fn ev_image_generation_call(
 ) -> Value
 ```
 
-**Purpose**: Constructs a completed image-generation call item with revised prompt and result payload.
+**Purpose**: Builds an image generation call event. It simulates a model tool call that produced an image result.
 
-**Data flow**: It takes an item ID, status, revised prompt, and result string and returns the corresponding JSON event.
+**Data flow**: It receives an id, status, revised prompt, and result string, then returns a completed `image_generation_call` event.
 
-**Call relations**: Image-generation tests use this to simulate remote tool output.
+**Call relations**: Image-generation tests can include this event in fake response streams.
 
 *Call graph*: 1 external calls (json!).
 
@@ -3006,11 +3018,11 @@ fn ev_image_generation_call(
 fn ev_function_call(call_id: &str, name: &str, arguments: &str) -> Value
 ```
 
-**Purpose**: Constructs a completed function-call output item with call ID, function name, and serialized arguments.
+**Purpose**: Builds a completed function-call event. Function calls are model requests for the client to run a named tool with JSON arguments.
 
-**Data flow**: It takes `call_id`, `name`, and `arguments` strings and returns a `response.output_item.done` JSON event for `type: function_call`.
+**Data flow**: It receives a call id, tool name, and argument string, then returns a `response.output_item.done` event with a `function_call` item.
 
-**Call relations**: Many higher-level helpers and tests use this as the canonical function-call event constructor.
+**Call relations**: Shell-command helpers, agent-response helpers, and many tests use this as the base tool-call event.
 
 *Call graph*: called by 18 (ev_apply_patch_shell_command_call_via_heredoc, ev_shell_command_call_with_args, exec_command_event, shell_event_with_prefix_rule, ev_shell_command_call, tool_call, shell_command_call, exec_command_event, exec_command_event_with_missing_additional_permissions, exec_command_event_with_request_permissions (+8 more)); 1 external calls (json!).
 
@@ -3026,11 +3038,11 @@ fn ev_function_call_with_namespace(
 ) -> Value
 ```
 
-**Purpose**: Constructs a completed namespaced function-call item.
+**Purpose**: Builds a function-call event that also names a namespace. This represents a tool call inside a grouped tool collection.
 
-**Data flow**: It takes `call_id`, namespace, name, and arguments strings and returns the corresponding JSON event including the `namespace` field.
+**Data flow**: It receives a call id, namespace, tool name, and argument string, then returns a completed function-call JSON event with all those fields.
 
-**Call relations**: Tests use this when simulating function calls emitted from namespace tools.
+**Call relations**: Namespace-related tool tests use this when the client must distinguish similarly named tools in different groups.
 
 *Call graph*: 1 external calls (json!).
 
@@ -3041,11 +3053,11 @@ fn ev_function_call_with_namespace(
 fn ev_tool_search_call(call_id: &str, arguments: &serde_json::Value) -> Value
 ```
 
-**Purpose**: Constructs a completed client-executed tool-search call item.
+**Purpose**: Builds a tool-search call event. This asks the client to perform or respond to a search over available tools.
 
-**Data flow**: It takes `call_id` and a JSON arguments value, embeds them with `execution: "client"`, and returns the JSON event.
+**Data flow**: It receives a call id and arguments JSON, then returns a completed `tool_search_call` event marked for client execution.
 
-**Call relations**: Tool-search tests use this to simulate model-emitted search calls.
+**Call relations**: Tool-search tests place this in fake streams, then inspect the client’s matching `tool_search_output` request.
 
 *Call graph*: 1 external calls (json!).
 
@@ -3056,11 +3068,11 @@ fn ev_tool_search_call(call_id: &str, arguments: &serde_json::Value) -> Value
 fn ev_custom_tool_call(call_id: &str, name: &str, input: &str) -> Value
 ```
 
-**Purpose**: Constructs a completed custom-tool call item with textual input.
+**Purpose**: Builds a custom tool-call event. Custom tools carry raw input rather than the normal function-call arguments string.
 
-**Data flow**: It takes `call_id`, tool name, and input string and returns the corresponding JSON event.
+**Data flow**: It receives a call id, tool name, and input string, then returns a completed `custom_tool_call` event.
 
-**Call relations**: Custom-tool tests use this to simulate direct custom tool invocation.
+**Call relations**: Custom-tool tests use this to trigger client behavior and later verify custom tool outputs.
 
 *Call graph*: 1 external calls (json!).
 
@@ -3071,11 +3083,11 @@ fn ev_custom_tool_call(call_id: &str, name: &str, input: &str) -> Value
 fn ev_local_shell_call(call_id: &str, status: &str, command: Vec<&str>) -> Value
 ```
 
-**Purpose**: Constructs a completed local-shell call item with exec command vector and status.
+**Purpose**: Builds a local shell call event with a command array. This simulates the model asking for a shell action represented in the newer local-shell format.
 
-**Data flow**: It takes `call_id`, status, and command argv as `Vec<&str>`, embeds them under `action.type = "exec"`, and returns the JSON event.
+**Data flow**: It receives a call id, status, and command parts, then returns a completed `local_shell_call` event with an exec action.
 
-**Call relations**: Shell-execution tests use this to simulate local shell tool calls.
+**Call relations**: Shell-related tests can use it when validating local shell call handling and matching outputs.
 
 *Call graph*: 1 external calls (json!).
 
@@ -3086,11 +3098,11 @@ fn ev_local_shell_call(call_id: &str, status: &str, command: Vec<&str>) -> Value
 fn ev_apply_patch_custom_tool_call(call_id: &str, patch: &str) -> Value
 ```
 
-**Purpose**: Constructs a custom-tool call event specifically for `apply_patch` with raw patch text as input.
+**Purpose**: Builds a custom tool-call event for `apply_patch`, carrying raw patch text. This mirrors the service shape when the model directly invokes patch application.
 
-**Data flow**: It takes `call_id` and patch text and returns a `custom_tool_call` JSON event with `name: "apply_patch"`.
+**Data flow**: It receives a call id and patch text, then returns a completed `custom_tool_call` event named `apply_patch` with the patch as input.
 
-**Call relations**: Compatibility tests use this helper to mirror the Responses API shape for direct `apply_patch` invocation.
+**Call relations**: Patch tests use this to simulate model-driven file edits through the custom tool path.
 
 *Call graph*: called by 1 (prepare); 1 external calls (json!).
 
@@ -3101,11 +3113,11 @@ fn ev_apply_patch_custom_tool_call(call_id: &str, patch: &str) -> Value
 fn ev_shell_command_call(call_id: &str, command: &str) -> Value
 ```
 
-**Purpose**: Constructs a `shell_command` function-call event from a plain command string.
+**Purpose**: Builds a shell-command function call from a plain command string. It is a convenience wrapper for the common shell tool case.
 
-**Data flow**: It wraps the command in a JSON object `{ "command": command }`, then delegates to `ev_shell_command_call_with_args` and returns the resulting event.
+**Data flow**: It receives a call id and command, wraps the command in JSON arguments, and hands those arguments to `ev_shell_command_call_with_args`.
 
-**Call relations**: This is the simple shell-command convenience wrapper used by tests that do not need custom argument objects.
+**Call relations**: Shell tests call this when they do not need custom argument objects.
 
 *Call graph*: calls 1 internal fn (ev_shell_command_call_with_args); 1 external calls (json!).
 
@@ -3116,11 +3128,11 @@ fn ev_shell_command_call(call_id: &str, command: &str) -> Value
 fn ev_shell_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value
 ```
 
-**Purpose**: Constructs a `shell_command` function-call event from an arbitrary JSON arguments object.
+**Purpose**: Builds a shell-command function call from a supplied JSON arguments object.
 
-**Data flow**: It serializes the provided JSON args to a string and passes that string to `ev_function_call(call_id, "shell_command", ...)`, returning the resulting event.
+**Data flow**: It receives a call id and arguments JSON, serializes the arguments to a string, and creates a `shell_command` function-call event.
 
-**Call relations**: This helper underlies `ev_shell_command_call` and supports tests that need nontrivial shell-command argument payloads.
+**Call relations**: The plain command helper delegates here, and this helper delegates to the generic `ev_function_call` builder.
 
 *Call graph*: calls 1 internal fn (ev_function_call); called by 1 (ev_shell_command_call); 1 external calls (to_string).
 
@@ -3131,11 +3143,11 @@ fn ev_shell_command_call_with_args(call_id: &str, args: &serde_json::Value) -> V
 fn ev_apply_patch_shell_command_call_via_heredoc(call_id: &str, patch: &str) -> Value
 ```
 
-**Purpose**: Constructs a `shell_command` function-call event whose command runs `apply_patch` via a heredoc.
+**Purpose**: Builds a shell-command function call that runs `apply_patch` through a heredoc. A heredoc is a shell way to pass a block of text to a command.
 
-**Data flow**: It formats a heredoc command string containing the patch text, wraps it in `{ "command": ... }`, serializes that JSON, and returns `ev_function_call(call_id, "shell_command", arguments)`.
+**Data flow**: It receives a call id and patch text, formats a shell command containing the patch between `EOF` markers, serializes it as shell-command arguments, and returns a function-call event.
 
-**Call relations**: Compatibility tests use this to simulate alternate model output shapes for patch application.
+**Call relations**: Patch-through-shell tests use this to exercise the shell command path rather than the custom tool path.
 
 *Call graph*: calls 1 internal fn (ev_function_call); 2 external calls (json!, to_string).
 
@@ -3146,11 +3158,11 @@ fn ev_apply_patch_shell_command_call_via_heredoc(call_id: &str, patch: &str) -> 
 fn sse_failed(id: &str, code: &str, message: &str) -> String
 ```
 
-**Purpose**: Builds an SSE stream containing a single `response.failed` event with code and message.
+**Purpose**: Builds an SSE stream containing a failed response event. Tests use it to simulate backend errors.
 
-**Data flow**: It takes response ID, error code, and message, constructs the JSON event, passes it to `sse`, and returns the stream string.
+**Data flow**: It receives a response id, error code, and message, builds a `response.failed` JSON event, passes it to `sse`, and returns the stream body.
 
-**Call relations**: Failure-path tests use this convenience helper to simulate terminal remote errors.
+**Call relations**: Error-handling and retry tests mount this stream to check how the client reacts to failures.
 
 *Call graph*: calls 1 internal fn (sse); called by 5 (thread_read_reports_system_error_idle_flag_after_failed_turn, thread_unsubscribe_preserves_cached_status_before_idle_unload, context_window_error_sets_total_tokens_to_model_window, manual_compact_non_context_failure_retries_then_emits_task_error, manual_compact_retries_after_context_window_error); 1 external calls (vec!).
 
@@ -3161,11 +3173,11 @@ fn sse_failed(id: &str, code: &str, message: &str) -> String
 fn sse_response(body: String) -> ResponseTemplate
 ```
 
-**Purpose**: Wraps a raw SSE body string in a `wiremock::ResponseTemplate` with `text/event-stream` content type.
+**Purpose**: Wraps an SSE text body in an HTTP response template with the right content type. This makes Wiremock serve it like a real event stream.
 
-**Data flow**: It takes a body string, creates `ResponseTemplate::new(200)`, inserts the `content-type` header, sets the raw body, and returns the template.
+**Data flow**: It receives a string body, creates a 200 response, sets `content-type` to `text/event-stream`, attaches the raw body, and returns the template.
 
-**Call relations**: Mount helpers use this to turn serialized SSE strings into wiremock responses.
+**Call relations**: Mount helpers and custom responders call this when they need a ready-to-serve SSE response.
 
 *Call graph*: called by 29 (respond, create_mock_responses_server_repeating_assistant, turn_steer_updates_client_metadata_on_follow_up_responses_request_v2, start_ctrl_c_restart_fixture, respond, model_verification_emits_typed_notification_and_warning_v2, openai_model_header_mismatch_emits_model_rerouted_notification_v2, response_model_field_mismatch_emits_model_rerouted_notification_v2_when_header_matches_requested, turn_moderation_metadata_emits_typed_notification_v2, thread_resume_rejects_history_when_thread_is_running (+15 more)); 1 external calls (new).
 
@@ -3176,11 +3188,11 @@ fn sse_response(body: String) -> ResponseTemplate
 async fn mount_response_once(server: &MockServer, response: ResponseTemplate) -> ResponseMock
 ```
 
-**Purpose**: Mounts a one-shot `/responses` mock that captures the request and returns a caller-supplied response template.
+**Purpose**: Mounts one fake `/responses` POST response on a mock server and returns the request recorder.
 
-**Data flow**: It takes a `MockServer` and `ResponseTemplate`, builds `(mock, response_mock)` via `base_mock()`, configures the mock to respond once with the template, mounts it, and returns the `ResponseMock` capture handle.
+**Data flow**: It receives a server and response template, builds the base `/responses` mock, configures it to answer once, mounts it, and returns the `ResponseMock` that will record the request.
 
-**Call relations**: Tests use this when they need a single custom HTTP response body rather than an SSE convenience wrapper.
+**Call relations**: Many tests use this when they need one non-streaming or custom response from the fake Responses API.
 
 *Call graph*: calls 1 internal fn (base_mock); called by 16 (cyber_policy_response_emits_typed_error_notification_v2, model_verification_emits_typed_notification_and_warning_v2, openai_model_header_mismatch_emits_model_rerouted_notification_v2, response_model_field_mismatch_emits_model_rerouted_notification_v2_when_header_matches_requested, turn_moderation_metadata_emits_typed_notification_v2, thread_resume_rejects_history_when_thread_is_running, thread_resume_rejects_mismatched_path_for_running_thread_id, request_permissions_guardian_review_stops_when_cancelled, renews_cache_ttl_on_matching_models_etag, refresh_models_on_models_etag_mismatch_and_avoid_duplicate_models_fetch (+6 more)).
 
@@ -3195,11 +3207,11 @@ async fn mount_response_once_match(
 ) -> ResponseMock
 ```
 
-**Purpose**: Mounts a one-shot `/responses` mock gated by an additional matcher and returning a caller-supplied response template.
+**Purpose**: Mounts one fake `/responses` response with an extra request matcher. This lets tests only respond when the request satisfies a custom condition.
 
-**Data flow**: It takes a server, extra matcher, and response template, starts from `base_mock()`, chains `.and(matcher)`, mounts the one-shot responder, and returns the `ResponseMock` capture handle.
+**Data flow**: It receives a server, matcher, and response template, builds the base mock, adds the matcher, limits it to one use, mounts it, and returns the recorder.
 
-**Call relations**: This variant is used when tests need to constrain the mock to requests matching extra predicates.
+**Call relations**: Tests with more specific request expectations use this instead of the simpler one-response mount.
 
 *Call graph*: calls 1 internal fn (base_mock); called by 3 (plaintext_multi_agent_v2_completion_sends_agent_message, setup_turn_one_with_custom_spawned_child, replaces_invalid_local_image_after_bad_request).
 
@@ -3210,11 +3222,11 @@ async fn mount_response_once_match(
 fn base_mock() -> (MockBuilder, ResponseMock)
 ```
 
-**Purpose**: Builds the standard wiremock matcher chain for POST requests to `/responses` plus a fresh `ResponseMock` capture handle.
+**Purpose**: Creates the common Wiremock setup for POST requests ending in `/responses`. It also attaches a fresh request recorder.
 
-**Data flow**: It creates a new `ResponseMock`, constructs `Mock::given(method("POST")).and(path_regex(".*/responses$")).and(response_mock.clone())`, and returns `(MockBuilder, ResponseMock)`.
+**Data flow**: It creates a `ResponseMock`, builds a Wiremock matcher for POST plus a path regex, adds the recorder as another matcher, and returns both the builder and recorder.
 
-**Call relations**: All `/responses` mount helpers start from this shared builder so they consistently capture requests and enforce invariants.
+**Call relations**: All normal `/responses` mount helpers start here, so they share request capture and invariant validation.
 
 *Call graph*: calls 1 internal fn (new); called by 6 (mount_response_once, mount_response_once_match, mount_response_sequence, mount_sse_once, mount_sse_once_match, mount_sse_sequence); 3 external calls (given, method, path_regex).
 
@@ -3225,11 +3237,11 @@ fn base_mock() -> (MockBuilder, ResponseMock)
 fn compact_mock() -> (MockBuilder, ResponseMock)
 ```
 
-**Purpose**: Builds the standard wiremock matcher chain for POST requests to `/responses/compact` plus a fresh `ResponseMock` capture handle.
+**Purpose**: Creates the common Wiremock setup for POST requests ending in `/responses/compact`. This is the compaction endpoint used in history-shortening tests.
 
-**Data flow**: It creates a new `ResponseMock`, constructs a `MockBuilder` matching POST and path regex `.*/responses/compact$`, attaches the capture matcher, and returns both.
+**Data flow**: It creates a `ResponseMock`, builds a POST/path matcher for the compact endpoint, attaches the recorder, and returns the builder plus recorder.
 
-**Call relations**: All compact-response mount helpers use this shared builder.
+**Call relations**: Compaction-specific mount helpers call this before adding JSON responses or custom responders.
 
 *Call graph*: calls 1 internal fn (new); called by 3 (mount_compact_json_once_match, mount_compact_response_once, mount_compact_user_history_with_summary_sequence); 3 external calls (given, method, path_regex).
 
@@ -3240,11 +3252,11 @@ fn compact_mock() -> (MockBuilder, ResponseMock)
 fn models_mock() -> (MockBuilder, ModelsMock)
 ```
 
-**Purpose**: Builds the standard wiremock matcher chain for GET requests to `/models` plus a fresh `ModelsMock` capture handle.
+**Purpose**: Creates the common Wiremock setup for GET requests ending in `/models`. It records model-catalog requests.
 
-**Data flow**: It creates a new `ModelsMock`, constructs `Mock::given(method("GET")).and(path_regex(".*/models$")).and(models_mock.clone())`, and returns both.
+**Data flow**: It creates a `ModelsMock`, builds a GET/path matcher for `/models`, attaches the recorder, and returns both.
 
-**Call relations**: All `/models` mount helpers use this shared builder.
+**Call relations**: All model-catalog mount helpers call this before adding their response body, delay, or ETag header.
 
 *Call graph*: calls 1 internal fn (new); called by 3 (mount_models_once, mount_models_once_with_delay, mount_models_once_with_etag); 3 external calls (given, method, path_regex).
 
@@ -3255,11 +3267,11 @@ fn models_mock() -> (MockBuilder, ModelsMock)
 async fn mount_sse_once_match(server: &MockServer, matcher: M, body: String) -> ResponseMock
 ```
 
-**Purpose**: Mounts a one-shot `/responses` mock gated by an extra matcher and serving an SSE body string.
+**Purpose**: Mounts one SSE response for `/responses` with an extra matcher. It is for tests that need both stream behavior and request filtering.
 
-**Data flow**: It takes a server, matcher, and SSE body string, builds `(mock, response_mock)` via `base_mock()`, wraps the body with `sse_response`, mounts the responder once, and returns the capture handle.
+**Data flow**: It receives a server, matcher, and SSE body string, builds the base mock, adds the matcher, wraps the body as an SSE HTTP response, mounts it for one use, and returns the recorder.
 
-**Call relations**: This is the matcher-aware SSE convenience helper used by many integration tests.
+**Call relations**: Specialized streaming tests call this when only certain requests should consume the scripted stream.
 
 *Call graph*: calls 2 internal fn (base_mock, sse_response); called by 27 (direct_input_to_multi_agent_v2_subagent_is_rejected, turn_start_emits_spawn_agent_item_with_effective_role_model_metadata_v2, turn_start_emits_spawn_agent_item_with_model_metadata_v2, responses_stream_includes_subagent_header_on_other, responses_stream_includes_subagent_header_on_review, v2_nested_spawn_checks_shared_active_execution_capacity, run_subagent_global_instruction_case, spawned_subagent_execpolicy_amendment_propagates_to_parent_session, context_window_error_sets_total_tokens_to_model_window, provider_auth_command_supplies_bearer_token (+15 more)).
 
@@ -3270,11 +3282,11 @@ async fn mount_sse_once_match(server: &MockServer, matcher: M, body: String) -> 
 async fn mount_sse_once(server: &MockServer, body: String) -> ResponseMock
 ```
 
-**Purpose**: Mounts a one-shot `/responses` mock serving an SSE body string.
+**Purpose**: Mounts one SSE response for the next `/responses` POST. This is the most common way tests script one model turn.
 
-**Data flow**: It takes a server and body string, builds `(mock, response_mock)` via `base_mock()`, responds with `sse_response(body)`, mounts once, and returns the capture handle.
+**Data flow**: It receives a server and SSE body, builds the base mock, wraps the body as an SSE response, mounts it for one use, and returns the request recorder.
 
-**Call relations**: This is the most common helper for simple single-turn SSE response mocking.
+**Call relations**: Many test scenarios and higher-level helpers use this to serve a single fake stream.
 
 *Call graph*: calls 2 internal fn (base_mock, sse_response); called by 352 (review_start_sends_parent_lineage_in_turn_metadata_for_thread_fork_v2, turn_start_forwards_client_metadata_to_responses_request_v2, turn_start_sends_fork_lineage_in_turn_metadata_for_thread_fork_v2, turn_start_sends_other_subagent_lineage_after_cold_thread_resume_v2, selected_executor_root_exposes_plugin_skill, standalone_image_generation_is_exposed_in_code_mode_only, local_executor_does_not_expose_orchestrator_skills, turn_start_accepts_output_schema_v2, turn_start_output_schema_is_per_turn_v2, thread_inject_items_adds_raw_response_items_to_thread_history (+15 more)).
 
@@ -3289,11 +3301,11 @@ async fn mount_compact_json_once_match(
 ) -> ResponseMock
 ```
 
-**Purpose**: Mounts a one-shot `/responses/compact` mock gated by an extra matcher and returning a JSON body.
+**Purpose**: Mounts one JSON response for `/responses/compact` with an extra matcher. Tests use it to check compaction requests precisely.
 
-**Data flow**: It takes a server, matcher, and JSON body, builds `(mock, response_mock)` via `compact_mock()`, wraps the body in a 200 JSON `ResponseTemplate`, mounts once, and returns the capture handle.
+**Data flow**: It receives a server, matcher, and JSON body, builds the compact mock, adds the matcher, creates a 200 JSON response, mounts it for one use, and returns the recorder.
 
-**Call relations**: Compaction tests use this when they need exact control over the compact endpoint response and request matching.
+**Call relations**: Compaction tests call this when the fake compact endpoint should only match a certain request shape.
 
 *Call graph*: calls 1 internal fn (compact_mock); 2 external calls (new, clone).
 
@@ -3304,11 +3316,11 @@ async fn mount_compact_json_once_match(
 async fn mount_compact_json_once(server: &MockServer, body: serde_json::Value) -> ResponseMock
 ```
 
-**Purpose**: Mounts a one-shot `/responses/compact` mock returning a JSON body.
+**Purpose**: Mounts one simple JSON response for `/responses/compact`. It is a shortcut for common compaction tests.
 
-**Data flow**: It takes a server and JSON body, wraps it in a JSON `ResponseTemplate`, delegates to `mount_compact_response_once`, and returns the `ResponseMock`.
+**Data flow**: It receives a server and JSON body, creates a 200 JSON response template, delegates to `mount_compact_response_once`, and returns the recorder.
 
-**Call relations**: This is the simple compact-endpoint helper used by many compaction tests.
+**Call relations**: Remote compaction tests use this when they already know the exact compact response body.
 
 *Call graph*: calls 1 internal fn (mount_compact_response_once); called by 19 (auto_compaction_remote_emits_started_and_completed_items, auto_compact_counts_encrypted_reasoning_before_last_user, auto_compact_runs_after_resume_when_token_usage_is_over_limit, auto_compact_runs_when_reasoning_header_clears_between_turns, auto_remote_compact_failure_stops_agent_loop, remote_compact_and_resume_refresh_stale_developer_instructions, remote_compact_filters_deferred_dynamic_tools, remote_compact_persists_replacement_history_in_rollout, remote_compact_refreshes_stale_developer_instructions_without_resume, remote_compact_replaces_history_for_followups (+9 more)); 1 external calls (new).
 
@@ -3322,11 +3334,11 @@ async fn mount_compact_user_history_with_summary_once(
 ) -> ResponseMock
 ```
 
-**Purpose**: Mounts a one-shot compact responder that preserves user/developer history and appends one synthetic compaction summary item.
+**Purpose**: Mounts a compact endpoint that returns filtered user/developer history plus one summary item. It simulates the default remote compaction shape for one call.
 
-**Data flow**: It takes a server and summary text, wraps the text in a one-element vector, delegates to `mount_compact_user_history_with_summary_sequence`, and returns the capture handle.
+**Data flow**: It receives summary text, wraps it into a one-element list, delegates to the sequence version, and returns the recorder.
 
-**Call relations**: This is the convenience entry for the more general sequential summary responder.
+**Call relations**: Compaction tests call this when one compact request should produce a realistic summary response.
 
 *Call graph*: calls 1 internal fn (mount_compact_user_history_with_summary_sequence); called by 12 (assert_remote_manual_compact_request_parity, auto_remote_compact_trims_function_call_history_to_fit_context_window, remote_compact_rewrites_multiple_trailing_function_call_outputs, remote_compact_runs_automatically, remote_compact_trim_estimate_uses_session_base_instructions, remote_compact_trims_function_call_history_to_fit_context_window, remote_compact_trims_tool_search_output_to_empty_tools_array, remote_manual_compact_emits_context_compaction_items, snapshot_request_shape_remote_mid_turn_continuation_compaction, snapshot_request_shape_remote_pre_turn_compaction_including_incoming_user_message (+2 more)); 1 external calls (vec!).
 
@@ -3340,11 +3352,11 @@ async fn mount_compact_user_history_with_summary_sequence(
 ) -> ResponseMock
 ```
 
-**Purpose**: Mounts a sequential compact responder that, for each request, keeps only user/developer messages from the incoming `input` and appends a synthetic compaction item using the next summary text.
+**Purpose**: Mounts a compact endpoint that answers multiple compact requests with successive summary texts. It also mimics how remote compaction drops assistant and tool history.
 
-**Data flow**: It takes a server and ordered summary texts, builds a custom `Respond` implementation with an atomic call counter, decodes and parses each incoming request body, filters `input` items to `message` items with role `user` or `developer`, appends `{ "type": "compaction", "encrypted_content": summary_text }`, wraps the result as `{ "output": output }`, mounts the responder with an exact expected call count, and returns the `ResponseMock` capture handle.
+**Data flow**: It receives a list of summaries, installs a responder that counts calls, decodes and parses each compact request, keeps only user and developer messages from its input, appends a synthetic compaction item with the next summary, and returns that JSON output.
 
-**Call relations**: Compaction tests use this helper when they want the mock compact endpoint to behave similarly to the current remote service across one or more compact calls.
+**Call relations**: The one-summary helper delegates here, and multi-compaction tests use it directly to script several compact responses in order.
 
 *Call graph*: calls 1 internal fn (compact_mock); called by 2 (mount_compact_user_history_with_summary_once, snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjects_above_last_summary); 1 external calls (new).
 
@@ -3358,11 +3370,11 @@ async fn mount_compact_response_once(
 ) -> ResponseMock
 ```
 
-**Purpose**: Mounts a one-shot `/responses/compact` mock returning an arbitrary response template.
+**Purpose**: Mounts one arbitrary response template for `/responses/compact`. It is the lower-level compact-response mount helper.
 
-**Data flow**: It takes a server and `ResponseTemplate`, builds `(mock, response_mock)` via `compact_mock()`, mounts the responder once, and returns the capture handle.
+**Data flow**: It receives a server and response template, builds the compact mock, serves the response once, mounts it, and returns the request recorder.
 
-**Call relations**: This is the low-level compact-endpoint mounting primitive used by JSON convenience wrappers and tests needing custom status or headers.
+**Call relations**: Higher-level compact JSON helpers call this when they want to reuse the common compact endpoint setup.
 
 *Call graph*: calls 1 internal fn (compact_mock); called by 4 (mount_compact_json_once, remote_mid_turn_compact_v1_sends_turn_state_over_http, remote_pre_turn_compact_response_seeds_turn_state, snapshot_request_shape_remote_pre_turn_compaction_context_window_exceeded).
 
@@ -3373,11 +3385,11 @@ async fn mount_compact_response_once(
 async fn mount_models_once(server: &MockServer, body: ModelsResponse) -> ModelsMock
 ```
 
-**Purpose**: Mounts a one-shot `/models` mock returning a JSON `ModelsResponse` and capturing the request.
+**Purpose**: Mounts one successful `/models` response. Tests use it to provide a fake model catalog.
 
-**Data flow**: It takes a server and `ModelsResponse`, builds `(mock, models_mock)` via `models_mock()`, wraps the body in a 200 JSON response, mounts once, and returns the capture handle.
+**Data flow**: It receives a server and typed models response, builds the models mock, creates a JSON response, mounts it for one use, and returns the models request recorder.
 
-**Call relations**: This helper is used directly by tests and also by `start_mock_server` to install a default empty models response.
+**Call relations**: The general `start_mock_server` installs this by default, and model-catalog tests call it with specific catalog contents.
 
 *Call graph*: calls 1 internal fn (models_mock); called by 40 (list_models_uses_chatgpt_remote_catalog_as_source_of_truth, new_uses_active_provider_for_model_refresh, start_mock_server, remote_model_override_uses_catalog_model_for_strict_auto_review, body_after_prefix_model_switch_budget_compacts_with_next_model, pre_sampling_compact_recovers_comp_hash_after_resume, pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model, pre_sampling_compact_runs_on_switch_to_smaller_context_model, pre_sampling_compact_runs_when_comp_hash_changes, pre_sampling_compact_skips_missing_comp_hash_after_resume (+15 more)); 2 external calls (new, clone).
 
@@ -3392,11 +3404,11 @@ async fn mount_models_once_with_delay(
 ) -> ModelsMock
 ```
 
-**Purpose**: Mounts a one-shot `/models` mock returning a delayed JSON `ModelsResponse`.
+**Purpose**: Mounts one `/models` response that waits before replying. Tests use it to exercise timeout behavior.
 
-**Data flow**: It takes a server, body, and delay, builds `(mock, models_mock)`, creates a JSON response template with `.set_delay(delay)`, mounts once, and returns the capture handle.
+**Data flow**: It receives a server, models body, and delay duration, builds the models mock, creates a delayed JSON response, mounts it once, and returns the recorder.
 
-**Call relations**: Timeout-related tests use this to simulate a slow models endpoint.
+**Call relations**: Timeout tests use this to make the fake model catalog deliberately slow.
 
 *Call graph*: calls 1 internal fn (models_mock); called by 1 (remote_models_request_times_out_after_5s); 2 external calls (new, clone).
 
@@ -3411,11 +3423,11 @@ async fn mount_models_once_with_etag(
 ) -> ModelsMock
 ```
 
-**Purpose**: Mounts a one-shot `/models` mock returning a JSON `ModelsResponse` plus an `ETag` header.
+**Purpose**: Mounts one `/models` response with an ETag header. An ETag is a server-provided version label used for cache validation.
 
-**Data flow**: It takes a server, body, and etag string, builds `(mock, models_mock)`, creates a JSON response template with `ETag` and content-type headers, mounts once, and returns the capture handle.
+**Data flow**: It receives a server, models body, and ETag string, builds the models mock, creates a JSON response with the ETag header, mounts it once, and returns the recorder.
 
-**Call relations**: Cache-refresh tests use this to exercise ETag-based models fetching behavior.
+**Call relations**: Cache-refresh tests use this to verify how the client reacts to matching or changed model-catalog versions.
 
 *Call graph*: calls 1 internal fn (models_mock); called by 2 (renews_cache_ttl_on_matching_models_etag, refresh_models_on_models_etag_mismatch_and_avoid_duplicate_models_fetch); 2 external calls (new, clone).
 
@@ -3426,11 +3438,11 @@ async fn mount_models_once_with_etag(
 async fn start_mock_server() -> MockServer
 ```
 
-**Purpose**: Starts a wiremock server configured for large body printing and preinstalls a default empty `/models` response.
+**Purpose**: Starts a Wiremock HTTP server configured for these API tests. It also installs a default empty `/models` response so tests do not accidentally reach the network.
 
-**Data flow**: It builds and starts a `MockServer` with `BodyPrintLimit::Limited(80_000)`, mounts `mount_models_once(&server, ModelsResponse { models: Vec::new() })`, and returns the server.
+**Data flow**: It builds and starts a mock server with a large body print limit, mounts a one-time empty models response, and returns the server.
 
-**Call relations**: Most higher-level test harnesses call this first so model-catalog requests remain hermetic even if a test only explicitly mounts `/responses` mocks.
+**Call relations**: Many integration tests call this first, then mount the specific `/responses` behavior they need.
 
 *Call graph*: calls 1 internal fn (mount_models_once); called by 623 (create_mock_responses_server_repeating_assistant, create_mock_responses_server_sequence, create_mock_responses_server_sequence_unchecked, review_start_sends_parent_lineage_in_turn_metadata_for_thread_fork_v2, turn_start_forwards_client_metadata_to_responses_request_v2, turn_start_sends_fork_lineage_in_turn_metadata_for_thread_fork_v2, turn_start_sends_other_subagent_lineage_after_cold_thread_resume_v2, turn_steer_updates_client_metadata_on_follow_up_responses_request_v2, auto_compaction_local_emits_started_and_completed_items, auto_compaction_remote_emits_started_and_completed_items (+15 more)); 3 external calls (Limited, builder, new).
 
@@ -3441,11 +3453,11 @@ async fn start_mock_server() -> MockServer
 async fn start_websocket_server(connections: Vec<Vec<Vec<Value>>>) -> WebSocketTestServer
 ```
 
-**Purpose**: Starts a websocket test server from a simplified nested vector of scripted request-response batches using default connection settings.
+**Purpose**: Starts a lightweight fake WebSocket server using a simple list of scripted response-event batches. It is the easy entry point for realtime tests.
 
-**Data flow**: It takes `Vec<Vec<Vec<Value>>>`, maps each connection script into a `WebSocketConnectionConfig` with empty response headers, no accept delay, and `close_after_requests = true`, then delegates to `start_websocket_server_with_headers`.
+**Data flow**: It receives nested lists of event batches, wraps each connection in a default `WebSocketConnectionConfig`, and delegates to the configurable server starter.
 
-**Call relations**: This is the convenience entry for websocket tests that do not need handshake delays or custom response headers.
+**Call relations**: Most realtime tests call this simpler helper unless they need custom headers, handshake delay, or close behavior.
 
 *Call graph*: calls 1 internal fn (start_websocket_server_with_headers); called by 81 (turn_start_forwards_client_metadata_to_responses_websocket_request_body_v2, realtime_conversation_requires_feature_flag, realtime_conversation_stop_emits_closed_notification, realtime_conversation_streams_v2_notifications, realtime_start_can_skip_startup_context, realtime_text_output_modality_requests_text_output_and_final_transcript, realtime_webrtc_start_surfaces_backend_error, websocket_first_turn_uses_startup_prewarm_and_create, websocket_test_codex_shell_chain, websocket_v2_first_turn_drops_fast_tier_after_startup_prewarm (+15 more)).
 
@@ -3458,11 +3470,11 @@ async fn start_websocket_server_with_headers(
 ) -> WebSocketTestServer
 ```
 
-**Purpose**: Starts a real websocket server that records handshakes and JSON requests, then streams scripted JSON event batches per request for each queued connection configuration.
+**Purpose**: Starts the full-featured fake WebSocket server. It records handshakes and requests, sends scripted JSON events as text frames, and can add response headers or delay accepting a connection.
 
-**Data flow**: It takes a vector of `WebSocketConnectionConfig`, binds a `TcpListener` on `127.0.0.1:0`, constructs shared logs for connections and handshakes plus a `Notify`, stores pending connection scripts in a `VecDeque`, and spawns an accept loop. For each accepted TCP stream with a queued config, it optionally sleeps for `accept_delay`, performs websocket handshake via `accept_hdr_async_with_config` using a callback that records request URI/headers and injects configured response headers, allocates a connection log slot, then for each scripted request batch waits for one inbound websocket message, parses JSON via `parse_ws_request_body`, records it, notifies waiters, and sends each scripted event as a text frame. After all batches it either closes the websocket or waits for shutdown depending on `close_after_requests`. It returns a `WebSocketTestServer` handle containing the URI, logs, shutdown sender, and task handle.
+**Data flow**: It binds a local TCP port, prepares shared logs and a shutdown channel, spawns a background task that accepts connections, records handshake URI and headers, reads each client message as JSON, logs it, sends the scripted events for that request, optionally closes the socket, and returns a `WebSocketTestServer` handle.
 
-**Call relations**: This is the core websocket transport simulator used by realtime and websocket-specific tests; `start_websocket_server` is just a convenience wrapper around it.
+**Call relations**: The simpler WebSocket starter delegates here, and realtime tests use it directly when they need custom handshake behavior or unusual close-handshake scenarios.
 
 *Call graph*: calls 2 internal fn (parse_ws_request_body, websocket_accept_config); called by 15 (attestation_generate_round_trip_adds_header_to_responses_websocket_handshake, new_with_main_loop_responses_server_and_sandbox, realtime_webrtc_start_emits_sdp_notification, start_websocket_server, websocket_first_turn_handles_handshake_delay_with_startup_prewarm, responses_websocket_emits_rate_limit_events, responses_websocket_emits_reasoning_included_event, responses_websocket_v2_surfaces_terminal_error_without_close_handshake, conversation_webrtc_close_while_sideband_connecting_drops_pending_join, conversation_webrtc_start_posts_generated_session (+5 more)); 17 external calls (clone, new, new, new, bind, new, from, eprintln!, format!, channel (+7 more)).
 
@@ -3473,11 +3485,11 @@ async fn start_websocket_server_with_headers(
 fn parse_ws_request_body(message: Message) -> Option<Value>
 ```
 
-**Purpose**: Parses a websocket message into JSON when it is text or binary and ignores other frame types.
+**Purpose**: Parses a WebSocket message into JSON if it is text or binary JSON. Non-data control messages are ignored.
 
-**Data flow**: It takes a `tungstenite::Message`, parses text frames with `serde_json::from_str`, binary frames with `serde_json::from_slice`, and returns `Option<Value>`.
+**Data flow**: It receives a WebSocket message, tries JSON parsing from text or bytes for text/binary messages, and returns `Some` JSON on success or `None` otherwise.
 
-**Call relations**: The websocket server uses this to decide which inbound frames should be recorded as request payloads.
+**Call relations**: The WebSocket server task calls this for every incoming client message before recording it in the request log.
 
 *Call graph*: called by 1 (start_websocket_server_with_headers); 2 external calls (from_slice, from_str).
 
@@ -3488,11 +3500,11 @@ fn parse_ws_request_body(message: Message) -> Option<Value>
 fn websocket_accept_config() -> WebSocketConfig
 ```
 
-**Purpose**: Builds the websocket accept configuration used by the test server, enabling permessage-deflate compression support.
+**Purpose**: Creates the WebSocket accept configuration used by the fake server, including per-message deflate compression support.
 
-**Data flow**: It creates default `ExtensionsConfig` and `WebSocketConfig`, sets `extensions.permessage_deflate = Some(DeflateConfig::default())`, assigns the extensions into the config, and returns it.
+**Data flow**: It starts from default extension settings, enables deflate compression, places those settings into a default WebSocket config, and returns it.
 
-**Call relations**: This configuration is passed into `accept_hdr_async_with_config` by the websocket server startup path.
+**Call relations**: The WebSocket server uses this config when accepting client handshakes, so tests can cover clients that negotiate compression.
 
 *Call graph*: called by 1 (start_websocket_server_with_headers); 3 external calls (default, default, default).
 
@@ -3508,11 +3520,11 @@ async fn mount_function_call_agent_response(
 ) -> FunctionCallResponseMocks
 ```
 
-**Purpose**: Mounts the common two-step SSE sequence for a tool-calling agent: first a function call, then a follow-up assistant completion.
+**Purpose**: Mounts a two-step fake agent interaction: first the model asks for a tool call, then it returns a final assistant message after the tool result.
 
-**Data flow**: It takes a server, `call_id`, serialized arguments, and tool name; builds a first SSE body containing `response.created`, the function call event, and `response.completed`; mounts it once; builds a second SSE body containing an assistant message and completion; mounts that once; and returns both `ResponseMock` handles in `FunctionCallResponseMocks`.
+**Data flow**: It receives a server, call id, arguments, and tool name. It builds and mounts one SSE stream containing a function call, then builds and mounts a second stream containing `done`, and returns both request recorders.
 
-**Call relations**: Tests that exercise tool-call round trips use this helper to install the standard pair of remote responses without repeating boilerplate.
+**Call relations**: Shell and sandbox tests use this when they need the agent loop to perform a tool call and then finish.
 
 *Call graph*: calls 2 internal fn (mount_sse_once, sse); called by 2 (shell_zsh_fork_skill_scripts_ignore_declared_permissions, shell_zsh_fork_still_enforces_workspace_write_sandbox); 1 external calls (vec!).
 
@@ -3523,11 +3535,11 @@ async fn mount_function_call_agent_response(
 async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> ResponseMock
 ```
 
-**Purpose**: Mounts a `/responses` mock that serves a fixed sequence of SSE bodies in FIFO order and asserts the exact number of calls.
+**Purpose**: Mounts a sequence of SSE response bodies for successive `/responses` POSTs. It fails if the client makes more calls than scripted.
 
-**Data flow**: It takes a server and vector of SSE body strings, builds a custom `Respond` implementation with an atomic call counter, returns the body at the current index or panics if exhausted, mounts it with `.up_to_n_times(num_calls).expect(num_calls)`, and returns the `ResponseMock` capture handle.
+**Data flow**: It receives a server and list of SSE bodies, installs a responder with an atomic call counter, serves the next body for each request, and configures Wiremock to expect exactly that many calls.
 
-**Call relations**: Tests use this when a scenario performs multiple `/responses` calls and each should receive a different SSE stream.
+**Call relations**: Multi-turn, retry, compaction, and tool-loop tests use this to script a whole conversation in order.
 
 *Call graph*: calls 1 internal fn (base_mock); called by 263 (auto_compaction_local_emits_started_and_completed_items, auto_compaction_remote_emits_started_and_completed_items, thread_compact_start_triggers_compaction_and_returns_empty_response, selected_executor_plugin_exposes_its_stdio_mcp_only_to_that_thread, external_agent_config_import_compacts_huge_session_before_first_follow_up, run_image_edit_test, standalone_image_generation_failure_emits_terminal_item, standalone_image_generation_is_callable_from_code_mode_only, standalone_image_generation_returns_saved_path_hint_to_model, orchestrator_skill_can_read_referenced_resource_without_an_executor (+15 more)); 1 external calls (new).
 
@@ -3541,11 +3553,11 @@ async fn mount_response_sequence(
 ) -> ResponseMock
 ```
 
-**Purpose**: Mounts a `/responses` mock that serves a fixed sequence of arbitrary `ResponseTemplate`s in FIFO order and asserts the exact number of calls.
+**Purpose**: Mounts a sequence of arbitrary HTTP response templates for successive `/responses` POSTs. This is the non-SSE version of the ordered response helper.
 
-**Data flow**: It takes a server and vector of response templates, builds a custom responder with an atomic call counter, clones and returns the template at the current index, mounts it with an exact expected call count, and returns the `ResponseMock` capture handle.
+**Data flow**: It receives a server and response templates, installs a counter-based responder that clones the next template per request, and tells Wiremock to expect exactly the provided number of calls.
 
-**Call relations**: This is the non-SSE analogue of `mount_sse_sequence`, used when tests need varying statuses, headers, or body types across calls.
+**Call relations**: Tests that need mixed status codes, headers, or custom bodies use this ordered response helper.
 
 *Call graph*: calls 1 internal fn (base_mock); called by 18 (external_auth_refresh_error_fails_turn, external_auth_refresh_invalid_access_token_fails_turn, external_auth_refresh_mismatched_workspace_fails_turn, external_auth_refreshes_on_unauthorized, turn_steer_updates_client_metadata_on_follow_up_responses_request_v2, thread_resume_rejoins_running_thread_even_with_override_mismatch, thread_settings_update_while_turn_is_active_emits_notification, turn_start_tracks_turn_event_analytics, guardian_review_surfaces_responses_api_errors_in_rejection_reason, responses_stream_includes_turn_metadata_header_for_git_workspace_e2e (+8 more)); 1 external calls (new).
 
@@ -3556,24 +3568,24 @@ async fn mount_response_sequence(
 fn validate_request_body_invariants(request: &wiremock::Request)
 ```
 
-**Purpose**: Enforces structural invariants on `/responses` request bodies so tests fail immediately on orphaned or asymmetric tool-call and tool-output items.
+**Purpose**: Checks that a captured `/responses` request has consistent tool-call history. It catches orphan outputs, missing call ids, and calls without matching outputs.
 
-**Data flow**: It takes a `wiremock::Request`, ignores non-POST or non-`/responses` paths, decodes and parses the body JSON, extracts the `input` array, gathers sets of `call_id`s for `function_call`, `custom_tool_call`, `tool_search_call`, `local_shell_call`, and their corresponding output item types, rejects missing or empty output `call_id`s except for legacy server-executed `tool_search_output`, then asserts that every output has a matching prior call kind and every call has a matching output. It returns nothing and panics on invariant violations.
+**Data flow**: It ignores non-POST or non-`/responses` requests, decodes and parses the body, reads the `input` array, gathers call ids for function, custom tool, tool search, and local shell calls and outputs, then asserts that outputs match prior calls and calls have matching outputs.
 
-**Call relations**: This function is invoked from `ResponseMock::matches` on every captured `/responses` request, making it a central guardrail for all HTTP-based response tests.
+**Call relations**: `ResponseMock::matches` runs this automatically on every captured `/responses` POST, so tests fail at the moment bad request history is sent.
 
 *Call graph*: calls 1 internal fn (decode_body_bytes); called by 1 (matches); 2 external calls (assert!, from_slice).
 
 
 ### `core/tests/common/streaming_sse.rs`
 
-`io_transport` · `test streaming transport simulation`
+`test` · `test setup, test request handling, and test teardown`
 
-This file implements a minimal bespoke HTTP server tailored for streaming tests. `StreamingSseChunk` represents one outbound SSE chunk plus an optional `oneshot::Receiver<()>` gate; if a gate is present, the server waits for it before writing that chunk. `StreamingSseServer` exposes the server URI, a log of raw request bodies, a notifier for request-count waits, and a shutdown handle.
+Real streaming APIs do not send a full answer all at once. They send small pieces over time, and clients must behave correctly while waiting, reading, cancelling, or receiving the final event. This file builds a small local test server that copies just enough of that behavior to test the rest of the system without calling a real external service.
 
-`start_streaming_sse_server` binds a `TcpListener` on localhost, preallocates one completion channel per queued response stream, and stores queued response chunks plus completion senders in a `StreamingSseState` protected by `TokioMutex`. The accept loop spawns one task per connection. Each connection reads only until the HTTP header terminator, parses the request line, then drains the request body according to `Content-Length`. It supports exactly two useful routes: `GET /v1/models`, which returns a tiny empty-models JSON payload, and `POST /v1/responses`, which records the raw body, pops the next queued stream/completion pair in FIFO order, writes SSE headers, then emits each chunk in order, waiting on gates as needed. After the final chunk it sends a completion timestamp in Unix milliseconds and shuts down the socket.
+The server listens on a random local port. It understands two routes. A GET request to `/v1/models` returns an empty JSON model list. A POST request to `/v1/responses` records the request body, then sends one queued SSE response stream. Each stream is a list of chunks. A chunk may have a “gate”, which is a one-time signal; if present, the server waits until the test opens that gate before writing the chunk. This is like a test-controlled turnstile in front of each piece of output.
 
-Helper functions keep the implementation explicit: `read_http_request` stops at `\r\n\r\n`, `content_length` parses headers case-insensitively, `read_request_body` drains any remaining bytes, and `write_http_response` emits simple non-streaming responses. The included tests cover malformed requests, FIFO behavior, gated delivery, body draining, and accept-loop shutdown.
+The file also gives tests ways to inspect which request bodies arrived, wait until enough requests have been seen, and shut the server down cleanly. The built-in tests prove the helper behaves predictably: routes return the right status codes, chunks stay in order, gated chunks wait, queued responses are used first-in-first-out, and shutdown stops the accept loop.
 
 #### Function details
 
@@ -3583,11 +3595,11 @@ Helper functions keep the implementation explicit: `read_http_request` stops at 
 fn uri(&self) -> &str
 ```
 
-**Purpose**: Returns the base HTTP URI of the streaming SSE test server.
+**Purpose**: Returns the base web address of the local test server. Tests use this address when they need to point a client at the fake streaming service.
 
-**Data flow**: It returns `&self.uri`.
+**Data flow**: It reads the server handle’s stored URI string and returns it as borrowed text. Nothing is changed.
 
-**Call relations**: Harness builders use this URI to point Codex at the custom streaming server.
+**Call relations**: Higher-level test setup, including `build_with_streaming_server`, calls this after the server has started so the code under test can connect to the fake service.
 
 *Call graph*: called by 1 (build_with_streaming_server).
 
@@ -3598,11 +3610,11 @@ fn uri(&self) -> &str
 async fn requests(&self) -> Vec<Vec<u8>>
 ```
 
-**Purpose**: Returns a cloned snapshot of all raw request bodies received by the server.
+**Purpose**: Returns a snapshot of all request bodies the fake server has received on `/v1/responses`. This lets a test check what the client actually sent.
 
-**Data flow**: It asynchronously locks `self.requests`, clones the `Vec<Vec<u8>>`, and returns it.
+**Data flow**: It locks the shared request list, copies the stored byte arrays, and returns the copy. The original list remains in the server for later checks.
 
-**Call relations**: Tests use this to inspect exactly what bytes were posted to `/v1/responses`.
+**Call relations**: This is part of the server handle that tests can call after making requests. It reads the same shared list that the server’s POST handling code appends to.
 
 
 ##### `StreamingSseServer::wait_for_request_count`  (lines 38–45)
@@ -3611,11 +3623,11 @@ async fn requests(&self) -> Vec<Vec<u8>>
 async fn wait_for_request_count(&self, count: usize)
 ```
 
-**Purpose**: Waits until at least a specified number of requests have been recorded.
+**Purpose**: Waits until the fake server has received at least a chosen number of response requests. This helps tests pause until the client has really contacted the server.
 
-**Data flow**: It takes a target count, repeatedly locks `self.requests` to compare its length, and awaits `self.request_notify.notified()` until the threshold is reached.
+**Data flow**: It repeatedly checks the shared request list length. If there are not enough requests yet, it waits for a notification from the server task, then checks again. It returns only when the count is reached.
 
-**Call relations**: This helper lets tests synchronize on background request emission before releasing gated chunks or making assertions.
+**Call relations**: The server’s POST path notifies this waiter after recording a request body. Tests use it to avoid races where they inspect the server before the client has sent anything.
 
 
 ##### `StreamingSseServer::shutdown`  (lines 47–50)
@@ -3624,11 +3636,11 @@ async fn wait_for_request_count(&self, count: usize)
 async fn shutdown(self)
 ```
 
-**Purpose**: Signals the server accept loop to stop and waits for the background task to finish.
+**Purpose**: Stops the local test server and waits for its background task to finish. This prevents leftover test servers from continuing to accept connections after a test ends.
 
-**Data flow**: It consumes `self`, sends on the shutdown oneshot, awaits the server task, and returns nothing.
+**Data flow**: It consumes the server handle, sends a one-time shutdown signal, then waits for the spawned server task to exit. It ignores errors, because shutdown may already have happened.
 
-**Call relations**: Tests call this during teardown to ensure the custom TCP server exits cleanly.
+**Call relations**: Many tests call this at the end of their flow. It uses the one-shot sender created by `start_streaming_sse_server` to tell the accept loop to break.
 
 *Call graph*: 1 external calls (send).
 
@@ -3641,11 +3653,11 @@ async fn start_streaming_sse_server(
 ) -> (StreamingSseServer, Vec<oneshot::Receiver<i64>>)
 ```
 
-**Purpose**: Starts the custom HTTP server with a FIFO queue of scripted SSE response streams and returns both the server handle and per-stream completion receivers.
+**Purpose**: Starts the fake streaming server and preloads the SSE responses it should send. Tests call this when they need a controllable stand-in for the real streaming API.
 
-**Data flow**: It takes `Vec<Vec<StreamingSseChunk>>`, binds a `TcpListener`, constructs the base URI, creates one completion oneshot pair per queued response stream, stores queued responses and completion senders in `StreamingSseState`, initializes shared request logging and shutdown state, and spawns an accept loop. Each accepted connection reads and parses the request, serves `/v1/models` or `/v1/responses` as appropriate, records POST bodies, pops the next queued stream via `take_next_stream`, writes headers, emits gated chunks in order, sends a completion timestamp from `unix_ms_now`, and shuts down the socket. It returns `(StreamingSseServer, Vec<oneshot::Receiver<i64>>)`.
+**Data flow**: It receives a list of response streams, where each stream is a list of chunks. It binds a local TCP listener, stores the streams and completion signals in shared queues, starts a background accept loop, and returns a server handle plus receivers that fire when each stream finishes.
 
-**Call relations**: This is the main entrypoint used by streaming tests and by the `TestCodexBuilder` path that targets a streaming server instead of wiremock.
+**Call relations**: This is the main setup function used by many tests, including checks for normal streaming, gated chunks, missing response queues, bad requests, unknown routes, request-body draining, and shutdown. The background task it creates calls helper routines to read HTTP requests, parse routes, read bodies, choose the next queued stream, write HTTP or SSE responses, and timestamp completions.
 
 *Call graph*: called by 28 (thread_unsubscribe_during_turn_keeps_turn_running, gated_chunks_wait_for_signal_and_preserve_order, get_models_returns_empty_list, malformed_request_returns_400, multiple_responses_are_fifo_and_completion_timestamps_monotonic, none_gate_streams_immediately, post_responses_streams_in_order_and_closes, post_responses_with_no_queue_returns_500, responses_post_drains_request_body, shutdown_terminates_accept_loop (+15 more)); 12 external calls (clone, new, new, bind, new, new, with_capacity, from, format!, channel (+2 more)).
 
@@ -3658,11 +3670,11 @@ async fn take_next_stream(
 ) -> Option<(Vec<StreamingSseChunk>, oneshot::Sender<i64>)>
 ```
 
-**Purpose**: Atomically pops the next queued response stream and its matching completion sender from shared server state.
+**Purpose**: Takes the next queued response stream and its matching completion sender. It keeps response data and completion notification paired together.
 
-**Data flow**: It locks the `StreamingSseState`, pops the front element from both `responses` and `completions`, and returns them as `Option<(Vec<StreamingSseChunk>, oneshot::Sender<i64>)>`.
+**Data flow**: It locks the shared server state, removes the first stream from the response queue, removes the first completion sender from the completion queue, and returns them together. If either queue is empty, it returns nothing.
 
-**Call relations**: The connection handler in `start_streaming_sse_server` uses this to ensure response streams and completion channels stay in lockstep FIFO order.
+**Call relations**: The POST `/v1/responses` handling code uses this when a client asks for a stream. The test `tests::take_next_stream_consumes_in_lockstep` calls it directly to confirm streams and completion signals are consumed in matching first-in-first-out order.
 
 *Call graph*: called by 1 (take_next_stream_consumes_in_lockstep); 1 external calls (lock).
 
@@ -3673,11 +3685,11 @@ async fn take_next_stream(
 async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>)
 ```
 
-**Purpose**: Reads from a TCP stream until the HTTP header terminator is seen, returning the header text and any already-read body prefix bytes.
+**Purpose**: Reads just the HTTP request headers from a TCP connection, while preserving any body bytes that were already received. This matters because network reads may grab both headers and part of the body at once.
 
-**Data flow**: It takes a mutable `TcpStream`, repeatedly reads into a scratch buffer, appends bytes to an accumulator, checks `header_terminator_index`, and once found returns `(header_string, remaining_bytes_after_headers)`. If EOF arrives first, it returns the whole buffer as header text with an empty body prefix.
+**Data flow**: It reads bytes from the stream into a buffer until it finds the blank line that ends HTTP headers. It returns the header text and any extra bytes after that separator as the first part of the body.
 
-**Call relations**: The per-connection task uses this first so later logic can parse the request line and then drain the remaining body bytes separately.
+**Call relations**: The connection task created by `start_streaming_sse_server` uses this before deciding which route was requested. The test `tests::read_http_request_returns_after_header_terminator` calls it directly to prove it stops as soon as headers are complete.
 
 *Call graph*: calls 1 internal fn (header_terminator_index); called by 1 (read_http_request_returns_after_header_terminator); 3 external calls (from_utf8_lossy, read, new).
 
@@ -3688,11 +3700,11 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u
 fn parse_request_line(request: &str) -> Option<(&str, &str)>
 ```
 
-**Purpose**: Parses the first HTTP request line into `(method, path)`.
+**Purpose**: Pulls the HTTP method and path from the first line of a request. For example, it can turn `GET /v1/models HTTP/1.1` into `GET` and `/v1/models`.
 
-**Data flow**: It takes the raw request header string, reads the first line, splits on whitespace, extracts the first two fields, and returns them as `Option<(&str, &str)>`.
+**Data flow**: It reads the first line of the request text, splits it on whitespace, and returns the first two parts if both exist. If the line is missing or incomplete, it returns nothing.
 
-**Call relations**: Connection handling uses this to route requests to `/v1/models`, `/v1/responses`, or error responses.
+**Call relations**: The server’s per-connection code uses this after reading headers to decide whether to serve models, stream responses, reject a bad request, or return not found. The test `tests::parse_request_line_handles_valid_and_invalid` checks both valid and invalid examples.
 
 
 ##### `header_terminator_index`  (lines 216–218)
@@ -3701,11 +3713,11 @@ fn parse_request_line(request: &str) -> Option<(&str, &str)>
 fn header_terminator_index(buf: &[u8]) -> Option<usize>
 ```
 
-**Purpose**: Finds the byte index where `\r\n\r\n` begins in a buffer.
+**Purpose**: Finds where the HTTP headers end inside a byte buffer. HTTP marks that point with a blank line, written as `\r\n\r\n`.
 
-**Data flow**: It scans `buf.windows(4)` for the header terminator sequence and returns `Option<usize>`.
+**Data flow**: It scans the bytes for the four-byte header-ending pattern. It returns the starting position of that pattern, or nothing if the headers are not complete yet.
 
-**Call relations**: This helper is used by `read_http_request` to know when it has read a complete HTTP header block.
+**Call relations**: `read_http_request` calls this after each network read to know when it can stop reading headers and hand back any leftover body bytes.
 
 *Call graph*: called by 1 (read_http_request).
 
@@ -3716,11 +3728,11 @@ fn header_terminator_index(buf: &[u8]) -> Option<usize>
 fn content_length(headers: &str) -> Option<usize>
 ```
 
-**Purpose**: Parses the `Content-Length` header from an HTTP header block, case-insensitively.
+**Purpose**: Reads the `Content-Length` header from HTTP request headers. That number tells the server how many body bytes it should expect.
 
-**Data flow**: It iterates header lines after the request line, splits each on the first colon, trims name and value, and returns `Some(usize)` for the first `content-length` header whose value parses successfully.
+**Data flow**: It skips the request line, checks each header line, compares the header name without caring about letter case, and parses the value as a number. It returns that number if present and valid.
 
-**Call relations**: `read_request_body` uses this to determine how many bytes remain to be drained from the stream.
+**Call relations**: `read_request_body` calls this before deciding whether more bytes must be read from the stream.
 
 *Call graph*: called by 1 (read_request_body).
 
@@ -3735,11 +3747,11 @@ async fn read_request_body(
 ) -> std::io::Result<Vec<u8>>
 ```
 
-**Purpose**: Reads the remainder of an HTTP request body based on `Content-Length`, combining it with any bytes already read past the header terminator.
+**Purpose**: Reads the full HTTP request body, including any body bytes that were already captured while reading headers. This lets the fake server store the exact POST payload sent by the client.
 
-**Data flow**: It takes a mutable `TcpStream`, header string, and `body_prefix` bytes. If no content length is present it returns the prefix unchanged; otherwise it truncates any excess prefix bytes, computes the remaining byte count, reads exactly that many bytes, appends them, and returns the full body.
+**Data flow**: It receives the stream, header text, and an initial body prefix. If there is no content length, it returns the prefix. If the prefix is too long, it trims it. If more bytes are needed, it reads exactly the remaining amount and appends them, then returns the complete body.
 
-**Call relations**: The connection handler uses this for both `/v1/models` and `/v1/responses` so request bodies are fully drained before responding.
+**Call relations**: The server’s GET and POST route handling uses this to drain request bodies before replying. It relies on `content_length` to know how much body data to read.
 
 *Call graph*: calls 1 internal fn (content_length); 2 external calls (read_exact, vec!).
 
@@ -3750,11 +3762,11 @@ async fn read_request_body(
 async fn write_sse_headers(stream: &mut tokio::net::TcpStream) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes a minimal HTTP 200 response header block for an SSE stream.
+**Purpose**: Writes the HTTP headers that announce an SSE stream. These headers tell the client that the response body will be event-stream text and that the connection will close when done.
 
-**Data flow**: It takes a mutable `TcpStream`, writes a fixed header string containing `content-type: text/event-stream`, `cache-control: no-cache`, and `connection: close`, and returns the I/O result.
+**Data flow**: It sends a fixed HTTP 200 header block to the TCP stream. It returns success or an I/O error from the write.
 
-**Call relations**: The `/v1/responses` handler calls this before streaming chunk bodies.
+**Call relations**: The POST `/v1/responses` handler calls this before writing the queued chunks. If writing these headers fails, that connection task stops early.
 
 *Call graph*: 1 external calls (write_all).
 
@@ -3770,11 +3782,11 @@ async fn write_http_response(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes a simple non-streaming HTTP response with status, content type, body, and connection close.
+**Purpose**: Writes a complete non-streaming HTTP response, including status, content type, body length, body text, and connection close. It is used for simple JSON or error replies.
 
-**Data flow**: It takes a mutable `TcpStream`, numeric status, body string, and content type, formats the response headers including `content-length`, writes headers and body, then shuts down the stream.
+**Data flow**: It receives a stream, status number, body text, and content type. It formats headers using the body length, writes headers and body to the stream, then shuts down the connection.
 
-**Call relations**: The server uses this helper for `/v1/models`, 400 bad request, 404 not found, and 500 no-queued-response cases.
+**Call relations**: The server’s route handling uses this for `/v1/models`, bad requests, missing queued responses, and unknown routes.
 
 *Call graph*: 3 external calls (shutdown, write_all, format!).
 
@@ -3785,11 +3797,11 @@ async fn write_http_response(
 fn unix_ms_now() -> i64
 ```
 
-**Purpose**: Returns the current Unix timestamp in milliseconds as `i64`.
+**Purpose**: Returns the current time as milliseconds since the Unix epoch, which is the common timestamp starting point of 1970-01-01 UTC. The fake server uses it to mark when a stream finished sending.
 
-**Data flow**: It reads `SystemTime::now()`, computes duration since `UNIX_EPOCH`, falls back to zero duration on error, converts milliseconds to `i64`, and returns it.
+**Data flow**: It reads the system clock, measures the duration since the Unix epoch, converts that duration to milliseconds, and returns it as a signed integer. If the clock is somehow before the epoch, it falls back to zero.
 
-**Call relations**: The streaming server sends this timestamp through completion channels after finishing each queued response stream.
+**Call relations**: After the POST stream loop sends the final chunk, the server calls this and sends the timestamp through the stream’s completion channel.
 
 *Call graph*: 1 external calls (now).
 
@@ -3800,11 +3812,11 @@ fn unix_ms_now() -> i64
 fn split_response(response: &str) -> (&str, &str)
 ```
 
-**Purpose**: Splits a raw HTTP response string into headers and body at the first header terminator.
+**Purpose**: Splits a raw HTTP response string into headers and body. Test assertions use it so they can check status and content separately.
 
-**Data flow**: It takes a response string, calls `split_once("\r\n\r\n")`, and returns the pair, panicking if the separator is missing.
+**Data flow**: It receives the whole response text, looks for the blank line between headers and body, and returns the two pieces. If the separator is missing, the test fails immediately.
 
-**Call relations**: This local test helper is used by multiple unit tests in the module.
+**Call relations**: Many tests call this after `tests::read_to_end` gathers a full response from the fake server.
 
 
 ##### `tests::status_code`  (lines 299–305)
@@ -3813,11 +3825,11 @@ fn split_response(response: &str) -> (&str, &str)
 fn status_code(headers: &str) -> u16
 ```
 
-**Purpose**: Extracts the numeric status code from an HTTP response header block.
+**Purpose**: Extracts the numeric HTTP status code from response headers. This keeps tests focused on expected results like 200, 400, 404, or 500.
 
-**Data flow**: It takes the header string, reads the first line, splits on whitespace, skips the HTTP version token, parses the next token as `u16`, and returns it.
+**Data flow**: It reads the first header line, splits it into words, takes the second word as the status code, parses it as a number, and returns it. Bad formatting causes the test to fail.
 
-**Call relations**: Module tests use this to assert server responses without a full HTTP client.
+**Call relations**: Route-behavior tests call this after `tests::split_response` to verify the server returned the expected kind of response.
 
 
 ##### `tests::header_value`  (lines 307–318)
@@ -3826,11 +3838,11 @@ fn status_code(headers: &str) -> u16
 fn header_value(headers: &'a str, name: &str) -> Option<&'a str>
 ```
 
-**Purpose**: Looks up a header value by name from a raw HTTP response header block.
+**Purpose**: Finds one named header in a block of HTTP response headers. Tests use it to confirm the server marks JSON, plain text, and SSE responses correctly.
 
-**Data flow**: It iterates header lines after the status line, splits each on the first colon, trims key and value, compares names case-insensitively, and returns `Option<&str>`.
+**Data flow**: It scans header lines after the status line, splits each at the first colon, compares the name without caring about letter case, and returns the trimmed value if found.
 
-**Call relations**: This helper supports assertions on content type and other response headers in the module tests.
+**Call relations**: Several response tests call this after splitting the response, especially to check `content-type`.
 
 
 ##### `tests::connect`  (lines 320–325)
@@ -3839,11 +3851,11 @@ fn header_value(headers: &'a str, name: &str) -> Option<&'a str>
 async fn connect(uri: &str) -> TcpStream
 ```
 
-**Purpose**: Connects a raw `TcpStream` to the streaming SSE server URI.
+**Purpose**: Opens a raw TCP connection to the fake server from its URI. This lets tests send hand-written HTTP requests and inspect exact bytes.
 
-**Data flow**: It strips the `http://` prefix from the URI, connects to the resulting socket address with `TcpStream::connect`, and returns the stream.
+**Data flow**: It receives a URI like `http://127.0.0.1:port`, removes the `http://` prefix, connects a TCP stream to that address, and returns the stream.
 
-**Call relations**: Module tests use this helper to exercise the server at the raw TCP level.
+**Call relations**: Most server behavior tests call this after `start_streaming_sse_server` so they can drive the fake server directly.
 
 *Call graph*: 1 external calls (connect).
 
@@ -3854,11 +3866,11 @@ async fn connect(uri: &str) -> TcpStream
 async fn read_to_end(stream: &mut TcpStream) -> String
 ```
 
-**Purpose**: Reads an entire TCP response stream into a UTF-8-lossy string.
+**Purpose**: Reads everything left on a TCP stream until the server closes the connection. Tests use it when they expect a complete response and no more data.
 
-**Data flow**: It takes a mutable `TcpStream`, reads all remaining bytes into a `Vec<u8>`, converts them with `String::from_utf8_lossy`, and returns the owned string.
+**Data flow**: It creates a byte buffer, reads all remaining bytes from the stream into it, converts the bytes to text, and returns that text.
 
-**Call relations**: Many module tests use this after sending a request to capture the full response.
+**Call relations**: Many tests call this after `tests::send_request` to collect the server’s full reply before splitting and checking it.
 
 *Call graph*: 3 external calls (from_utf8_lossy, read_to_end, new).
 
@@ -3869,11 +3881,11 @@ async fn read_to_end(stream: &mut TcpStream) -> String
 async fn read_until(stream: &mut TcpStream, needle: &str) -> (String, String)
 ```
 
-**Purpose**: Reads from a TCP stream until a specified byte sequence appears, returning the consumed prefix and any immediately following remainder.
+**Purpose**: Reads from a TCP stream until a chosen marker appears. Tests use it to stop right after response headers, before later streamed chunks arrive.
 
-**Data flow**: It takes a mutable `TcpStream` and needle string, repeatedly reads into a buffer, searches for the needle bytes, and once found returns `(prefix_through_needle, remainder_after_needle)` as strings. If EOF arrives first it returns the whole buffer and an empty remainder.
+**Data flow**: It reads chunks of bytes into a buffer, searches for the marker text, and when found returns the text up through the marker plus any bytes that came after it. If the stream ends first, it returns what it has and an empty remainder.
 
-**Call relations**: Tests use this to stop after HTTP headers or after a gated chunk boundary without consuming the entire stream.
+**Call relations**: Streaming timing tests call this to verify that headers are sent immediately while gated body chunks are still waiting.
 
 *Call graph*: 4 external calls (from_utf8_lossy, new, read, new).
 
@@ -3884,11 +3896,11 @@ async fn read_until(stream: &mut TcpStream, needle: &str) -> (String, String)
 async fn send_request(stream: &mut TcpStream, request: &str)
 ```
 
-**Purpose**: Writes a raw HTTP request string to a TCP stream.
+**Purpose**: Writes a raw HTTP request string to a TCP stream. This gives tests precise control over request method, path, and headers.
 
-**Data flow**: It takes a mutable `TcpStream` and request string, writes all bytes, and returns nothing.
+**Data flow**: It receives an open stream and request text, writes the request bytes to the stream, and fails the test if the write does not complete.
 
-**Call relations**: This helper is used by the module's raw-socket tests to send handcrafted requests.
+**Call relations**: Most tests call this after `tests::connect` and before reading the server response.
 
 *Call graph*: 1 external calls (write_all).
 
@@ -3899,11 +3911,11 @@ async fn send_request(stream: &mut TcpStream, request: &str)
 async fn get_models_returns_empty_list()
 ```
 
-**Purpose**: Verifies that `GET /v1/models` returns a 200 JSON response with an empty model list.
+**Purpose**: Checks that the fake server’s `/v1/models` endpoint returns a successful empty model list. This proves the helper can satisfy code that probes available models before streaming.
 
-**Data flow**: It starts the server with no queued responses, opens a TCP connection, sends a GET request, reads the full response, splits headers/body, parses the JSON body, and asserts status, content type, and payload shape before shutting down the server.
+**Data flow**: It starts the server with no queued streams, sends a raw GET request, reads the response, checks the status and content type, parses the JSON body, and shuts the server down.
 
-**Call relations**: This unit test exercises the `/v1/models` branch of `start_streaming_sse_server`.
+**Call relations**: It exercises `start_streaming_sse_server`, `tests::connect`, `tests::send_request`, `tests::read_to_end`, and `tests::split_response` together as a basic route test.
 
 *Call graph*: calls 1 internal fn (start_streaming_sse_server); 7 external calls (new, assert_eq!, connect, read_to_end, send_request, split_response, from_str).
 
@@ -3914,11 +3926,11 @@ async fn get_models_returns_empty_list()
 async fn post_responses_streams_in_order_and_closes()
 ```
 
-**Purpose**: Verifies that a queued `/v1/responses` stream emits all chunks in order, closes the connection, and reports a completion timestamp.
+**Purpose**: Checks that a queued response stream is sent chunk by chunk in the original order and that the connection closes afterward. It also confirms a completion timestamp is sent.
 
-**Data flow**: It queues two ungated chunks, starts the server, sends a POST request, reads the full response, asserts SSE headers and concatenated body, confirms EOF on further reads, awaits the completion receiver, and checks the timestamp is positive.
+**Data flow**: It queues two chunks, starts the server, sends a POST with an empty body, reads the full response, checks the SSE headers and combined body text, verifies end-of-file, waits for the completion timestamp, and shuts down.
 
-**Call relations**: This test covers the normal happy path for queued SSE streaming.
+**Call relations**: It exercises the normal POST streaming path created by `start_streaming_sse_server` and uses the shared test helpers for connection, sending, reading, and response splitting.
 
 *Call graph*: calls 1 internal fn (start_streaming_sse_server); 7 external calls (assert!, assert_eq!, connect, read_to_end, send_request, split_response, vec!).
 
@@ -3929,11 +3941,11 @@ async fn post_responses_streams_in_order_and_closes()
 async fn none_gate_streams_immediately()
 ```
 
-**Purpose**: Verifies that chunks with `gate: None` are sent immediately once the SSE response starts.
+**Purpose**: Confirms that a chunk without a gate is sent right away. This protects the meaning of `gate: None`: no artificial waiting.
 
-**Data flow**: It starts the server with one ungated chunk, sends a POST request, reads through the header terminator, then reads the rest of the stream and asserts the chunk body arrived without waiting on any signal.
+**Data flow**: It queues one ungated chunk, sends a POST, reads through the response headers, then reads the body and checks that the chunk arrived immediately.
 
-**Call relations**: This test exercises the no-gate branch in the chunk-sending loop.
+**Call relations**: It uses `start_streaming_sse_server`, `tests::connect`, `tests::send_request`, `tests::read_until`, and `tests::split_response` to focus on timing at the start of a stream.
 
 *Call graph*: calls 1 internal fn (start_streaming_sse_server); 7 external calls (assert_eq!, connect, read_until, send_request, split_response, format!, vec!).
 
@@ -3944,11 +3956,11 @@ async fn none_gate_streams_immediately()
 async fn post_responses_with_no_queue_returns_500()
 ```
 
-**Purpose**: Verifies that posting to `/v1/responses` with no queued response streams yields a 500 plain-text error.
+**Purpose**: Checks that a POST to `/v1/responses` fails clearly when no response stream was queued. This helps catch test setup mistakes.
 
-**Data flow**: It starts the server with an empty queue, sends a POST request, reads the response, splits headers/body, and asserts status 500, `text/plain`, and body `no responses queued`.
+**Data flow**: It starts the server with an empty response queue, sends a POST, reads the reply, and verifies a 500 plain-text response saying there are no queued responses.
 
-**Call relations**: This test covers the `take_next_stream` failure path.
+**Call relations**: It exercises the path where `take_next_stream` cannot supply a stream inside the server started by `start_streaming_sse_server`.
 
 *Call graph*: calls 1 internal fn (start_streaming_sse_server); 6 external calls (new, assert_eq!, connect, read_to_end, send_request, split_response).
 
@@ -3959,11 +3971,11 @@ async fn post_responses_with_no_queue_returns_500()
 async fn gated_chunks_wait_for_signal_and_preserve_order()
 ```
 
-**Purpose**: Verifies that gated chunks are withheld until their oneshot signals fire and still arrive in FIFO order.
+**Purpose**: Checks that gated chunks do not appear until their matching signal is sent, and that later chunks cannot jump ahead of earlier ones. This is the core timing behavior this helper exists to provide.
 
-**Data flow**: It creates two gate channels, queues two gated chunks, starts the server, sends a POST request, reads headers, asserts no body arrives before the first gate, sends the first gate and reads exactly the first chunk, asserts the second chunk is still blocked, then sends the second gate and reads the remaining body.
+**Data flow**: It creates two one-time gate signals, queues two gated chunks, sends a POST, confirms headers arrive but no body arrives early, opens the first gate and reads the first chunk, confirms the second still waits, then opens the second gate and reads the rest.
 
-**Call relations**: This test exercises the per-chunk gating logic that motivates the custom server.
+**Call relations**: It uses `start_streaming_sse_server` and the stream-reading helpers to prove the server’s per-chunk gate logic works in realistic network conditions.
 
 *Call graph*: calls 1 internal fn (start_streaming_sse_server); 11 external calls (from_millis, assert!, assert_eq!, connect, read_to_end, read_until, send_request, split_response, channel, timeout (+1 more)).
 
@@ -3974,11 +3986,11 @@ async fn gated_chunks_wait_for_signal_and_preserve_order()
 async fn multiple_responses_are_fifo_and_completion_timestamps_monotonic()
 ```
 
-**Purpose**: Verifies that multiple queued response streams are consumed in FIFO order across separate requests and that completion timestamps are nondecreasing.
+**Purpose**: Checks that multiple queued response streams are served first-in-first-out and that completion timestamps are sensible. FIFO means the first queued item is the first one used.
 
-**Data flow**: It queues two one-chunk responses, sends two POST requests sequentially, asserts each response body matches the corresponding queued stream, awaits both completion receivers, and checks both timestamps are positive and monotonic.
+**Data flow**: It queues two separate streams, sends two POST requests in sequence, verifies the first response gets the first body and the second gets the second body, then waits for both completion timestamps and checks they are positive and nondecreasing.
 
-**Call relations**: This test covers queue ordering and completion-channel pairing.
+**Call relations**: It exercises the shared stream queue created by `start_streaming_sse_server`, indirectly relying on `take_next_stream` to keep responses and completions paired.
 
 *Call graph*: calls 1 internal fn (start_streaming_sse_server); 7 external calls (assert!, assert_eq!, connect, read_to_end, send_request, split_response, vec!).
 
@@ -3989,11 +4001,11 @@ async fn multiple_responses_are_fifo_and_completion_timestamps_monotonic()
 async fn unknown_route_returns_404()
 ```
 
-**Purpose**: Verifies that unsupported routes receive a 404 plain-text response.
+**Purpose**: Checks that the fake server returns a plain 404 response for paths it does not recognize. This proves unexpected routes do not accidentally look successful.
 
-**Data flow**: It starts the server, sends `GET /v1/unknown`, reads the response, and asserts status 404, `text/plain`, and body `not found`.
+**Data flow**: It starts the server, sends a GET request to an unknown path, reads the response, and checks the status, content type, and body text.
 
-**Call relations**: This test covers the fallback route branch in the connection handler.
+**Call relations**: It uses the same raw TCP helpers as other route tests and exercises the fallback branch in the server started by `start_streaming_sse_server`.
 
 *Call graph*: calls 1 internal fn (start_streaming_sse_server); 6 external calls (new, assert_eq!, connect, read_to_end, send_request, split_response).
 
@@ -4004,11 +4016,11 @@ async fn unknown_route_returns_404()
 async fn malformed_request_returns_400()
 ```
 
-**Purpose**: Verifies that an unparsable request line yields a 400 plain-text response.
+**Purpose**: Checks that a badly formed HTTP request is rejected with a 400 response. This verifies the helper does not crash or behave unpredictably on invalid input.
 
-**Data flow**: It starts the server, sends the malformed request `BAD\r\n\r\n`, reads the response, and asserts status 400, `text/plain`, and body `bad request`.
+**Data flow**: It starts the server, sends the invalid text `BAD` as a request, reads the response, and verifies the plain-text `bad request` result.
 
-**Call relations**: This test covers the `parse_request_line` failure path.
+**Call relations**: It exercises the server path where `parse_request_line` cannot find both a method and path.
 
 *Call graph*: calls 1 internal fn (start_streaming_sse_server); 6 external calls (new, assert_eq!, connect, read_to_end, send_request, split_response).
 
@@ -4019,11 +4031,11 @@ async fn malformed_request_returns_400()
 async fn responses_post_drains_request_body()
 ```
 
-**Purpose**: Verifies that the server fully drains a JSON POST body before responding with the queued SSE stream.
+**Purpose**: Checks that the server reads the full POST body before streaming its response. This matters for real HTTP clients, which expect the server to consume the request payload properly.
 
-**Data flow**: It starts the server with one SSE response, sends a real `reqwest` POST containing a JSON payload, asserts the HTTP status and streamed bytes, awaits the completion timestamp, and checks it is positive.
+**Data flow**: It starts the server with one SSE response, sends a JSON POST using a normal HTTP client, verifies the status is OK, reads the streamed bytes, checks they match the queued body, waits for the completion timestamp, and shuts down.
 
-**Call relations**: This test specifically exercises `read_request_body` in the `/v1/responses` path.
+**Call relations**: It exercises `start_streaming_sse_server` through `reqwest`, a real HTTP client library, rather than the file’s raw TCP test helpers. This specifically verifies the `read_request_body` behavior in the POST route.
 
 *Call graph*: calls 2 internal fn (new, start_streaming_sse_server); 5 external calls (assert!, assert_eq!, format!, json!, vec!).
 
@@ -4034,11 +4046,11 @@ async fn responses_post_drains_request_body()
 async fn read_http_request_returns_after_header_terminator()
 ```
 
-**Purpose**: Verifies that `read_http_request` returns as soon as the header terminator is seen and leaves no body bytes when none were sent.
+**Purpose**: Checks that `read_http_request` returns as soon as it sees the end of headers. This prevents tests from hanging while waiting for a body that is not coming.
 
-**Data flow**: It creates a temporary listener, spawns a server task that calls `read_http_request`, sends a simple GET request from a client, receives the parsed header/body pair over a oneshot, and asserts the header string matches exactly and the body is empty.
+**Data flow**: It starts a temporary listener, accepts one connection, calls `read_http_request`, sends a header-only GET request from a client, and verifies the function returns the complete headers with an empty body prefix within a short timeout.
 
-**Call relations**: This unit test isolates the low-level request-reading helper.
+**Call relations**: This test calls `read_http_request` directly rather than going through `start_streaming_sse_server`, so it isolates the low-level header-reading behavior.
 
 *Call graph*: calls 1 internal fn (read_http_request); 8 external calls (from_millis, bind, connect, assert!, assert_eq!, channel, spawn, timeout).
 
@@ -4049,11 +4061,11 @@ async fn read_http_request_returns_after_header_terminator()
 fn parse_request_line_handles_valid_and_invalid()
 ```
 
-**Purpose**: Verifies that `parse_request_line` rejects malformed input and parses a valid request line correctly.
+**Purpose**: Checks that request-line parsing accepts a normal HTTP request line and rejects empty or incomplete ones. This protects the server’s bad-request behavior.
 
-**Data flow**: It calls `parse_request_line` with empty, malformed, and valid strings and asserts the returned `Option` values.
+**Data flow**: It passes three strings into `parse_request_line`: empty text, incomplete text, and a valid GET line. It verifies the first two return nothing and the valid one returns the expected method and path.
 
-**Call relations**: This is a focused unit test for the request-line parser.
+**Call relations**: This test directly covers `parse_request_line`, which the server uses before routing each request.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -4064,11 +4076,11 @@ fn parse_request_line_handles_valid_and_invalid()
 async fn take_next_stream_consumes_in_lockstep()
 ```
 
-**Purpose**: Verifies that `take_next_stream` pops response streams and completion senders in matching FIFO order.
+**Purpose**: Checks that queued streams and their completion senders are removed together in matching order. This prevents a completion signal for one stream from being attached to another stream by mistake.
 
-**Data flow**: It constructs a `StreamingSseState` with two queued streams and two completion senders, calls `take_next_stream` twice, asserts the chunk bodies match the expected order, sends completion values through the returned senders, verifies the paired receivers get those values, and confirms a third call returns `None`.
+**Data flow**: It builds a test state with two streams and two completion senders, calls `take_next_stream` twice, verifies the returned stream bodies, sends test completion values through the returned senders, and confirms the matching receivers get those values. A third call correctly returns nothing.
 
-**Call relations**: This unit test isolates the queue-popping helper used by the server.
+**Call relations**: This test calls `take_next_stream` directly to isolate the queue behavior used by the POST streaming path.
 
 *Call graph*: calls 1 internal fn (take_next_stream); 6 external calls (new, from, assert!, assert_eq!, channel, vec!).
 
@@ -4079,11 +4091,11 @@ async fn take_next_stream_consumes_in_lockstep()
 async fn shutdown_terminates_accept_loop()
 ```
 
-**Purpose**: Verifies that calling `StreamingSseServer::shutdown` stops the accept loop promptly.
+**Purpose**: Checks that calling shutdown actually stops the server’s background accept loop promptly. This keeps tests from leaking background tasks.
 
-**Data flow**: It starts the server, wraps `server.shutdown()` in a short timeout, and asserts the shutdown future completes before the timeout.
+**Data flow**: It starts the fake server, calls `server.shutdown()` inside a short timeout, and verifies shutdown completes before the timeout expires.
 
-**Call relations**: This test covers the shutdown signaling path of the background server task.
+**Call relations**: It exercises `start_streaming_sse_server` and `StreamingSseServer::shutdown` together, focusing on teardown rather than request handling.
 
 *Call graph*: calls 1 internal fn (start_streaming_sse_server); 4 external calls (from_millis, new, assert!, timeout).
 
@@ -4093,9 +4105,13 @@ These harness modules construct the main Codex test fixture and specialized exec
 
 ### `core/tests/common/zsh_fork.rs`
 
-`util` · `integration test fixture setup before shell-execution tests`
+`test` · `test setup`
 
-The central type is `ZshForkRuntime`, which stores two resolved paths: the test `zsh` executable and the `codex-execve-wrapper` helper binary. Its private `apply_to_config` method mutates a `codex_core::config::Config` in a very specific way: it enables `Feature::ShellTool` and `Feature::ShellZshFork`, injects the two executable paths, disables login-shell execution, sets `permissions.approval_policy` via `Constrained::allow_any`, and applies a caller-provided `PermissionProfile`. The helper `restrictive_workspace_write_profile` constructs a sandboxed profile with restricted networking and explicit temp-directory exclusions, matching the expectations of several shell-sandbox tests. Runtime discovery is intentionally defensive. `zsh_fork_runtime` first calls `find_test_zsh_path`, which resolves the repository root, expects a shared DotSlash file at `codex-rs/app-server/tests/suite/zsh`, and fetches the actual binary via `fetch_dotslash_file`; any failure prints a skip reason and returns `Ok(None)`. It then probes the shell with `/usr/bin/true` under `EXEC_WRAPPER=/usr/bin/false`; only a non-success exit proves interception support. Finally it resolves `codex-execve-wrapper` with `cargo_bin`, again skipping cleanly if unavailable. The two async builders wrap `test_codex()` and install either the standard zsh-fork configuration or the unified-exec variant, additionally enabling `Feature::UnifiedExec` and `Feature::UnifiedExecZshFork` and setting `use_experimental_unified_exec_tool = true`.
+These helpers exist so several tests can all ask the same question in the same way: “Can this machine run the zsh-fork shell tests, and if so, how do we configure Codex for them?” The zsh-fork mode depends on a particular zsh binary and on an exec wrapper, which is a small program used to intercept process launches. If either piece is missing or the zsh build does not support the needed interception behavior, the tests should be skipped rather than fail for the wrong reason.
+
+The file centers on `ZshForkRuntime`, a small bundle of paths: where the test zsh lives and where the exec wrapper binary lives. Once that bundle is available, it can be applied to a test `Config`. Applying it turns on the shell tool, turns on the zsh-fork feature, points Codex at the test zsh and wrapper, disables login-shell behavior, and installs the requested approval and permission settings.
+
+The builder functions then use the common `test_codex` test harness to create a ready-to-run `TestCodex`. One builder sets up the normal shell tool path. The other also enables the newer “unified exec” path, which is an experimental execution route used by separate tests. In short, this file is like a test kitchen prep station: it gathers ingredients, checks they are usable, and hands each test a correctly prepared Codex instance.
 
 #### Function details
 
@@ -4110,11 +4126,11 @@ fn apply_to_config(
     )
 ```
 
-**Purpose**: Applies the zsh-fork runtime and permission settings to a mutable test `Config`. It turns on the shell-related features and injects the resolved executable paths needed for intercepted shell execution.
+**Purpose**: This method edits a test configuration so Codex will run shell commands through the zsh-fork path. Tests use it to make sure the same zsh binary, wrapper program, approval rule, and permission profile are all installed together.
 
-**Data flow**: Reads `self.zsh_path` and `self.main_execve_wrapper_exe`, plus `approval_policy` and `permission_profile` arguments → enables `Feature::ShellTool` and `Feature::ShellZshFork`, clones and stores the paths into `config.zsh_path` and `config.main_execve_wrapper_exe`, sets `allow_login_shell = false`, wraps the approval policy with `Constrained::allow_any`, and applies the permission profile through `set_permission_profile` → returns `()` after mutating `config` in place.
+**Data flow**: It starts with a mutable `Config`, an approval policy, and a permission profile. It turns on the shell and zsh-fork features, copies in the stored zsh and wrapper paths, disables login-shell permission, sets how approvals should work, and applies the chosen permission profile. The result is not returned as a new value; the original config is changed in place.
 
-**Call relations**: This method is not called directly by tests; it is invoked inside the configuration closures assembled by `build_zsh_fork_test` and `build_unified_exec_zsh_fork_test`. Those builders rely on it to centralize the common zsh-fork configuration before adding any unified-exec-specific flags.
+**Call relations**: The two test-builder functions call this inside their configuration callback while constructing a `TestCodex`. It uses `allow_any` to wrap the requested approval policy in a form the config accepts, and it clones the stored paths so the runtime object can safely supply them to the config.
 
 *Call graph*: calls 1 internal fn (allow_any); 1 external calls (clone).
 
@@ -4125,11 +4141,11 @@ fn apply_to_config(
 fn restrictive_workspace_write_profile() -> PermissionProfile
 ```
 
-**Purpose**: Constructs the specific `PermissionProfile` used by zsh-fork tests that need workspace-write access but restricted networking and no temp-directory escape hatches. It encodes the sandbox assumptions expected by those tests in one reusable helper.
+**Purpose**: This function creates a strict permission profile for tests that should allow writing in the workspace but keep network access and temporary-directory shortcuts restricted. It gives tests a consistent “locked down but writable project folder” setup.
 
-**Data flow**: Takes no arguments → calls `PermissionProfile::workspace_write_with(&[], NetworkSandboxPolicy::Restricted, true, true)` → returns the resulting `PermissionProfile` value without mutating external state.
+**Data flow**: It takes no input. It asks `PermissionProfile::workspace_write_with` to build a workspace-write profile with no extra writable roots, restricted network access, and exclusions for both the temp-directory environment variable and `/tmp`. It returns that finished `PermissionProfile` to the caller.
 
-**Call relations**: Several zsh-fork integration tests call this during fixture setup to supply a consistent permission profile into the builder helpers. It does not orchestrate test execution itself; it just packages the exact profile constants those callers need.
+**Call relations**: Several zsh-fork tests call this when they need the same restrictive sandbox rules. It hands the resulting profile to the test setup path, usually through `build_zsh_fork_test` or the unified-exec variant, so the test Codex instance enforces those limits.
 
 *Call graph*: calls 1 internal fn (workspace_write_with); called by 6 (env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork, matched_prefix_rule_runs_unsandboxed_under_zsh_fork, shell_zsh_fork_skill_scripts_ignore_declared_permissions, shell_zsh_fork_still_enforces_workspace_write_sandbox, unified_exec_zsh_fork_parent_approval_escalates_intercepted_exec, unified_exec_zsh_fork_parent_approval_keeps_explicit_prompt_rule).
 
@@ -4140,11 +4156,11 @@ fn restrictive_workspace_write_profile() -> PermissionProfile
 fn zsh_fork_runtime(test_name: &str) -> Result<Option<ZshForkRuntime>>
 ```
 
-**Purpose**: Discovers whether the current test environment can run zsh-fork tests and, if so, returns the resolved runtime paths. It converts missing binaries or unsupported interception into clean skips rather than hard failures.
+**Purpose**: This function decides whether a zsh-fork test can run on the current machine and, if it can, returns the runtime paths needed for that test. If the environment is not ready, it returns `None` so the test can skip cleanly.
 
-**Data flow**: Accepts `test_name: &str` for skip diagnostics → calls `find_test_zsh_path`; if absent, returns `Ok(None)`. If a path exists, probes it with `supports_exec_wrapper_intercept`; on failure, prints a skip message including the path and returns `Ok(None)`. It then resolves `codex-execve-wrapper` via `cargo_bin`; if that fails, prints another skip message and returns `Ok(None)`. Otherwise it packages `zsh_path` and `main_execve_wrapper_exe` into `Some(ZshForkRuntime)` and returns `Ok(...)`.
+**Data flow**: It receives the test name, mainly so skip messages can say which test was skipped. It first looks for the test zsh path. If that is missing, it returns `Ok(None)`. Then it checks whether that zsh supports the needed exec-wrapper interception behavior. If not, it prints a skip message and returns `Ok(None)`. Finally, it tries to find the `codex-execve-wrapper` binary. If that is unavailable, it also prints a skip message and returns `Ok(None)`. When all checks pass, it returns `Ok(Some(ZshForkRuntime { ... }))` containing both paths.
 
-**Call relations**: Individual zsh-fork tests call this first to decide whether to proceed or skip. It delegates discovery to `find_test_zsh_path` and capability probing to `supports_exec_wrapper_intercept`, acting as the gatekeeper before either builder function is used.
+**Call relations**: Individual zsh-fork tests call this near the start of their setup. Internally it relies on `find_test_zsh_path` to locate and fetch the shared zsh binary, on `supports_exec_wrapper_intercept` to prove the binary behaves as needed, and on `cargo_bin` to locate the wrapper executable.
 
 *Call graph*: calls 2 internal fn (find_test_zsh_path, supports_exec_wrapper_intercept); called by 5 (env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork, matched_prefix_rule_runs_unsandboxed_under_zsh_fork, shell_zsh_fork_skill_scripts_ignore_declared_permissions, shell_zsh_fork_still_enforces_workspace_write_sandbox, build_unified_exec_zsh_fork_test_or_skip); 2 external calls (cargo_bin, eprintln!).
 
@@ -4161,11 +4177,11 @@ async fn build_zsh_fork_test(
 ) -
 ```
 
-**Purpose**: Builds a `TestCodex` fixture configured for standard zsh-fork execution. It combines a caller-supplied filesystem pre-build hook with the runtime-specific config mutation.
+**Purpose**: This asynchronous helper builds a normal zsh-fork `TestCodex` instance. Tests use it after they already have a valid `ZshForkRuntime` and want a configured Codex test harness connected to a mock server.
 
-**Data flow**: Consumes a `wiremock::MockServer` reference, a `ZshForkRuntime`, approval and permission settings, and a `pre_build_hook: FnOnce(&Path)` → starts from `test_codex()`, attaches the hook with `with_pre_build_hook`, installs a config closure that calls `runtime.apply_to_config(...)`, then asynchronously builds against the mock server → returns `Result<TestCodex>`.
+**Data flow**: It receives a mock server, the runtime paths, an approval policy, a permission profile, and a pre-build hook that can prepare the test directory. It creates a `test_codex` builder, attaches the pre-build hook, and adds a config-editing callback that applies the zsh-fork runtime settings. It then builds the test Codex instance asynchronously and returns it as a `Result<TestCodex>`.
 
-**Call relations**: Zsh-fork integration tests invoke this after obtaining a runtime from `zsh_fork_runtime`. It delegates all fixture assembly to the `test_codex` builder and uses `apply_to_config` to inject the zsh-specific settings at build time.
+**Call relations**: Several zsh-fork tests call this after `zsh_fork_runtime` says the environment is usable. It hands configuration work to `ZshForkRuntime::apply_to_config`, then hands the completed builder to the shared test harness so the actual `TestCodex` can be created.
 
 *Call graph*: calls 1 internal fn (test_codex); called by 4 (env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork, matched_prefix_rule_runs_unsandboxed_under_zsh_fork, shell_zsh_fork_skill_scripts_ignore_declared_permissions, shell_zsh_fork_still_enforces_workspace_write_sandbox).
 
@@ -4181,11 +4197,11 @@ async fn build_unified_exec_zsh_fork_test(
     pre_build
 ```
 
-**Purpose**: Builds a `TestCodex` fixture for the unified-exec implementation layered on top of zsh-fork interception. It extends the standard zsh-fork config with the experimental unified-exec toggle and feature flags.
+**Purpose**: This asynchronous helper builds a zsh-fork `TestCodex` instance that also uses the experimental unified execution path. It is for tests that need to check how zsh-fork behavior works under that newer execution system.
 
-**Data flow**: Accepts the same inputs as `build_zsh_fork_test` → creates a `test_codex()` builder, attaches the pre-build hook, and installs a config closure that first calls `runtime.apply_to_config(...)`, then sets `config.use_experimental_unified_exec_tool = true` and enables `Feature::UnifiedExec` plus `Feature::UnifiedExecZshFork` → asynchronously builds and returns `Result<TestCodex>`.
+**Data flow**: It receives the same inputs as the normal builder: a mock server, runtime paths, approval policy, permission profile, and pre-build hook. It creates a `test_codex` builder, installs the hook, applies the normal zsh-fork config, then additionally turns on the experimental unified exec flag and enables the unified exec features. It builds and returns the finished `TestCodex` asynchronously.
 
-**Call relations**: This helper is called by the unified-exec zsh-fork test path after runtime discovery. It parallels `build_zsh_fork_test` but adds the extra feature wiring needed for the alternate execution stack.
+**Call relations**: The helper `build_unified_exec_zsh_fork_test_or_skip` calls this when it has a usable runtime. This function first reuses `ZshForkRuntime::apply_to_config` for the common zsh-fork setup, then layers on the unified-exec-specific feature switches before handing control to the shared test builder.
 
 *Call graph*: calls 1 internal fn (test_codex); called by 1 (build_unified_exec_zsh_fork_test_or_skip).
 
@@ -4196,11 +4212,11 @@ async fn build_unified_exec_zsh_fork_test(
 fn find_test_zsh_path() -> Result<Option<PathBuf>>
 ```
 
-**Purpose**: Locates and materializes the shared test `zsh` binary referenced by a DotSlash file in the repository. It treats missing files or fetch failures as skippable conditions and reports them to stderr.
+**Purpose**: This private helper finds the zsh binary that the zsh-fork tests are supposed to use. It hides the details of locating the repository file and fetching it through DotSlash, a tool-style indirection that can download or resolve the real executable.
 
-**Data flow**: Reads the repository root from `codex_utils_cargo_bin::repo_root()`, joins `codex-rs/app-server/tests/suite/zsh`, checks `is_file()`, and if present calls `crate::fetch_dotslash_file(&dotslash_zsh, None)` → returns `Ok(Some(PathBuf))` on success, `Ok(None)` after printing a skip reason when the file is missing or fetch fails, or propagates repository-root lookup errors.
+**Data flow**: It starts with no direct input. It asks for the repository root, builds the expected path to the shared zsh DotSlash file, and checks that the file exists. If it does not exist, it prints a skip message and returns `Ok(None)`. If the file exists, it tries to fetch or resolve it with `fetch_dotslash_file`. On success it returns `Ok(Some(path))`; on failure it prints the error and returns `Ok(None)`.
 
-**Call relations**: Only `zsh_fork_runtime` calls this helper. It isolates the repository-path and DotSlash-fetch logic so the higher-level runtime gatekeeper can focus on capability checks and wrapper resolution.
+**Call relations**: `zsh_fork_runtime` calls this as its first readiness check. This helper does not build the full runtime by itself; it only supplies the zsh path, which `zsh_fork_runtime` then validates further with `supports_exec_wrapper_intercept`.
 
 *Call graph*: called by 1 (zsh_fork_runtime); 3 external calls (repo_root, fetch_dotslash_file, eprintln!).
 
@@ -4211,26 +4227,24 @@ fn find_test_zsh_path() -> Result<Option<PathBuf>>
 fn supports_exec_wrapper_intercept(zsh_path: &Path) -> bool
 ```
 
-**Purpose**: Probes whether a given `zsh` binary honors `EXEC_WRAPPER` interception for non-login command execution. The test is intentionally simple: if wrapping `/usr/bin/true` with `/usr/bin/false` causes failure, interception is considered supported.
+**Purpose**: This private helper checks whether a given zsh binary honors the `EXEC_WRAPPER` interception mechanism needed by the tests. In plain terms, it makes sure zsh will let the wrapper stand in front of programs that zsh launches.
 
-**Data flow**: Accepts `zsh_path: &Path` → spawns `std::process::Command::new(zsh_path)` with arguments `-fc` and `/usr/bin/true`, sets environment variable `EXEC_WRAPPER=/usr/bin/false`, and collects the exit status → returns `true` when the command runs and exits unsuccessfully, otherwise `false` on success or process-spawn error.
+**Data flow**: It receives a path to a zsh executable. It runs that zsh with a simple command that would normally execute `/usr/bin/true`, but it sets the `EXEC_WRAPPER` environment variable to `/usr/bin/false`. If interception works, the wrapper causes the command to fail, so the function returns `true` when the process exits unsuccessfully. If the command succeeds or cannot be run, it returns `false`.
 
-**Call relations**: This helper is called only from `zsh_fork_runtime` after a candidate shell path has been found. Its boolean result determines whether the runtime is usable or whether the caller should skip the test with an explanatory message.
+**Call relations**: `zsh_fork_runtime` calls this after finding the zsh path and before looking for the wrapper binary. Its answer decides whether tests using that zsh should continue or be skipped with an explanatory message.
 
 *Call graph*: called by 1 (zsh_fork_runtime); 1 external calls (new).
 
 
 ### `core/tests/common/test_codex.rs`
 
-`orchestration` · `test harness setup and turn execution`
+`test` · `test setup and test turn execution`
 
-This file is the main orchestration layer for core integration tests. It defines `TestCodexBuilder`, which accumulates config mutators, auth, pre-build hooks, workspace setup closures, optional temp home, cloud-config fixtures, shell overrides, exec-server URL overrides, extension registries, and user-instructions providers. Builder methods are intentionally composable and mostly mutate internal vectors or optional fields. The build paths differ only in transport/environment selection: wiremock SSE, custom streaming SSE, websocket, local-only execution, remote execution, or mixed remote+local environments.
+Most Codex tests need the same stage set: a temporary home folder, a temporary project folder, fake authentication, a mock OpenAI-style server, and a running Codex thread that can accept user prompts. This file builds that stage so individual tests can focus on the behavior they care about instead of repeating setup code.
 
-`prepare_config` constructs a hermetic `Config` rooted in a temp home, points `model_provider.base_url` at the chosen test server, disables websocket transport by default, runs pre-build hooks against the home directory, loads default config (optionally with cloud bundle), sets `config.cwd`, tries several strategies to locate `codex` or `codex-exec` for self-invocation, applies queued config mutators, and injects a synthetic model catalog entry when the special `test-gpt-5.1-codex` model is selected.
+The main idea is like a theatre rehearsal room. `TestCodexBuilder` chooses the props: model name, config changes, shell choice, cloud config, extensions, and workspace files. It then creates a `TestCodex`, which wraps the live Codex thread plus its temporary folders and execution environment. `TestCodexHarness` adds an HTTP mock server and convenience methods for writing files, submitting prompts, and reading what Codex sent back to the model.
 
-`build_with_home_and_base_url` then creates an `EnvironmentManager`, runs queued workspace setup futures against the selected filesystem, and delegates to `build_from_config`. That method initializes the state DB and thread store, resolves installation ID, chooses a user-instructions provider, constructs a `ThreadManager`, and starts or resumes a thread, optionally using a user-shell override. The resulting `TestCodex` stores the temp home/workspace, `Arc<CodexThread>`, session configuration event, config, thread manager, and retained `TestEnv`.
-
-`TestCodex` provides turn-submission helpers that translate permission profiles into legacy sandbox policy fields, submit `Op::UserInput`, wait for `TurnStarted` to capture the turn ID, then wait up to 30 seconds for the matching `TurnComplete`. `TestCodexHarness` wraps a started mock server plus `TestCodex` and adds filesystem helpers implemented through the executor filesystem abstraction, along with request-body inspection helpers that extract function/custom-tool outputs from captured `/responses` requests.
+The file also supports remote execution tests. When a remote test environment is configured, it creates a per-test remote working directory and cleans it up later, including Docker cleanup when needed. The submit helpers do more than send text: they attach approval and sandbox settings, wait for a turn to start, then wait for that same turn to finish. This prevents tests from racing ahead before Codex has completed its work.
 
 #### Function details
 
@@ -4240,11 +4254,11 @@ This file is the main orchestration layer for core integration tests. It defines
 fn new(inner: Arc<dyn UserInstructionsProvider>) -> Self
 ```
 
-**Purpose**: Wraps an existing `UserInstructionsProvider` with a load counter for tests that need to assert how often instructions are fetched.
+**Purpose**: Creates a wrapper around another user-instructions provider so tests can count how many times instructions are loaded. This is useful when a test needs to prove that instructions are not reloaded too often or are loaded at the right moments.
 
-**Data flow**: It takes `Arc<dyn UserInstructionsProvider>`, stores it in `inner`, initializes `load_count` to zero, and returns the wrapper.
+**Data flow**: It receives an existing provider, stores it, and starts a counter at zero. The result is a new recording provider that behaves like the original provider but keeps a load count.
 
-**Call relations**: Tests construct this wrapper around a real provider and then pass it into `TestCodexBuilder::with_user_instructions_provider`.
+**Call relations**: Tests that check instruction-loading behavior call this before building Codex. Later, when Codex asks for instructions, the wrapper forwards the request to the inner provider.
 
 *Call graph*: called by 2 (loads_user_instructions_without_a_primary_environment, multi_environment_thread_loads_every_project_and_keeps_creation_snapshot); 1 external calls (new).
 
@@ -4255,11 +4269,11 @@ fn new(inner: Arc<dyn UserInstructionsProvider>) -> Self
 fn load_count(&self) -> usize
 ```
 
-**Purpose**: Returns the number of times `load_user_instructions` has been invoked on the wrapper.
+**Purpose**: Returns how many times the wrapped instruction provider has been asked to load instructions. Tests use this as an observable counter.
 
-**Data flow**: It atomically reads `self.load_count` with `Ordering::SeqCst` and returns the `usize` count.
+**Data flow**: It reads the internal atomic counter, which is safe to read even when multiple tasks are running, and returns the number as a normal integer.
 
-**Call relations**: Tests call this after running scenarios to verify instruction-loading behavior.
+**Call relations**: After a test runs one or more Codex turns, it can call this to confirm how often `load_user_instructions` was triggered.
 
 *Call graph*: 1 external calls (load).
 
@@ -4270,11 +4284,11 @@ fn load_count(&self) -> usize
 fn load_user_instructions(&self) -> LoadUserInstructionsFuture<'_>
 ```
 
-**Purpose**: Implements `UserInstructionsProvider` by incrementing the counter and delegating to the wrapped provider.
+**Purpose**: Implements the instruction-loading behavior while recording that a load happened. It keeps the test-visible count accurate without changing the real instructions returned.
 
-**Data flow**: It atomically increments `load_count`, then returns the future from `self.inner.load_user_instructions()`.
+**Data flow**: A Codex thread calls it with no explicit input. It increments the counter, then delegates to the wrapped provider and returns that provider's future result.
 
-**Call relations**: The `ThreadManager` invokes this through the trait when loading user instructions; tests later inspect `load_count()`.
+**Call relations**: This is called by Codex wherever a normal `UserInstructionsProvider` would be used. It hands off to the inner provider so the rest of the system sees the same instruction content.
 
 *Call graph*: 1 external calls (fetch_add).
 
@@ -4285,11 +4299,11 @@ fn load_user_instructions(&self) -> LoadUserInstructionsFuture<'_>
 fn local(cwd: AbsolutePathBuf) -> TurnEnvironmentSelection
 ```
 
-**Purpose**: Builds a `TurnEnvironmentSelection` targeting the local executor environment for a given absolute working directory.
+**Purpose**: Builds a turn-environment selection that points at the local execution environment and a chosen working directory. Tests use it when they need to say, "run this turn here."
 
-**Data flow**: It takes an `AbsolutePathBuf`, fills `environment_id` with `LOCAL_ENVIRONMENT_ID`, converts the cwd to `PathUri`, and returns the selection struct.
+**Data flow**: It receives an absolute path, converts it into a path URI, and combines it with the known local environment identifier. It returns one environment selection.
 
-**Call relations**: Tests use this helper directly and via `local_selections` when constructing explicit environment selections for a turn.
+**Call relations**: Higher-level helpers and tests use this when constructing environment choices for a turn, especially when comparing local and remote execution routing.
 
 *Call graph*: calls 1 internal fn (from_abs_path); called by 3 (default_turn_does_not_overlay_legacy_fallback_cwd_onto_stored_thread_environments, exec_command_routes_to_selected_remote_environment, view_image_routes_to_selected_remote_environment).
 
@@ -4300,11 +4314,11 @@ fn local(cwd: AbsolutePathBuf) -> TurnEnvironmentSelection
 fn local_selections(cwd: AbsolutePathBuf) -> TurnEnvironmentSelections
 ```
 
-**Purpose**: Builds a `TurnEnvironmentSelections` containing exactly one local environment selection rooted at the given cwd.
+**Purpose**: Builds the full environment-selection object for a turn that should use the local workspace. It wraps the single local selection in the collection format the protocol expects.
 
-**Data flow**: It clones the provided `AbsolutePathBuf`, constructs a single-element vector with `local(cwd)`, and returns `TurnEnvironmentSelections::new(...)`.
+**Data flow**: It receives a working directory path, clones it, creates a `local` selection from it, and returns a `TurnEnvironmentSelections` value.
 
-**Call relations**: Many tests use this helper to populate thread settings with an explicit local environment set.
+**Call relations**: Many tests use this helper when they need explicit local-environment settings instead of relying on defaults.
 
 *Call graph*: calls 1 internal fn (new); called by 72 (user_turn_updates_approvals_reviewer, env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork, matched_prefix_rule_runs_unsandboxed_under_zsh_fork, network_approval_retry_keeps_deny_read_sandbox_for_escalated_command, submit_turn, remote_model_override_uses_catalog_model_for_strict_auto_review, user_turn_collaboration_mode_overrides_model_and_effort, user_turn_explicit_reasoning_summary_overrides_model_catalog_default, collaboration_instructions_added_on_user_turn, collaboration_instructions_omitted_when_disabled (+15 more)); 2 external calls (clone, vec!).
 
@@ -4315,11 +4329,11 @@ fn local_selections(cwd: AbsolutePathBuf) -> TurnEnvironmentSelections
 async fn local() -> Result<Self>
 ```
 
-**Purpose**: Creates a local test execution environment backed by a fresh temporary working directory.
+**Purpose**: Creates a purely local test execution environment with a fresh temporary working directory. This is the common path for tests that do not need a remote executor.
 
-**Data flow**: It allocates a `TempDir`, converts it to `AbsolutePathBuf`, creates a `codex_exec_server::Environment` with no remote exec URL, and returns a `TestEnv` containing the environment, cwd, retained temp dir, and no remote container metadata.
+**Data flow**: It creates a temporary directory, turns it into an absolute path, asks the execution server library for a test environment, and returns a `TestEnv` containing those pieces.
 
-**Call relations**: Builder paths that do not require remote execution call this to obtain the executor environment used during thread startup.
+**Call relations**: Builder methods call this when creating local Codex instances. The resulting environment later supplies the filesystem used by test helpers.
 
 *Call graph*: calls 1 internal fn (create_for_tests); called by 5 (build, build_with_streaming_server, build_with_websocket_server, resume, test_env); 2 external calls (new, new).
 
@@ -4330,11 +4344,11 @@ async fn local() -> Result<Self>
 fn cwd(&self) -> &AbsolutePathBuf
 ```
 
-**Purpose**: Returns the absolute working directory associated with the test environment.
+**Purpose**: Returns the working directory for this test environment. Callers use it as the project folder for Codex.
 
-**Data flow**: It returns `&self.cwd`.
+**Data flow**: It reads the stored absolute path and returns a reference to it without changing anything.
 
-**Call relations**: Builder setup reads this when preparing config and workspace setup closures.
+**Call relations**: The builder calls this while preparing the Codex config so the configured current directory matches the test environment.
 
 *Call graph*: called by 1 (build_with_home_and_base_url).
 
@@ -4345,11 +4359,11 @@ fn cwd(&self) -> &AbsolutePathBuf
 fn environment(&self) -> &codex_exec_server::Environment
 ```
 
-**Purpose**: Returns the underlying executor `Environment` for filesystem and execution operations.
+**Purpose**: Returns the execution environment object behind this test environment. This gives callers access to the filesystem and execution setup.
 
-**Data flow**: It returns `&self.environment`.
+**Data flow**: It reads the stored environment and returns a reference to it. Nothing is created or modified.
 
-**Call relations**: Higher-level helpers use this to obtain the filesystem and to pass the environment into managers.
+**Call relations**: The builder and `TestCodex::fs` call this when they need the environment's filesystem or runtime details.
 
 *Call graph*: called by 2 (fs, build_with_home_and_base_url).
 
@@ -4360,11 +4374,11 @@ fn environment(&self) -> &codex_exec_server::Environment
 fn local_cwd_temp_dir(&self) -> Option<Arc<TempDir>>
 ```
 
-**Purpose**: Returns the retained local temp directory when the environment is local-backed.
+**Purpose**: Returns the temporary local working directory, if this environment has one. Remote environments do not have a local temp directory for the remote workspace.
 
-**Data flow**: It clones and returns `self.local_cwd_temp_dir` as `Option<Arc<TempDir>>`.
+**Data flow**: It clones the stored shared pointer to the temporary directory, if present, and returns it. This keeps the directory alive for as long as the clone exists.
 
-**Call relations**: Builder setup uses this to decide whether the final `TestCodex.cwd` should be the local environment temp dir or the fallback temp dir created during config preparation.
+**Call relations**: The builder uses this to decide which temporary directory should be stored in `TestCodex` as its local `cwd` holder.
 
 *Call graph*: called by 1 (build_with_home_and_base_url).
 
@@ -4375,11 +4389,11 @@ fn local_cwd_temp_dir(&self) -> Option<Arc<TempDir>>
 fn drop(&mut self)
 ```
 
-**Purpose**: Cleans up remote test working directories inside Docker containers when a remote-backed `TestEnv` is dropped.
+**Purpose**: Cleans up remote test workspace files when a remote Docker-backed environment was used. This prevents leftover per-test directories from piling up in the container.
 
-**Data flow**: On drop, if `remote_container_name` is present, it formats `rm -rf <cwd>` and invokes `docker_command_capture_stdout(["exec", container_name, "sh", "-lc", &script])`, ignoring any error.
+**Data flow**: When `TestEnv` is being destroyed, it checks for a remote container name. If one exists, it builds a shell command to remove the remote working directory and runs it through Docker, ignoring cleanup errors.
 
-**Call relations**: This destructor runs automatically at teardown for remote Docker environments so test-created directories do not accumulate inside the container.
+**Call relations**: This runs automatically at teardown when the test environment is dropped. It calls `docker_command_capture_stdout` to perform the Docker command.
 
 *Call graph*: calls 1 internal fn (docker_command_capture_stdout); 1 external calls (format!).
 
@@ -4390,11 +4404,11 @@ fn drop(&mut self)
 async fn test_env() -> Result<TestEnv>
 ```
 
-**Purpose**: Creates either a remote-backed or local-backed `TestEnv` depending on the configured test environment variables.
+**Purpose**: Chooses between a remote test environment and a local one. Tests can run the same setup either on the local machine or against a configured remote execution server.
 
-**Data flow**: It reads `get_remote_test_env()`. For remote environments it resolves the remote exec server URL, creates a remote `Environment`, computes a unique remote cwd from `remote_test_instance_id`, creates that directory through the executor filesystem, converts the path URI back to `AbsolutePathBuf`, and returns a `TestEnv` with remote metadata. If no remote environment is configured, it delegates to `TestEnv::local()`.
+**Data flow**: It checks whether remote-test settings exist. If they do, it reads the remote server URL, creates a unique remote working directory, creates that directory through the remote filesystem, and returns a remote `TestEnv`; otherwise it returns `TestEnv::local`.
 
-**Call relations**: Remote-capable builder paths call this to obtain the execution environment appropriate for the current test process configuration.
+**Call relations**: Remote-aware builder paths and remote execution tests call this. It relies on `remote_exec_server_url` and `remote_test_instance_id` when remote mode is active.
 
 *Call graph*: calls 4 internal fn (local, remote_exec_server_url, remote_test_instance_id, create_for_tests); called by 9 (remote_exec_server_rejects_inherited_fd_launches, unified_exec_uses_remote_exec_server_when_configured, build_with_remote_and_local_env, build_with_remote_env, remote_test_env_can_connect_and_use_filesystem, remote_test_env_copy_preserves_symlink_source, remote_test_env_remove_removes_symlink_not_target, remote_test_env_sandboxed_read_allows_readable_root, remote_test_env_sandboxed_read_rejects_symlink_parent_dotdot_escape); 1 external calls (get_remote_test_env).
 
@@ -4405,11 +4419,11 @@ async fn test_env() -> Result<TestEnv>
 fn remote_exec_server_url() -> Result<String>
 ```
 
-**Purpose**: Reads and validates the remote exec server URL from `CODEX_TEST_REMOTE_EXEC_SERVER_URL`.
+**Purpose**: Reads the remote execution server URL from the environment. It fails clearly if the required setting is missing or blank.
 
-**Data flow**: It reads the environment variable, trims whitespace, returns an error if missing or empty, and otherwise returns the URL string.
+**Data flow**: It reads `CODEX_TEST_REMOTE_EXEC_SERVER_URL`, trims whitespace, checks it is not empty, and returns the URL string or an error.
 
-**Call relations**: This helper is used only by `test_env` when constructing remote-backed environments.
+**Call relations**: `test_env` calls this only when remote tests are enabled, so remote setup can connect to the right execution server.
 
 *Call graph*: called by 1 (test_env); 2 external calls (anyhow!, var).
 
@@ -4420,11 +4434,11 @@ fn remote_exec_server_url() -> Result<String>
 fn remote_test_instance_id() -> String
 ```
 
-**Purpose**: Generates a unique per-process, per-call identifier for remote test working directories.
+**Purpose**: Creates a unique-ish identifier for one remote test instance. This helps separate remote working directories created by concurrent tests.
 
-**Data flow**: It atomically increments `REMOTE_TEST_INSTANCE_COUNTER`, combines the current process ID and counter with `format!`, and returns the resulting string.
+**Data flow**: It increments a process-wide counter and combines the current process id with that counter. The output is a string such as `12345-0`.
 
-**Call relations**: Remote environment setup uses this to avoid cwd collisions across tests and shards.
+**Call relations**: `test_env` uses this identifier when asking the remote-test configuration for a per-test working directory.
 
 *Call graph*: called by 1 (test_env); 1 external calls (format!).
 
@@ -4435,11 +4449,11 @@ fn remote_test_instance_id() -> String
 fn docker_command_capture_stdout(args: [&str; N]) -> Result<String>
 ```
 
-**Purpose**: Runs a `docker` command, returning UTF-8 stdout on success and a detailed error containing stdout/stderr on failure.
+**Purpose**: Runs a Docker command and returns its standard output as text. It is used for cleanup commands in remote Docker test environments.
 
-**Data flow**: It takes a fixed-size array of argument strings, executes `docker`, checks the exit status, converts stdout to UTF-8, and returns `Result<String>`, attaching command context and failure details.
+**Data flow**: It receives Docker command arguments, runs `docker` with those arguments, checks the exit status, and returns UTF-8 stdout. If Docker fails or output is not valid UTF-8, it returns an error with useful details.
 
-**Call relations**: The `TestEnv` destructor uses this to remove remote working directories inside Docker containers.
+**Call relations**: `TestEnv::drop` calls this during remote workspace cleanup.
 
 *Call graph*: called by 1 (drop); 3 external calls (from_utf8, anyhow!, new).
 
@@ -4453,11 +4467,11 @@ fn turn_permission_fields(
 ) -> (SandboxPolicy, Option<PermissionProfile>)
 ```
 
-**Purpose**: Converts a `PermissionProfile` into the pair of thread-settings fields expected by tests: legacy `SandboxPolicy` plus optional modern `PermissionProfile`.
+**Purpose**: Converts a modern permission profile into the older sandbox-policy fields still expected in turn settings. This keeps tests compatible with both representations.
 
-**Data flow**: It takes a `PermissionProfile` and cwd path, attempts `to_legacy_sandbox_policy(cwd)`, falls back to `SandboxPolicy::new_read_only_policy()` on conversion failure, and returns `(sandbox_policy, Some(permission_profile))`.
+**Data flow**: It receives a permission profile and current directory, asks the profile for an equivalent sandbox policy, falls back to read-only if conversion fails, and returns both the sandbox policy and the original profile.
 
-**Call relations**: Turn-submission helpers call this before constructing `ThreadSettingsOverrides` so both legacy and modern permission fields are populated consistently.
+**Call relations**: `TestCodex::submit_turn_with_context` uses this before sending a user turn. Many tests also call it directly when preparing expected thread settings.
 
 *Call graph*: calls 1 internal fn (to_legacy_sandbox_policy); called by 63 (submit_turn_with_context, apply_patch_turn_diff_tracks_local_and_remote_environment_paths, env_zsh_script_spawned_by_python_can_request_escalation_under_zsh_fork, matched_prefix_rule_runs_unsandboxed_under_zsh_fork, network_approval_retry_keeps_deny_read_sandbox_for_escalated_command, remote_model_override_uses_catalog_model_for_strict_auto_review, code_mode_can_call_hidden_dynamic_tools, disabled_permission_user_turn, execpolicy_blocks_shell_invocation, submit_user_turn (+15 more)).
 
@@ -4468,11 +4482,11 @@ fn turn_permission_fields(
 fn with_config(mut self, mutator: T) -> Self
 ```
 
-**Purpose**: Queues a one-shot config mutator closure to be applied during config preparation.
+**Purpose**: Adds a one-time config-editing function to the builder. Tests use it to tweak Codex settings before the test thread starts.
 
-**Data flow**: It takes ownership of `self` and a `FnOnce(&mut Config)`, boxes the closure, pushes it into `config_mutators`, and returns the updated builder.
+**Data flow**: It receives a function that mutates a `Config`, stores it in the builder, and returns the builder for chaining.
 
-**Call relations**: Many other builder helpers, such as `with_model`, are implemented in terms of this generic mutator queue.
+**Call relations**: Convenience methods such as `with_model` and `with_model_info_override` build on this. Later, `prepare_config` runs all stored mutators.
 
 *Call graph*: called by 2 (with_model, with_model_info_override); 1 external calls (new).
 
@@ -4483,11 +4497,11 @@ fn with_config(mut self, mutator: T) -> Self
 fn with_auth(mut self, auth: CodexAuth) -> Self
 ```
 
-**Purpose**: Overrides the auth object that will be used when constructing the thread manager and starting or resuming the thread.
+**Purpose**: Sets the authentication object the test Codex instance should use. This lets tests swap the default dummy API key for another auth setup.
 
-**Data flow**: It takes ownership of `self` and a `CodexAuth`, stores it in `self.auth`, and returns the builder.
+**Data flow**: It receives a `CodexAuth`, stores it on the builder, and returns the builder.
 
-**Call relations**: Tests use this when they need non-default authentication behavior.
+**Call relations**: `build_from_config` later clones this auth value and gives it to the test thread manager.
 
 
 ##### `TestCodexBuilder::with_model`  (lines 277–282)
@@ -4496,11 +4510,11 @@ fn with_auth(mut self, auth: CodexAuth) -> Self
 fn with_model(self, model: &str) -> Self
 ```
 
-**Purpose**: Queues a config mutation that sets `config.model` to a specific model slug.
+**Purpose**: Configures the test to use a specific model name. This is a simple shortcut for changing `config.model`.
 
-**Data flow**: It clones the provided model string into an owned `String`, then delegates to `with_config` with a closure that assigns `config.model = Some(new_model)`.
+**Data flow**: It receives a model string, copies it into an owned string, and adds a config mutator that sets the model field.
 
-**Call relations**: This is the simplest model-selection helper; `ensure_test_model_catalog` later may inject catalog data for special test models.
+**Call relations**: It delegates to `with_config`; `prepare_config` applies the stored mutator during build.
 
 *Call graph*: calls 1 internal fn (with_config).
 
@@ -4511,11 +4525,11 @@ fn with_model(self, model: &str) -> Self
 fn with_model_info_override(self, model: &str, override_model_info: T) -> Self
 ```
 
-**Purpose**: Queues a config mutation that ensures a model catalog exists, finds a specific model entry, mutates its `ModelInfo`, and selects that model.
+**Purpose**: Lets a test modify the catalog entry for a particular model before Codex starts. This is useful for testing model capabilities without changing the shared model catalog.
 
-**Data flow**: It captures the target model slug and override closure, then delegates to `with_config`. The queued closure lazily inserts `bundled_models_response()` into `config.model_catalog` if absent, finds the matching `ModelInfo` by `slug`, applies the caller's mutation, and sets `config.model = Some(model)`.
+**Data flow**: It receives a model name and a function that edits that model's `ModelInfo`. During config preparation, it ensures a model catalog exists, finds the requested model, applies the override, and selects that model.
 
-**Call relations**: Tests use this when they need to tweak catalog metadata for one model without constructing an entire custom catalog.
+**Call relations**: It is implemented through `with_config`, so its changes are applied in `prepare_config` along with other config mutators.
 
 *Call graph*: calls 1 internal fn (with_config).
 
@@ -4526,11 +4540,11 @@ fn with_model_info_override(self, model: &str, override_model_info: T) -> Self
 fn with_pre_build_hook(mut self, hook: F) -> Self
 ```
 
-**Purpose**: Queues a closure to run against the home directory path before config loading/building begins.
+**Purpose**: Registers a hook that runs after the temporary home directory exists but before the config is loaded. Tests use this to place files in the fake home directory before Codex reads them.
 
-**Data flow**: It boxes the provided `FnOnce(&Path)` hook, pushes it into `pre_build_hooks`, and returns the builder.
+**Data flow**: It receives a function that takes the home path, stores it, and returns the builder.
 
-**Call relations**: These hooks are drained and executed in `prepare_config`, typically to seed files under the temp home before config load.
+**Call relations**: `prepare_config` drains and runs these hooks before loading the default test config.
 
 *Call graph*: 1 external calls (new).
 
@@ -4541,11 +4555,11 @@ fn with_pre_build_hook(mut self, hook: F) -> Self
 fn with_workspace_setup(mut self, setup: F) -> Self
 ```
 
-**Purpose**: Queues an async workspace-setup closure that will run against the selected cwd and executor filesystem before thread startup.
+**Purpose**: Registers asynchronous setup work for the workspace filesystem. This allows tests to create files or directories in either local or remote workspaces through the same filesystem interface.
 
-**Data flow**: It takes a closure returning a future, wraps it into a boxed `WorkspaceSetup` that returns `BoxFuture<'static, Result<()>>`, pushes it into `workspace_setups`, and returns the builder.
+**Data flow**: It receives a setup function, wraps its future in a boxed future, stores it, and returns the builder. Later the setup receives the configured working directory and filesystem.
 
-**Call relations**: `build_with_home_and_base_url` drains and executes these setups after environment-manager creation and before thread startup.
+**Call relations**: `build_with_home_and_base_url` runs all stored workspace setup functions after the environment and config are ready.
 
 *Call graph*: 1 external calls (new).
 
@@ -4556,11 +4570,11 @@ fn with_workspace_setup(mut self, setup: F) -> Self
 fn with_home(mut self, home: Arc<TempDir>) -> Self
 ```
 
-**Purpose**: Forces the builder to use a caller-supplied temp home directory instead of allocating a new one.
+**Purpose**: Tells the builder to use a specific temporary Codex home directory. This is needed when a test wants to seed or reuse home-state across builds.
 
-**Data flow**: It stores the provided `Arc<TempDir>` in `self.home` and returns the builder.
+**Data flow**: It receives a shared temporary directory, stores it, and returns the builder.
 
-**Call relations**: Tests use this when they need to preserve home state across builds or resumes.
+**Call relations**: Build methods use this stored home instead of creating a new one.
 
 
 ##### `TestCodexBuilder::with_cloud_config_bundle`  (lines 326–332)
@@ -4572,11 +4586,11 @@ fn with_cloud_config_bundle(
     ) -> Self
 ```
 
-**Purpose**: Supplies a cloud-config bundle loader to be used during config construction.
+**Purpose**: Supplies a cloud configuration bundle for tests that need cloud-provided settings. This changes how the default test config is loaded.
 
-**Data flow**: It stores the provided `CloudConfigBundleLoader` in `self.cloud_config_bundle` and returns the builder.
+**Data flow**: It receives a bundle loader, stores it, and returns the builder.
 
-**Call relations**: `prepare_config` consumes this option to choose between the default config loader and the cloud-bundle-aware variant.
+**Call relations**: `prepare_config` consumes this value and calls the cloud-aware config loader when present.
 
 
 ##### `TestCodexBuilder::with_user_shell`  (lines 334–337)
@@ -4585,11 +4599,11 @@ fn with_cloud_config_bundle(
 fn with_user_shell(mut self, user_shell: Shell) -> Self
 ```
 
-**Purpose**: Overrides the user shell used when starting or resuming the thread.
+**Purpose**: Overrides the shell that Codex should believe the user is using. Tests use this to exercise shell-specific behavior.
 
-**Data flow**: It stores the provided `Shell` in `self.user_shell_override` and returns the builder.
+**Data flow**: It receives a shell description, stores it, and returns the builder.
 
-**Call relations**: `build_from_config` consults this option to choose shell-override startup/resume paths.
+**Call relations**: `build_from_config` later chooses special thread-start or resume helpers when this override is present.
 
 *Call graph*: called by 1 (with_windows_cmd_shell).
 
@@ -4600,11 +4614,11 @@ fn with_user_shell(mut self, user_shell: Shell) -> Self
 fn with_exec_server_url(mut self, exec_server_url: impl Into<String>) -> Self
 ```
 
-**Purpose**: Overrides the exec server URL used when constructing the environment manager.
+**Purpose**: Configures the builder to use a specific execution server URL. This lets tests direct commands to a chosen executor instead of the default test environment.
 
-**Data flow**: It converts the input into `String`, stores it in `self.exec_server_url`, and returns the builder.
+**Data flow**: It receives a URL-like value, converts it into a string, stores it, and returns the builder.
 
-**Call relations**: `build_with_home_and_base_url` prefers this explicit override over any URL carried by the selected `TestEnv`.
+**Call relations**: `build_with_home_and_base_url` prefers this explicit URL over the URL carried by `TestEnv`.
 
 *Call graph*: 1 external calls (into).
 
@@ -4615,11 +4629,11 @@ fn with_exec_server_url(mut self, exec_server_url: impl Into<String>) -> Self
 fn with_extensions(mut self, extensions: Arc<ExtensionRegistry<Config>>) -> Self
 ```
 
-**Purpose**: Overrides the extension registry passed into the thread manager.
+**Purpose**: Installs an extension registry for the test Codex instance. Tests use this when they need custom tools or extension-provided behavior.
 
-**Data flow**: It stores the provided `Arc<ExtensionRegistry<Config>>` in `self.extensions` and returns the builder.
+**Data flow**: It receives a shared registry, stores it, and returns the builder.
 
-**Call relations**: Tests use this to inject custom extensions into the started thread.
+**Call relations**: `build_from_config` passes this registry into `ThreadManager::new`.
 
 
 ##### `TestCodexBuilder::with_user_instructions_provider`  (lines 349–355)
@@ -4631,11 +4645,11 @@ fn with_user_instructions_provider(
     ) -> Self
 ```
 
-**Purpose**: Overrides the user-instructions provider used by the thread manager.
+**Purpose**: Sets a custom source for user instructions. This lets tests replace the normal Codex-home instruction loader with a fake or recording provider.
 
-**Data flow**: It stores the provided `Arc<dyn UserInstructionsProvider>` in `self.user_instructions_provider` and returns the builder.
+**Data flow**: It receives a provider, stores it, and returns the builder.
 
-**Call relations**: `build_from_config` uses this provider instead of the default `CodexHomeUserInstructionsProvider` when present.
+**Call relations**: `build_from_config` uses this provider if present; otherwise it creates the normal home-directory provider.
 
 
 ##### `TestCodexBuilder::with_windows_cmd_shell`  (lines 357–363)
@@ -4644,11 +4658,11 @@ fn with_user_instructions_provider(
 fn with_windows_cmd_shell(self) -> Self
 ```
 
-**Purpose**: On Windows, configures the builder to use `cmd.exe` as the user shell; on other platforms it leaves the builder unchanged.
+**Purpose**: On Windows, configures the test to use `cmd.exe` as the user shell. On other operating systems, it leaves the builder unchanged.
 
-**Data flow**: It checks `cfg!(windows)`, and if true resolves a `Shell` from `PathBuf::from("cmd.exe")` via `get_shell_by_model_provided_path`, then delegates to `with_user_shell`; otherwise it returns `self` unchanged.
+**Data flow**: It checks the target operating system. If running on Windows, it converts `cmd.exe` into a `Shell` and stores it through `with_user_shell`; otherwise it returns the same builder.
 
-**Call relations**: This is a platform-specific convenience wrapper around `with_user_shell`.
+**Call relations**: Tests that need Windows command-shell behavior can call this without adding platform-specific branching themselves.
 
 *Call graph*: calls 2 internal fn (get_shell_by_model_provided_path, with_user_shell); 2 external calls (from, cfg!).
 
@@ -4659,11 +4673,11 @@ fn with_windows_cmd_shell(self) -> Self
 async fn build(&mut self, server: &wiremock::MockServer) -> anyhow::Result<TestCodex>
 ```
 
-**Purpose**: Builds a `TestCodex` using a wiremock server and a local execution environment.
+**Purpose**: Builds a normal local `TestCodex` connected to a wiremock HTTP server. This is the standard setup path for most tests.
 
-**Data flow**: It ensures a home temp dir exists, formats the server base URL as `<server.uri()>/v1`, creates `TestEnv::local()`, and delegates to `build_with_home_and_base_url` with no resume path and `include_local_environment = false`.
+**Data flow**: It chooses or creates a home directory, constructs the mock server `/v1` base URL, creates a local `TestEnv`, and delegates to `build_with_home_and_base_url`.
 
-**Call relations**: This is the standard builder entry used by `TestCodexHarness::with_builder` and most local integration tests.
+**Call relations**: `TestCodexHarness::with_builder` calls this after starting the mock server.
 
 *Call graph*: calls 2 internal fn (build_with_home_and_base_url, local); called by 1 (with_builder); 4 external calls (new, pin, new, format!).
 
@@ -4677,11 +4691,11 @@ async fn build_with_remote_env(
     ) -> anyhow::Result<TestCodex>
 ```
 
-**Purpose**: Builds a `TestCodex` using a wiremock server and the configured remote-or-local test environment.
+**Purpose**: Builds a `TestCodex` whose workspace may live in a remote test environment. This is for tests that need to exercise remote execution behavior.
 
-**Data flow**: It ensures a home temp dir exists, formats the server base URL, obtains `test_env().await`, and delegates to `build_with_home_and_base_url` with no resume path and no extra local environment.
+**Data flow**: It chooses or creates a home directory, builds the mock model base URL, obtains `test_env`, and delegates to the shared build path without also adding a local environment.
 
-**Call relations**: Remote-environment harnesses use this when tests should run against the configured remote executor environment.
+**Call relations**: `TestCodexHarness::with_remote_env_builder` and remote-environment tests use this.
 
 *Call graph*: calls 2 internal fn (build_with_home_and_base_url, test_env); called by 2 (with_remote_env_builder, agents_instructions); 4 external calls (new, pin, new, format!).
 
@@ -4695,11 +4709,11 @@ async fn build_with_remote_and_local_env(
     ) -> anyhow::Result<TestCodex>
 ```
 
-**Purpose**: Builds a `TestCodex` with the configured remote environment plus an additional local environment exposed by the environment manager.
+**Purpose**: Builds a `TestCodex` with both remote and local environments available. Tests use this when they need to verify routing between the two.
 
-**Data flow**: It ensures a home temp dir exists, formats the server base URL, obtains `test_env().await`, and delegates to `build_with_home_and_base_url` with `include_local_environment = true`.
+**Data flow**: It creates or reuses the home directory, gets the mock server base URL, creates a local-or-remote `TestEnv`, and delegates to the shared build path with local inclusion enabled.
 
-**Call relations**: Tests that need both remote and local execution targets use this variant.
+**Call relations**: It shares most work with the other build methods through `build_with_home_and_base_url`.
 
 *Call graph*: calls 2 internal fn (build_with_home_and_base_url, test_env); 4 external calls (new, pin, new, format!).
 
@@ -4713,11 +4727,11 @@ async fn build_with_streaming_server(
     ) -> anyhow::Result<TestCodex>
 ```
 
-**Purpose**: Builds a `TestCodex` pointed at the custom streaming SSE server instead of wiremock.
+**Purpose**: Builds a local `TestCodex` connected to a streaming Server-Sent Events test server. Server-Sent Events are a web streaming format where the server pushes chunks over one HTTP response.
 
-**Data flow**: It reads `server.uri()`, ensures a home temp dir exists, creates `TestEnv::local()`, formats the base URL as `<uri>/v1`, and delegates to `build_with_home_and_base_url`.
+**Data flow**: It reads the streaming server URI, prepares a home directory, creates a local environment, formats the `/v1` base URL, and delegates to the common build method.
 
-**Call relations**: Streaming tests use this path so Codex talks to `StreamingSseServer`.
+**Call relations**: Streaming response tests call this when wiremock is not the right kind of server.
 
 *Call graph*: calls 3 internal fn (uri, build_with_home_and_base_url, local); 4 external calls (new, pin, new, format!).
 
@@ -4731,11 +4745,11 @@ async fn build_with_websocket_server(
     ) -> anyhow::Result<TestCodex>
 ```
 
-**Purpose**: Builds a `TestCodex` pointed at the websocket test server and mutates config to enable websocket transport and a realtime test model.
+**Purpose**: Builds a local `TestCodex` configured for realtime WebSocket testing. A WebSocket is a long-lived two-way connection between client and server.
 
-**Data flow**: It formats the websocket base URL as `<server.uri()>/v1`, ensures a home temp dir exists, pushes a config mutator that sets `model_provider.base_url`, `supports_websockets = true`, `experimental_realtime_ws_model = Some("realtime-test-model")`, and `realtime.version = V1`, creates `TestEnv::local()`, and delegates to `build_with_home_and_base_url`.
+**Data flow**: It builds the server base URL, prepares a home directory, adds a config mutator that enables websocket support and realtime model settings, creates a local environment, and delegates to the common build method.
 
-**Call relations**: Realtime/websocket tests use this specialized build path to flip the necessary transport flags before startup.
+**Call relations**: Realtime tests call this to make the config match the WebSocket test server.
 
 *Call graph*: calls 2 internal fn (build_with_home_and_base_url, local); 5 external calls (new, new, pin, new, format!).
 
@@ -4751,11 +4765,11 @@ async fn resume(
     ) -> anyhow::Result<TestCodex>
 ```
 
-**Purpose**: Builds a `TestCodex` by resuming from an existing rollout file under a supplied home directory.
+**Purpose**: Builds a `TestCodex` by resuming an existing conversation from a rollout file. A rollout file is saved conversation state used to continue a prior thread.
 
-**Data flow**: It formats the wiremock base URL, creates `TestEnv::local()`, and delegates to `build_with_home_and_base_url` with `resume_from = Some(rollout_path)` and the caller-provided home.
+**Data flow**: It receives a mock server, existing home directory, and rollout path. It creates the model base URL and local environment, then delegates to the common build path with `resume_from` set.
 
-**Call relations**: Resume-related tests use this path to restart a thread from persisted rollout state.
+**Call relations**: Resume tests call this; `build_from_config` later chooses the resume code path.
 
 *Call graph*: calls 2 internal fn (build_with_home_and_base_url, local); called by 1 (resume_until_initial_messages); 2 external calls (pin, format!).
 
@@ -4772,11 +4786,11 @@ async fn build_with_home_and_base_url(
         include_local_e
 ```
 
-**Purpose**: Shared build pipeline that prepares config, creates environment managers, runs workspace setup hooks, chooses the effective cwd temp dir, and delegates to thread startup/resume.
+**Purpose**: Performs the shared build steps that are common to local, remote, streaming, websocket, and resume setups. It connects config, filesystem, execution manager, and final Codex thread creation.
 
-**Data flow**: It takes base URL, home, optional rollout path, `TestEnv`, and a flag for including a local environment. It calls `prepare_config` to get `(Config, fallback_cwd)`, resolves the exec server URL from builder override or `test_env`, computes local runtime paths including the Linux sandbox binary when applicable, creates an `EnvironmentManager` with or without local environment support, obtains the executor filesystem from `test_env.environment()`, drains and runs queued `workspace_setups` against `config.cwd` and that filesystem, chooses `cwd` as `test_env.local_cwd_temp_dir().unwrap_or(fallback_cwd)`, and calls `build_from_config`.
+**Data flow**: It prepares the config, chooses the execution server URL, finds runtime helper binaries, creates an environment manager, runs workspace setup functions, chooses the temporary cwd holder, and then calls `build_from_config`.
 
-**Call relations**: All public build variants funnel through this method so transport and environment differences are isolated to a few parameters.
+**Call relations**: All public build methods funnel into this function. It hands prepared pieces to `build_from_config`, which actually starts or resumes the Codex thread.
 
 *Call graph*: calls 8 internal fn (build_from_config, prepare_config, cwd, environment, local_cwd_temp_dir, create_for_tests, create_for_tests_with_local, new); called by 6 (build, build_with_remote_and_local_env, build_with_remote_env, build_with_streaming_server, build_with_websocket_server, resume); 7 external calls (clone, new, pin, find_codex_linux_sandbox_exe, current_exe, swap, vec!).
 
@@ -4794,11 +4808,11 @@ async fn build_from_config(
         e
 ```
 
-**Purpose**: Constructs runtime state from a prepared `Config`, creates the `ThreadManager`, and starts or resumes the thread with optional shell override.
+**Purpose**: Starts or resumes the actual Codex thread from an already prepared config. This is where the test harness becomes a live Codex conversation.
 
-**Data flow**: It takes the prepared `Config`, cwd/home temp dirs, optional rollout path, `TestEnv`, and `EnvironmentManager`. It initializes the state DB, derives the thread store, resolves installation ID, chooses a user-instructions provider, constructs `ThreadManager::new(...)`, wraps it in `Arc`, and then matches on `(resume_from, user_shell_override)` to choose one of four startup paths: resume with shell override, resume normally, start with shell override, or start normally. It returns a `TestCodex` containing the resulting `CodexThread`, `SessionConfiguredEvent`, config, thread manager, and retained environment.
+**Data flow**: It initializes state storage, creates a thread store and installation id, chooses a user-instructions provider, builds a `ThreadManager`, then either starts a new thread or resumes from a rollout, with optional shell override. It returns a `TestCodex` containing the live thread and test resources.
 
-**Call relations**: This is the final assembly step called only by `build_with_home_and_base_url`.
+**Call relations**: `build_with_home_and_base_url` calls this after setup is complete. It delegates thread creation to `ThreadManager` or test-support helpers depending on resume and shell options.
 
 *Call graph*: calls 4 internal fn (auth_manager_from_auth, resume_thread_from_rollout_with_user_shell_override, start_thread_with_user_shell_override, new); called by 1 (build_with_home_and_base_url); 8 external calls (clone, new, pin, clone, init_state_db, resolve_installation_id, thread_store_from_config, clone).
 
@@ -4814,11 +4828,11 @@ async fn prepare_config(
     ) -> anyhow::Result<(Config, Arc<TempDir>)>
 ```
 
-**Purpose**: Builds the hermetic test `Config`, points it at the chosen model-provider base URL, runs pre-build hooks and config mutators, and ensures special test-model catalog entries exist.
+**Purpose**: Loads and edits the test configuration before Codex starts. It makes sure the config points at the mock model server and the chosen test workspace.
 
-**Data flow**: It takes the base URL, home temp dir, and cwd override. It constructs a `ModelProviderInfo` from the built-in OpenAI provider with `base_url` set and `supports_websockets = false`, allocates a fallback cwd temp dir, drains and runs `pre_build_hooks` against `home.path()`, loads default config with or without a cloud bundle, sets `config.cwd` and `config.model_provider`, tries to locate `codex` or `codex-exec` binaries for `config.codex_self_exe`, drains and applies queued config mutators, calls `ensure_test_model_catalog`, and returns `(config, cwd_temp_dir)`.
+**Data flow**: It creates a test model provider, creates a fallback temp cwd, runs pre-build hooks, loads default config, sets cwd and provider fields, tries to locate the Codex executable, applies stored config mutators, ensures special test model catalog data when needed, and returns the config plus fallback cwd holder.
 
-**Call relations**: Every build path calls this first so all later startup logic receives a fully prepared config.
+**Call relations**: `build_with_home_and_base_url` calls this first. It calls `ensure_test_model_catalog` after test-specific config edits.
 
 *Call graph*: calls 1 internal fn (ensure_test_model_catalog); called by 1 (build_with_home_and_base_url); 10 external calls (new, new, path, built_in_model_providers, cargo_bin, load_default_config_for_test, load_default_config_for_test_with_cloud_config_bundle, current_exe, swap, vec!).
 
@@ -4829,11 +4843,11 @@ async fn prepare_config(
 fn ensure_test_model_catalog(config: &mut Config) -> Result<()>
 ```
 
-**Purpose**: Injects a synthetic model-catalog entry for the special `test-gpt-5.1-codex` model when that model is selected and no catalog is already configured.
+**Purpose**: Adds a synthetic model catalog entry for a special experimental-tools test model when needed. This keeps tests from depending on that fake model existing in the bundled catalog.
 
-**Data flow**: It takes `&mut Config`, returns early unless `config.model == Some(TEST_MODEL_WITH_EXPERIMENTAL_TOOLS)` and `config.model_catalog.is_none()`, loads bundled models, clones the `gpt-5.2` entry, rewrites its slug and display name to the test model, sets `experimental_supported_tools = ["test_sync_tool"]`, stores a one-model `ModelsResponse` in `config.model_catalog`, and returns `Ok(())`.
+**Data flow**: It checks whether the selected model is the special test model and whether a catalog is already present. If needed, it clones the bundled `gpt-5.2` entry, renames it, adds a test experimental tool, and stores a one-model catalog in the config.
 
-**Call relations**: This helper is called from `prepare_config` so tests can select the special model slug without manually constructing a catalog.
+**Call relations**: `prepare_config` calls this after config mutators, so tests can request the special model by name and still get a valid catalog entry.
 
 *Call graph*: called by 1 (prepare_config); 2 external calls (bundled_models_response, vec!).
 
@@ -4844,11 +4858,11 @@ fn ensure_test_model_catalog(config: &mut Config) -> Result<()>
 fn cwd_path(&self) -> &Path
 ```
 
-**Purpose**: Returns the filesystem path of the retained workspace temp directory.
+**Purpose**: Returns the local temporary directory path stored as the test's current working directory holder. Tests use it for local filesystem assertions.
 
-**Data flow**: It returns `self.cwd.path()`.
+**Data flow**: It reads the stored temporary directory and returns its filesystem path.
 
-**Call relations**: Other `TestCodex` helpers and tests use this as the base workspace path.
+**Call relations**: `workspace_path` and several tests call this when they need a normal `Path` rather than the absolute-path wrapper in config.
 
 *Call graph*: called by 5 (workspace_path, read_only_user_turn, read_only_text_turn_with_personality, disabled_text_turn, submit_turn_with_policies).
 
@@ -4859,11 +4873,11 @@ fn cwd_path(&self) -> &Path
 fn codex_home_path(&self) -> &Path
 ```
 
-**Purpose**: Returns the filesystem path of the Codex home directory from the active config.
+**Purpose**: Returns the path to the fake Codex home directory used by this test. Tests use it to inspect or seed home-level files.
 
-**Data flow**: It returns `self.config.codex_home.as_path()`.
+**Data flow**: It reads `config.codex_home` and returns it as a path reference.
 
-**Call relations**: Tests use this to seed or inspect files under the test home.
+**Call relations**: Tests that work with saved threads, skills, or home configuration call this directly.
 
 *Call graph*: called by 2 (seed_recent_thread, skill_script_command).
 
@@ -4874,11 +4888,11 @@ fn codex_home_path(&self) -> &Path
 fn workspace_path(&self, rel: impl AsRef<Path>) -> PathBuf
 ```
 
-**Purpose**: Builds a workspace-relative path under the retained cwd temp directory.
+**Purpose**: Builds a path inside the test workspace from a relative path. This avoids repeated path joining in tests.
 
-**Data flow**: It takes a relative path-like value, joins it onto `cwd_path()`, and returns the resulting `PathBuf`.
+**Data flow**: It receives a relative path, gets the workspace root through `cwd_path`, joins the two, and returns the resulting path.
 
-**Call relations**: This is a convenience helper for tests that need concrete workspace file paths.
+**Call relations**: Tests call this when they need to refer to files under the test workspace.
 
 *Call graph*: calls 1 internal fn (cwd_path); called by 1 (seed_recent_thread).
 
@@ -4889,11 +4903,11 @@ fn workspace_path(&self, rel: impl AsRef<Path>) -> PathBuf
 fn executor_environment(&self) -> &TestEnv
 ```
 
-**Purpose**: Returns the retained `TestEnv` describing the executor environment used by this harness.
+**Purpose**: Exposes the underlying test execution environment. Tests use this when they need details beyond the simpler filesystem helper.
 
-**Data flow**: It returns `&self._test_env`.
+**Data flow**: It returns a reference to the stored `TestEnv` without changing it.
 
-**Call relations**: Tests use this when they need direct access to environment metadata beyond the filesystem abstraction.
+**Call relations**: This is a direct escape hatch for tests that need environment-level access.
 
 
 ##### `TestCodex::fs`  (lines 718–720)
@@ -4902,11 +4916,11 @@ fn executor_environment(&self) -> &TestEnv
 fn fs(&self) -> Arc<dyn ExecutorFileSystem>
 ```
 
-**Purpose**: Returns the executor filesystem associated with the harness environment.
+**Purpose**: Returns the filesystem interface for the test environment. This lets tests read and write files whether the workspace is local or remote.
 
-**Data flow**: It reads `self._test_env.environment()` and returns `Arc<dyn ExecutorFileSystem>` from `get_filesystem()`.
+**Data flow**: It gets the environment from `TestEnv`, asks it for its filesystem object, and returns a shared filesystem handle.
 
-**Call relations**: Filesystem-manipulation helpers in `TestCodexHarness` delegate to this method.
+**Call relations**: `TestCodexHarness` file helpers call this so their code works with both local and remote execution environments.
 
 *Call graph*: calls 1 internal fn (environment); called by 8 (abs_path_exists, create_dir_all, read_file_text, remove_abs_path, write_file, create_workspace_directory, create_workspace_directory, write_workspace_file).
 
@@ -4917,11 +4931,11 @@ fn fs(&self) -> Arc<dyn ExecutorFileSystem>
 async fn submit_turn(&self, prompt: &str) -> Result<()>
 ```
 
-**Purpose**: Submits a user turn with approvals disabled and the `Disabled` permission profile, then waits for completion.
+**Purpose**: Submits a user prompt with permissions disabled and waits for the turn to finish. This is the simplest way for tests to ask Codex something.
 
-**Data flow**: It takes a prompt string, delegates to `submit_turn_with_permission_profile(prompt, PermissionProfile::Disabled)`, awaits it, and returns the result.
+**Data flow**: It receives prompt text and passes it to `submit_turn_with_permission_profile` using the disabled permission profile.
 
-**Call relations**: This is the simplest turn-submission helper and is used by `TestCodexHarness::submit`.
+**Call relations**: `TestCodexHarness::submit` calls this as its basic submit helper.
 
 *Call graph*: calls 1 internal fn (submit_turn_with_permission_profile); called by 1 (submit).
 
@@ -4936,11 +4950,11 @@ async fn submit_turn_with_permission_profile(
     ) -> Result<()>
 ```
 
-**Purpose**: Submits a user turn with a specific permission profile and no approval prompts, then waits for completion.
+**Purpose**: Submits a prompt with a chosen permission profile and no approval prompts. A permission profile describes what filesystem or command access is allowed.
 
-**Data flow**: It takes a prompt and `PermissionProfile`, delegates to `submit_turn_with_approval_and_permission_profile` with `AskForApproval::Never`, and returns the result.
+**Data flow**: It receives prompt text and a permission profile, pairs them with `AskForApproval::Never`, and delegates to the approval-aware helper.
 
-**Call relations**: This helper is used directly by tests and by the simpler `submit_turn` wrapper.
+**Call relations**: Used by the basic submit path and by harness methods that need explicit permission profiles.
 
 *Call graph*: calls 1 internal fn (submit_turn_with_approval_and_permission_profile); called by 2 (submit_turn, submit_with_permission_profile).
 
@@ -4955,11 +4969,11 @@ async fn submit_turn_with_policy(
     ) -> Result<()>
 ```
 
-**Purpose**: Submits a user turn using an explicit legacy `SandboxPolicy` and no approval prompts, then waits for completion.
+**Purpose**: Submits a prompt using an explicit sandbox policy and no approval prompts. A sandbox policy is the set of restrictions placed on code or shell execution.
 
-**Data flow**: It takes a prompt and sandbox policy, delegates to `submit_turn_with_policies(prompt, AskForApproval::Never, sandbox_policy)`, and returns the result.
+**Data flow**: It receives prompt text and a sandbox policy, adds `AskForApproval::Never`, and delegates to `submit_turn_with_policies`.
 
-**Call relations**: This is the legacy-policy convenience wrapper used by harness methods and tests.
+**Call relations**: `TestCodexHarness::submit_with_policy` calls this for tests that still express permissions in legacy sandbox terms.
 
 *Call graph*: calls 1 internal fn (submit_turn_with_policies); called by 1 (submit_with_policy).
 
@@ -4974,11 +4988,11 @@ async fn submit_turn_with_service_tier(
     ) -> Result<()>
 ```
 
-**Purpose**: Submits a user turn while overriding the service tier in thread settings.
+**Purpose**: Submits a prompt while overriding the requested service tier. Tests use this to check how tier settings are passed into model requests.
 
-**Data flow**: It takes a prompt and optional service-tier string, wraps the tier as `Option<Option<String>>`, delegates to `submit_turn_with_permission_profile_context` with approvals disabled, `PermissionProfile::Disabled`, and no explicit environments, and returns the result.
+**Data flow**: It receives prompt text and an optional tier string, wraps the tier in the thread-settings shape, uses disabled permissions and no approval, and delegates to the context submitter.
 
-**Call relations**: Tests use this when asserting service-tier propagation into outbound requests.
+**Call relations**: This is a specialized submit helper that funnels into `submit_turn_with_permission_profile_context`.
 
 *Call graph*: calls 1 internal fn (submit_turn_with_permission_profile_context).
 
@@ -4994,11 +5008,11 @@ async fn submit_turn_with_policies(
     ) -> Result<()>
 ```
 
-**Purpose**: Submits a user turn using explicit approval and sandbox policies, deriving the corresponding permission profile from the sandbox policy.
+**Purpose**: Submits a prompt with explicit approval and sandbox settings. It bridges old sandbox-policy settings into the newer permission-profile field.
 
-**Data flow**: It takes a prompt, `AskForApproval`, and `SandboxPolicy`, derives `PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox_policy, self.config.cwd.as_path())`, then delegates to `submit_turn_with_context` with no service tier or explicit environments.
+**Data flow**: It receives prompt text, approval policy, and sandbox policy. It derives a permission profile from the sandbox policy for the configured cwd, then delegates to `submit_turn_with_context`.
 
-**Call relations**: This helper bridges legacy sandbox-policy tests into the common turn-submission path.
+**Call relations**: `submit_turn_with_policy` calls this. The final send and wait logic lives in `submit_turn_with_context`.
 
 *Call graph*: calls 2 internal fn (submit_turn_with_context, from_legacy_sandbox_policy_for_cwd); called by 1 (submit_turn_with_policy).
 
@@ -5014,11 +5028,11 @@ async fn submit_turn_with_approval_and_permission_profile(
     ) -> Result<
 ```
 
-**Purpose**: Submits a user turn with explicit approval policy and permission profile, then waits for completion.
+**Purpose**: Submits a prompt with both an approval policy and a permission profile. Tests use this when they need to model approval-sensitive turns.
 
-**Data flow**: It takes a prompt, approval policy, and permission profile, delegates to `submit_turn_with_permission_profile_context` with no service tier or environments, and returns the result.
+**Data flow**: It receives the prompt, approval policy, and permission profile, then passes them on with no service tier or environment override.
 
-**Call relations**: This is the main explicit-permissions wrapper used by tests and by `submit_turn_with_permission_profile`.
+**Call relations**: It is called by `submit_turn_with_permission_profile` and by tests that need approval control. It delegates to `submit_turn_with_permission_profile_context`.
 
 *Call graph*: calls 1 internal fn (submit_turn_with_permission_profile_context); called by 2 (submit_turn_with_permission_profile, run_extract_turn).
 
@@ -5033,11 +5047,11 @@ async fn submit_turn_with_environments(
     ) -> Result<()>
 ```
 
-**Purpose**: Submits a user turn with explicit environment selections and default disabled permissions.
+**Purpose**: Submits a prompt while selecting specific execution environments for the turn. This is used to test local versus remote routing.
 
-**Data flow**: It takes a prompt and optional vector of `TurnEnvironmentSelection`, delegates to `submit_turn_with_permission_profile_context` with approvals disabled, `PermissionProfile::Disabled`, no service tier, and the provided environments.
+**Data flow**: It receives prompt text and optional environment selections, uses disabled permissions and no approval, and delegates to the context submitter.
 
-**Call relations**: Environment-routing tests use this helper to target specific execution environments.
+**Call relations**: Environment-routing tests call this; it funnels into the same final submit path as other helpers.
 
 *Call graph*: calls 1 internal fn (submit_turn_with_permission_profile_context); called by 1 (exec_command_routing_output).
 
@@ -5053,11 +5067,11 @@ async fn submit_turn_with_permission_profile_context(
         service_tier:
 ```
 
-**Purpose**: Shared wrapper that forwards prompt, approval policy, permission profile, optional service tier, and optional environments into the common submission path.
+**Purpose**: Combines permission, approval, optional service tier, and optional environment settings before the final submit. It is a small shared bridge for several public helpers.
 
-**Data flow**: It takes those parameters and delegates directly to `submit_turn_with_context`, awaiting and returning the result.
+**Data flow**: It receives all these turn options and passes them unchanged to `submit_turn_with_context`.
 
-**Call relations**: Several public submission helpers funnel through this method to avoid duplicating argument plumbing.
+**Call relations**: Several submit helpers call this so they do not each duplicate the final turn-building logic.
 
 *Call graph*: calls 1 internal fn (submit_turn_with_context); called by 3 (submit_turn_with_approval_and_permission_profile, submit_turn_with_environments, submit_turn_with_service_tier).
 
@@ -5073,11 +5087,11 @@ async fn submit_turn_with_context(
         service_tier: Option<Option<Stri
 ```
 
-**Purpose**: Constructs and submits `Op::UserInput` with the requested permissions, service tier, and environment selections, then waits for the matching turn to start and complete.
+**Purpose**: Sends a user turn to the live Codex thread and waits until that exact turn completes. This prevents tests from continuing while Codex is still working.
 
-**Data flow**: It takes prompt text, approval policy, permission profile, optional service tier override, and optional environment selections. It converts the permission profile via `turn_permission_fields`, captures the session model from `session_configured`, wraps explicit environments into `TurnEnvironmentSelections` rooted at `config.cwd`, submits `Op::UserInput` containing one `UserInput::Text` item and `ThreadSettingsOverrides` populated with environments, approval policy, sandbox policy, permission profile, service tier, and a default collaboration mode carrying the session model. After submission it waits for `EventMsg::TurnStarted` to obtain the `turn_id`, then waits up to `SUBMIT_TURN_COMPLETE_TIMEOUT` for `EventMsg::TurnComplete` with the same `turn_id`, and returns `Ok(())`.
+**Data flow**: It receives prompt text and turn settings, converts permission fields, builds a `UserInput` operation with text and thread-setting overrides, submits it to Codex, waits for a `TurnStarted` event to get the turn id, then waits for the matching `TurnComplete` event or timeout.
 
-**Call relations**: All public turn-submission helpers ultimately delegate here; it is the central synchronization point that turns asynchronous thread execution into a simple test API.
+**Call relations**: All submit helpers eventually call this. It uses `turn_permission_fields` for compatibility and test waiting helpers to synchronize with Codex events.
 
 *Call graph*: calls 1 internal fn (turn_permission_fields); called by 2 (submit_turn_with_permission_profile_context, submit_turn_with_policies); 4 external calls (default, wait_for_event_match, wait_for_event_with_timeout, vec!).
 
@@ -5088,11 +5102,11 @@ async fn submit_turn_with_context(
 async fn new() -> Result<Self>
 ```
 
-**Purpose**: Creates a default harness with a fresh mock server and the default `test_codex()` builder.
+**Purpose**: Creates a full default test harness with a mock server and default Codex builder. This is the fastest path for ordinary tests.
 
-**Data flow**: It constructs the default builder via `test_codex()`, delegates to `with_builder`, awaits the result, and returns the harness.
+**Data flow**: It creates the default builder through `test_codex` and passes it to `with_builder`, returning the finished harness.
 
-**Call relations**: This is the simplest harness constructor for tests that need no custom configuration.
+**Call relations**: Tests call this when they do not need custom configuration.
 
 *Call graph*: calls 1 internal fn (test_codex); 1 external calls (with_builder).
 
@@ -5103,11 +5117,11 @@ async fn new() -> Result<Self>
 async fn with_config(mutator: impl FnOnce(&mut Config) + Send + 'static) -> Result<Self>
 ```
 
-**Purpose**: Creates a harness using the default builder plus one caller-supplied config mutator.
+**Purpose**: Creates a harness after applying one config mutation. This is a convenient one-line setup for tests that only need to tweak config.
 
-**Data flow**: It builds `test_codex().with_config(mutator)`, delegates to `with_builder`, awaits it, and returns the harness.
+**Data flow**: It starts from `test_codex`, adds the provided config mutator, and delegates to `with_builder`.
 
-**Call relations**: This is a convenience constructor for one-off config tweaks without manually handling the builder.
+**Call relations**: Tests call this instead of manually creating a builder when only config differs.
 
 *Call graph*: calls 1 internal fn (test_codex); 1 external calls (with_builder).
 
@@ -5118,11 +5132,11 @@ async fn with_config(mutator: impl FnOnce(&mut Config) + Send + 'static) -> Resu
 async fn with_builder(mut builder: TestCodexBuilder) -> Result<Self>
 ```
 
-**Purpose**: Starts a default mock server, builds a `TestCodex` from the supplied builder, and returns both as a harness.
+**Purpose**: Creates a full harness from a prepared builder. It starts the mock model server and builds Codex against it.
 
-**Data flow**: It starts the server with `start_mock_server().await`, calls `builder.build(&server).await`, and returns `TestCodexHarness { server, test }`.
+**Data flow**: It starts a mock server, asks the builder to build a `TestCodex` using that server, and returns both bundled in a harness.
 
-**Call relations**: Most integration tests use this constructor after customizing a `TestCodexBuilder`.
+**Call relations**: Most harness constructors call this. Many tests use it directly after customizing `TestCodexBuilder`.
 
 *Call graph*: calls 2 internal fn (start_mock_server, build); called by 33 (assert_remote_manual_compact_request_parity, auto_remote_compact_failure_stops_agent_loop, auto_remote_compact_trims_function_call_history_to_fit_context_window, remote_compact_persists_replacement_history_in_rollout, remote_compact_replaces_history_for_followups, remote_compact_rewrites_multiple_trailing_function_call_outputs, remote_compact_runs_automatically, remote_compact_trim_estimate_uses_session_base_instructions, remote_compact_trims_function_call_history_to_fit_context_window, remote_compact_v2_accepts_additional_output_items_before_compaction (+15 more)).
 
@@ -5133,11 +5147,11 @@ async fn with_builder(mut builder: TestCodexBuilder) -> Result<Self>
 async fn with_remote_env_builder(mut builder: TestCodexBuilder) -> Result<Self>
 ```
 
-**Purpose**: Starts a default mock server and builds a `TestCodex` using the builder's remote-environment path.
+**Purpose**: Creates a harness using a builder that should run against a remote-capable test environment. It is the remote version of `with_builder`.
 
-**Data flow**: It starts the server, calls `builder.build_with_remote_env(&server).await`, and returns the harness.
+**Data flow**: It starts the mock server, asks the builder to build with a remote environment, and returns the server and test Codex together.
 
-**Call relations**: Remote-environment tests use this constructor instead of the local-only `with_builder`.
+**Call relations**: Remote apply-patch and remote execution tests call this.
 
 *Call graph*: calls 2 internal fn (start_mock_server, build_with_remote_env); called by 1 (apply_patch_harness_with).
 
@@ -5148,11 +5162,11 @@ async fn with_remote_env_builder(mut builder: TestCodexBuilder) -> Result<Self>
 fn server(&self) -> &MockServer
 ```
 
-**Purpose**: Returns the underlying wiremock server used by the harness.
+**Purpose**: Returns the mock server used by this harness. Tests use it to mount fake model responses or inspect requests.
 
-**Data flow**: It returns `&self.server`.
+**Data flow**: It returns a reference to the stored `MockServer`.
 
-**Call relations**: Tests use this to mount additional responses or inspect received requests directly.
+**Call relations**: Response-mounting helpers call this before configuring expected model-server behavior.
 
 *Call graph*: called by 6 (mount_apply_patch, mount_apply_patch_model_output, mount_legacy_compact_if_needed, mount_shell_responses, mount_shell_responses_with_timeout, run_tool_turn_on_harness).
 
@@ -5163,11 +5177,11 @@ fn server(&self) -> &MockServer
 fn test(&self) -> &TestCodex
 ```
 
-**Purpose**: Returns the underlying `TestCodex` instance.
+**Purpose**: Returns the underlying `TestCodex` object. This gives tests access to lower-level thread and config details.
 
-**Data flow**: It returns `&self.test`.
+**Data flow**: It returns a reference to the stored `TestCodex`.
 
-**Call relations**: Tests use this when they need lower-level access than the harness convenience methods provide.
+**Call relations**: Tests and helper functions call this when the harness convenience methods are not enough.
 
 *Call graph*: called by 3 (submit_without_wait_with_turn_permissions, rollout_path, run_tool_turn_on_harness).
 
@@ -5178,11 +5192,11 @@ fn test(&self) -> &TestCodex
 fn cwd(&self) -> &Path
 ```
 
-**Purpose**: Returns the configured cwd path from the harness's active config.
+**Purpose**: Returns the configured working directory as a normal path reference. This is useful for path assertions and setup code.
 
-**Data flow**: It returns `self.test.config.cwd.as_path()`.
+**Data flow**: It reads `test.config.cwd` and returns it as a path.
 
-**Call relations**: This is a convenience accessor for workspace-relative assertions.
+**Call relations**: Tests can call this directly when they need the root workspace path.
 
 
 ##### `TestCodexHarness::cwd_abs`  (lines 931–933)
@@ -5191,11 +5205,11 @@ fn cwd(&self) -> &Path
 fn cwd_abs(&self) -> AbsolutePathBuf
 ```
 
-**Purpose**: Returns the configured cwd as an `AbsolutePathBuf`.
+**Purpose**: Returns the configured working directory as an absolute-path wrapper. This keeps type safety for helpers that require absolute paths.
 
-**Data flow**: It clones `self.test.config.cwd` and returns it.
+**Data flow**: It clones the absolute cwd stored in the test config and returns it.
 
-**Call relations**: Tests use this when they need the project's absolute-path wrapper rather than a plain `&Path`.
+**Call relations**: Tests use this when building environment selections or filesystem paths that require `AbsolutePathBuf`.
 
 
 ##### `TestCodexHarness::path`  (lines 935–937)
@@ -5204,11 +5218,11 @@ fn cwd_abs(&self) -> AbsolutePathBuf
 fn path(&self, rel: impl AsRef<Path>) -> PathBuf
 ```
 
-**Purpose**: Builds a workspace-relative path under the configured cwd and returns it as `PathBuf`.
+**Purpose**: Builds a normal filesystem path inside the harness workspace. It is a convenience wrapper around `path_abs`.
 
-**Data flow**: It takes a relative path-like value, delegates to `path_abs`, converts the result into `PathBuf`, and returns it.
+**Data flow**: It receives a relative path, turns it into an absolute workspace path with `path_abs`, then converts that wrapper into a normal `PathBuf`.
 
-**Call relations**: This is the plain-`PathBuf` convenience wrapper around `path_abs`.
+**Call relations**: Tests call this when they need a standard path object.
 
 *Call graph*: calls 1 internal fn (path_abs).
 
@@ -5219,11 +5233,11 @@ fn path(&self, rel: impl AsRef<Path>) -> PathBuf
 fn path_abs(&self, rel: impl AsRef<Path>) -> AbsolutePathBuf
 ```
 
-**Purpose**: Builds a workspace-relative path under the configured cwd and returns it as `AbsolutePathBuf`.
+**Purpose**: Builds an absolute path inside the harness workspace. This is the base path helper used by file operations.
 
-**Data flow**: It takes a relative path-like value, joins it onto `self.test.config.cwd`, and returns the resulting absolute path wrapper.
+**Data flow**: It receives a relative path and joins it to the configured cwd, returning an `AbsolutePathBuf`.
 
-**Call relations**: Filesystem helpers use this to resolve relative paths before converting them to `PathUri`.
+**Call relations**: `path`, `write_file`, `read_file_text`, `create_dir_all`, and `path_exists` call this.
 
 *Call graph*: called by 5 (create_dir_all, path, path_exists, read_file_text, write_file).
 
@@ -5238,11 +5252,11 @@ async fn write_file(
     ) -> Result<()>
 ```
 
-**Purpose**: Creates parent directories as needed and writes bytes to a workspace-relative file through the executor filesystem abstraction.
+**Purpose**: Writes a file into the test workspace through the executor filesystem. It works for both local and remote workspaces.
 
-**Data flow**: It resolves the absolute path with `path_abs`, creates the parent directory via `fs().create_directory` if one exists, converts the file path to `PathUri`, writes the provided bytes with `fs().write_file`, and returns `Result<()>`.
+**Data flow**: It receives a relative path and bytes, computes the absolute path, creates the parent directory if needed, converts paths to URIs, and writes the file contents through `TestCodex::fs`.
 
-**Call relations**: Tests use this helper to seed workspace files in a way that works for both local and remote executor environments.
+**Call relations**: Tests call this to seed workspace files before submitting prompts. It uses `path_abs` and the environment filesystem.
 
 *Call graph*: calls 3 internal fn (fs, path_abs, from_path); 1 external calls (as_ref).
 
@@ -5253,11 +5267,11 @@ async fn write_file(
 async fn read_file_text(&self, rel: impl AsRef<Path>) -> Result<String>
 ```
 
-**Purpose**: Reads a workspace-relative file as text through the executor filesystem abstraction.
+**Purpose**: Reads a UTF-8 text file from the test workspace through the executor filesystem. It hides whether the workspace is local or remote.
 
-**Data flow**: It resolves the absolute path with `path_abs`, converts it to `PathUri`, calls `fs().read_file_text`, and returns the resulting `String`.
+**Data flow**: It receives a relative path, computes its absolute path, converts it to a URI, reads text through the filesystem, and returns the string.
 
-**Call relations**: This complements `write_file` for assertions on workspace contents.
+**Call relations**: Tests call this after Codex actions to verify file contents.
 
 *Call graph*: calls 3 internal fn (fs, path_abs, from_path).
 
@@ -5268,11 +5282,11 @@ async fn read_file_text(&self, rel: impl AsRef<Path>) -> Result<String>
 async fn create_dir_all(&self, rel: impl AsRef<Path>) -> Result<()>
 ```
 
-**Purpose**: Creates a workspace-relative directory tree through the executor filesystem abstraction.
+**Purpose**: Creates a directory and any missing parent directories inside the test workspace. This mirrors the common `mkdir -p` behavior.
 
-**Data flow**: It resolves the absolute path with `path_abs`, converts it to `PathUri`, calls `fs().create_directory` with `recursive: true`, and returns `Result<()>`.
+**Data flow**: It receives a relative path, converts the absolute workspace path to a URI, and asks the executor filesystem to create it recursively.
 
-**Call relations**: Tests use this to prepare directory structures in local or remote workspaces.
+**Call relations**: Tests use this for workspace setup before running Codex.
 
 *Call graph*: calls 3 internal fn (fs, path_abs, from_path).
 
@@ -5283,11 +5297,11 @@ async fn create_dir_all(&self, rel: impl AsRef<Path>) -> Result<()>
 async fn path_exists(&self, rel: impl AsRef<Path>) -> Result<bool>
 ```
 
-**Purpose**: Checks whether a workspace-relative path exists.
+**Purpose**: Checks whether a relative workspace path exists. It is a convenience wrapper around the absolute-path version.
 
-**Data flow**: It resolves the path with `path_abs`, delegates to `abs_path_exists`, and returns the boolean result.
+**Data flow**: It receives a relative path, converts it to an absolute workspace path, and delegates to `abs_path_exists`.
 
-**Call relations**: This is the relative-path convenience wrapper around `abs_path_exists`.
+**Call relations**: Tests call this for simple existence checks after Codex actions.
 
 *Call graph*: calls 2 internal fn (abs_path_exists, path_abs).
 
@@ -5298,11 +5312,11 @@ async fn path_exists(&self, rel: impl AsRef<Path>) -> Result<bool>
 async fn remove_abs_path(&self, path: &AbsolutePathBuf) -> Result<()>
 ```
 
-**Purpose**: Removes an absolute path through the executor filesystem abstraction using forceful non-recursive removal.
+**Purpose**: Removes a specific absolute path through the executor filesystem. It uses force mode but does not request recursive removal.
 
-**Data flow**: It converts the `AbsolutePathBuf` to `PathUri`, calls `fs().remove` with `RemoveOptions { recursive: false, force: true }`, and returns `Result<()>`.
+**Data flow**: It receives an absolute path, converts it to a path URI, asks the filesystem to remove it, and returns success or an error.
 
-**Call relations**: Tests use this to delete files or links in a transport-agnostic way.
+**Call relations**: Tests use this when they need to delete a known absolute file or directory path.
 
 *Call graph*: calls 2 internal fn (fs, from_abs_path).
 
@@ -5313,11 +5327,11 @@ async fn remove_abs_path(&self, path: &AbsolutePathBuf) -> Result<()>
 async fn abs_path_exists(&self, path: &AbsolutePathBuf) -> Result<bool>
 ```
 
-**Purpose**: Checks whether an absolute path exists through the executor filesystem abstraction, treating `NotFound` as `false`.
+**Purpose**: Checks whether an absolute path exists through the executor filesystem. It treats "not found" as `false` and other errors as real failures.
 
-**Data flow**: It converts the path to `PathUri`, calls `fs().get_metadata`, returns `Ok(true)` on success, `Ok(false)` when the I/O error kind is `NotFound`, and propagates other errors.
+**Data flow**: It receives an absolute path, asks the filesystem for metadata, returns `true` on success, `false` on not-found, or an error for anything else.
 
-**Call relations**: This is the underlying existence check used by `path_exists`.
+**Call relations**: `path_exists` delegates to this after building an absolute path.
 
 *Call graph*: calls 2 internal fn (fs, from_abs_path); called by 1 (path_exists).
 
@@ -5328,11 +5342,11 @@ async fn abs_path_exists(&self, path: &AbsolutePathBuf) -> Result<bool>
 async fn submit(&self, prompt: &str) -> Result<()>
 ```
 
-**Purpose**: Submits a prompt through the underlying `TestCodex` and boxes the future to keep caller async state small.
+**Purpose**: Submits a prompt through the harness and waits for Codex to finish the turn. It is the harness-level version of the basic submit helper.
 
-**Data flow**: It takes a prompt string, boxes `self.test.submit_turn(prompt)`, awaits it, and returns the result.
+**Data flow**: It receives prompt text, calls `TestCodex::submit_turn`, boxes the future to keep caller async state smaller, and returns the result.
 
-**Call relations**: This is the harness-level convenience wrapper around the default turn-submission path.
+**Call relations**: Tests commonly call this after mounting mock responses on the server.
 
 *Call graph*: calls 1 internal fn (submit_turn); 1 external calls (pin).
 
@@ -5347,11 +5361,11 @@ async fn submit_with_policy(
     ) -> Result<()>
 ```
 
-**Purpose**: Submits a prompt with an explicit sandbox policy through the underlying `TestCodex`.
+**Purpose**: Submits a prompt with a specific sandbox policy through the harness. This lets tests check behavior under different execution restrictions.
 
-**Data flow**: It takes a prompt and `SandboxPolicy`, delegates to `self.test.submit_turn_with_policy`, awaits it, and returns the result.
+**Data flow**: It receives prompt text and a sandbox policy, passes them to `TestCodex::submit_turn_with_policy`, and returns the result.
 
-**Call relations**: This is the harness-level wrapper for legacy-policy turn submission.
+**Call relations**: Policy-sensitive tests call this instead of the default `submit`.
 
 *Call graph*: calls 1 internal fn (submit_turn_with_policy).
 
@@ -5366,11 +5380,11 @@ async fn submit_with_permission_profile(
     ) -> Result<()>
 ```
 
-**Purpose**: Submits a prompt with an explicit permission profile through the underlying `TestCodex`.
+**Purpose**: Submits a prompt with a specific permission profile through the harness. This uses the newer permission-profile form of access control.
 
-**Data flow**: It takes a prompt and `PermissionProfile`, delegates to `self.test.submit_turn_with_permission_profile`, awaits it, and returns the result.
+**Data flow**: It receives prompt text and a permission profile, passes them to `TestCodex::submit_turn_with_permission_profile`, and returns the result.
 
-**Call relations**: This is the harness-level wrapper for permission-profile turn submission.
+**Call relations**: Tests that care about permission profiles call this convenience method.
 
 *Call graph*: calls 1 internal fn (submit_turn_with_permission_profile).
 
@@ -5381,11 +5395,11 @@ async fn submit_with_permission_profile(
 async fn request_bodies(&self) -> Vec<Value>
 ```
 
-**Purpose**: Returns parsed JSON bodies for all `/responses` requests received by the harness's wiremock server.
+**Purpose**: Collects JSON bodies of model requests sent to the mock `/responses` endpoint. Tests use this to inspect exactly what Codex sent to the model server.
 
-**Data flow**: It builds a path matcher for `.*/responses$`, fetches all received requests from the server, filters them by path, parses each body as `serde_json::Value`, and returns the vector of bodies.
+**Data flow**: It asks the mock server for received requests, filters to paths ending in `/responses`, parses each request body as JSON, and returns the list.
 
-**Call relations**: Higher-level output-inspection helpers use this to search across all outbound response requests.
+**Call relations**: Output-inspection helpers call this before searching for function-call or custom-tool results.
 
 *Call graph*: called by 2 (custom_tool_call_output, function_call_output_value); 2 external calls (received_requests, path_regex).
 
@@ -5396,11 +5410,11 @@ async fn request_bodies(&self) -> Vec<Value>
 async fn function_call_output_value(&self, call_id: &str) -> Value
 ```
 
-**Purpose**: Finds the full `function_call_output` item for a given `call_id` across captured request bodies.
+**Purpose**: Finds the JSON output sent for a specific function-call id. Tests use it to assert tool results included in later model requests.
 
-**Data flow**: It fetches `request_bodies().await`, delegates to the free helper `function_call_output(&bodies, call_id)`, clones the matched `Value`, and returns it.
+**Data flow**: It loads all request bodies, searches them with `function_call_output`, clones the matching JSON value, and returns it.
 
-**Call relations**: This helper underlies `function_call_stdout` and supports tests that need the full output item.
+**Call relations**: `function_call_stdout` calls this when it only needs the text stored under the `output` field.
 
 *Call graph*: calls 2 internal fn (request_bodies, function_call_output); called by 1 (function_call_stdout).
 
@@ -5411,11 +5425,11 @@ async fn function_call_output_value(&self, call_id: &str) -> Value
 async fn function_call_stdout(&self, call_id: &str) -> String
 ```
 
-**Purpose**: Extracts the string `output` field from a captured `function_call_output` item.
+**Purpose**: Returns the text output for a specific function-call id. It is a shortcut for the common case where the function output has an `output` string.
 
-**Data flow**: It obtains the full output item via `function_call_output_value(call_id).await`, reads its `output` field as a string, clones it, and returns it.
+**Data flow**: It gets the matching function-call output value, extracts its `output` field as a string, and returns that string.
 
-**Call relations**: Tests use this when function-call outputs are expected to be plain strings.
+**Call relations**: Tests call this when verifying command stdout or similar function-call output.
 
 *Call graph*: calls 1 internal fn (function_call_output_value).
 
@@ -5426,11 +5440,11 @@ async fn function_call_stdout(&self, call_id: &str) -> String
 async fn custom_tool_call_output(&self, call_id: &str) -> String
 ```
 
-**Purpose**: Extracts normalized text from a captured `custom_tool_call_output` item for a given `call_id`.
+**Purpose**: Returns the text output for a specific custom-tool call id. Custom tools are nonstandard tool calls such as apply-patch style actions.
 
-**Data flow**: It fetches `request_bodies().await`, delegates to `custom_tool_call_output_text(&bodies, call_id)`, and returns the resulting string.
+**Data flow**: It loads request bodies, passes them to `custom_tool_call_output_text`, and returns the extracted text.
 
-**Call relations**: This helper is the harness-level accessor for custom tool outputs and underlies `apply_patch_output`.
+**Call relations**: `apply_patch_output` delegates to this because apply-patch output is represented as custom-tool output.
 
 *Call graph*: calls 2 internal fn (request_bodies, custom_tool_call_output_text); called by 1 (apply_patch_output).
 
@@ -5441,11 +5455,11 @@ async fn custom_tool_call_output(&self, call_id: &str) -> String
 async fn apply_patch_output(&self, call_id: &str) -> String
 ```
 
-**Purpose**: Returns the text output of an `apply_patch` custom tool call.
+**Purpose**: Returns the output text for an apply-patch call. It is a named convenience method for tests focused on patch behavior.
 
-**Data flow**: It delegates to `custom_tool_call_output(call_id).await` and returns the string.
+**Data flow**: It receives a call id and delegates to `custom_tool_call_output`.
 
-**Call relations**: This is a semantic alias used by patch-related tests.
+**Call relations**: Apply-patch tests call this to check what Codex reported back to the model.
 
 *Call graph*: calls 1 internal fn (custom_tool_call_output).
 
@@ -5456,11 +5470,11 @@ async fn apply_patch_output(&self, call_id: &str) -> String
 fn custom_tool_call_output(bodies: &'a [Value], call_id: &str) -> &'a Value
 ```
 
-**Purpose**: Searches parsed request bodies for the `custom_tool_call_output` item matching a given `call_id` and returns it by reference.
+**Purpose**: Searches request-body JSON for the custom-tool output item with a given call id. It panics with a clear message if the expected item is absent.
 
-**Data flow**: It takes a slice of JSON bodies and `call_id`, iterates each body's `input` array, finds the first item with `type == "custom_tool_call_output"` and matching `call_id`, and returns `&Value`, panicking with a descriptive message if absent.
+**Data flow**: It receives a slice of JSON request bodies and a call id, walks each body's `input` array, finds an item whose type is `custom_tool_call_output` and whose `call_id` matches, and returns that JSON item by reference.
 
-**Call relations**: This free helper is used by `custom_tool_call_output_text` and the harness-level custom-tool output accessors.
+**Call relations**: `custom_tool_call_output_text` calls this before extracting the actual output text.
 
 *Call graph*: called by 1 (custom_tool_call_output_text); 2 external calls (iter, format!).
 
@@ -5471,11 +5485,11 @@ fn custom_tool_call_output(bodies: &'a [Value], call_id: &str) -> &'a Value
 fn custom_tool_call_output_text(bodies: &[Value], call_id: &str) -> String
 ```
 
-**Purpose**: Extracts normalized text from a `custom_tool_call_output` item across parsed request bodies.
+**Purpose**: Extracts plain text from a custom-tool output item in model request bodies. It supports the output shape used by custom tool calls.
 
-**Data flow**: It takes request bodies and `call_id`, finds the item via `custom_tool_call_output`, reads its `output` field, normalizes it with `output_value_to_text`, and returns the resulting string, panicking if the output field is missing or non-textual.
+**Data flow**: It receives request bodies and a call id, finds the matching custom-tool item, reads its `output` field, converts that JSON value to text, and returns the text. If the field or text is missing, it panics with a targeted message.
 
-**Call relations**: This helper is used by `TestCodexHarness::custom_tool_call_output` and by local unit tests in this file.
+**Call relations**: Harness custom-tool helpers and the unit tests in this file call it.
 
 *Call graph*: calls 2 internal fn (output_value_to_text, custom_tool_call_output); called by 2 (custom_tool_call_output, custom_tool_call_output_text_panics_when_output_is_missing); 1 external calls (format!).
 
@@ -5486,11 +5500,11 @@ fn custom_tool_call_output_text(bodies: &[Value], call_id: &str) -> String
 fn function_call_output(bodies: &'a [Value], call_id: &str) -> &'a Value
 ```
 
-**Purpose**: Searches parsed request bodies for the `function_call_output` item matching a given `call_id` and returns it by reference.
+**Purpose**: Searches request-body JSON for a normal function-call output item with a given call id. It gives tests a direct reference to the matching JSON object.
 
-**Data flow**: It takes a slice of JSON bodies and `call_id`, iterates each body's `input` array, finds the first item with `type == "function_call_output"` and matching `call_id`, and returns `&Value`, panicking with a descriptive message if absent.
+**Data flow**: It receives request bodies and a call id, walks each body's `input` array, finds an item whose type is `function_call_output` and whose `call_id` matches, and returns that item by reference.
 
-**Call relations**: This free helper is used by `TestCodexHarness::function_call_output_value`.
+**Call relations**: `TestCodexHarness::function_call_output_value` calls this after collecting mock-server request bodies.
 
 *Call graph*: called by 1 (function_call_output_value); 2 external calls (iter, format!).
 
@@ -5501,11 +5515,11 @@ fn function_call_output(bodies: &'a [Value], call_id: &str) -> &'a Value
 fn test_codex() -> TestCodexBuilder
 ```
 
-**Purpose**: Constructs the default `TestCodexBuilder` used by most tests, with Apps disabled and dummy API-key auth.
+**Purpose**: Creates the default `TestCodexBuilder`. It sets sensible test defaults such as dummy API-key auth, no extensions, and the Apps feature disabled.
 
-**Data flow**: It returns a `TestCodexBuilder` initialized with one config mutator that disables `Feature::Apps`, `CodexAuth::from_api_key("dummy")`, empty hook/setup vectors, no home/cloud bundle/shell/exec override, an empty extension registry, and no custom user-instructions provider.
+**Data flow**: It constructs a builder with one config mutator that disables Apps, dummy auth, empty hook lists, no custom home or cloud bundle, no shell override, no executor URL, an empty extension registry, and no custom instructions provider.
 
-**Call relations**: Most harness constructors and tests start from this builder and then layer additional configuration on top.
+**Call relations**: Most tests and harness constructors start from this builder, then add only the differences they need.
 
 *Call graph*: calls 1 internal fn (from_api_key); called by 583 (fork_startup_context_then_first_turn_diff_snapshot, session_configured_reports_permission_profile_for_external_sandbox, apps_enabled_builder, search_capable_apps_builder, new, with_config, build_unified_exec_zsh_fork_test, build_zsh_fork_test, responses_stream_includes_turn_metadata_header_for_git_workspace_e2e, interrupt_long_running_tool_emits_turn_aborted (+15 more)); 2 external calls (empty_extension_registry, vec!).
 
@@ -5516,11 +5530,11 @@ fn test_codex() -> TestCodexBuilder
 fn custom_tool_call_output_text_returns_output_text()
 ```
 
-**Purpose**: Verifies that `custom_tool_call_output_text` returns a plain string output correctly.
+**Purpose**: Checks that `custom_tool_call_output_text` returns the expected text when a matching custom-tool output contains an `output` field.
 
-**Data flow**: It constructs a synthetic request-body vector containing one `custom_tool_call_output` item with string output, calls `custom_tool_call_output_text`, and asserts the returned string equals `hello`.
+**Data flow**: It builds a small fake request body with one custom-tool output item, calls the helper with its call id, and asserts the returned text is `hello`.
 
-**Call relations**: This unit test exercises the happy path of the custom-tool output extraction helper.
+**Call relations**: This is a unit test for the JSON-search helper in this same file.
 
 *Call graph*: 2 external calls (assert_eq!, vec!).
 
@@ -5531,24 +5545,24 @@ fn custom_tool_call_output_text_returns_output_text()
 fn custom_tool_call_output_text_panics_when_output_is_missing()
 ```
 
-**Purpose**: Verifies that `custom_tool_call_output_text` panics with the expected message when the output field is absent.
+**Purpose**: Checks that `custom_tool_call_output_text` fails with a useful panic message when the matching custom-tool item has no `output` field.
 
-**Data flow**: It constructs a synthetic request-body vector containing a `custom_tool_call_output` item without `output`, calls `custom_tool_call_output_text`, and relies on `#[should_panic]` to assert the panic message.
+**Data flow**: It builds a fake request body with a matching call id but no output, then calls the helper. The test expects a panic containing the missing-output message.
 
-**Call relations**: This unit test covers the failure path of the custom-tool output extraction helper.
+**Call relations**: This guards the helper's failure behavior so future changes keep the error message useful.
 
 *Call graph*: calls 1 internal fn (custom_tool_call_output_text); 1 external calls (vec!).
 
 
 ### `core/tests/common/test_codex_exec.rs`
 
-`orchestration` · `CLI test setup`
+`test` · `test setup and command execution`
 
-This file provides a minimal harness for CLI-style tests that execute the compiled `codex-exec` binary as a subprocess. `TestCodexExecBuilder` owns two `TempDir`s: one for `CODEX_HOME`/`CODEX_SQLITE_HOME` and one for the process working directory. The main method, `cmd`, resolves the `codex-exec` binary via `codex_utils_cargo_bin::cargo_bin`, constructs an `assert_cmd::Command`, sets the current directory to the temp cwd, and injects the standard environment variables expected by tests, including a dummy API key through `CODEX_API_KEY_ENV_VAR`.
+Tests that launch a real command-line program need a clean little world to run in. This file builds that world for `codex-exec`. It creates two temporary directories: one acts like the user’s home for Codex settings and database files, and the other acts like the current working folder where the command is run. That keeps tests isolated, like giving each test its own disposable desk instead of letting it write on the shared office table.
 
-`cmd_with_server` layers one additional runtime configuration override onto that command: it formats the mock server's `/v1` base URL and passes `-c openai_base_url=<quoted>` so the subprocess talks to the test server instead of any real endpoint. The quoting is handled by `toml_string_literal`, which serializes the URL with `serde_json::to_string`; this produces a correctly escaped quoted string suitable for TOML inline configuration syntax.
+The main piece is `TestCodexExecBuilder`. Its `cmd` method prepares an `assert_cmd::Command`, which is a testing tool for starting a program and checking what it prints or how it exits. The command is pointed at the compiled `codex-exec` binary, given the temporary working directory, and supplied with environment variables such as `CODEX_HOME`, `CODEX_SQLITE_HOME`, and a dummy API key.
 
-The remaining accessors expose the temp cwd and home paths for tests that need to seed files or inspect persisted state. `test_codex_exec` is the constructor that allocates both temp directories and returns a ready-to-use builder.
+Some tests also need `codex-exec` to talk to a fake HTTP server instead of the real OpenAI service. `cmd_with_server` adds a configuration override that points the command at a `wiremock` server. The helper also exposes the temporary paths so tests can inspect files afterward. Without this file, many tests would repeat fragile setup code and might accidentally depend on, or damage, real local state.
 
 #### Function details
 
@@ -5558,11 +5572,11 @@ The remaining accessors expose the temp cwd and home paths for tests that need t
 fn cmd(&self) -> assert_cmd::Command
 ```
 
-**Purpose**: Builds an `assert_cmd::Command` configured to run the `codex-exec` binary in isolated temp directories with dummy auth.
+**Purpose**: Builds a ready-to-run test command for the `codex-exec` binary. It sets the command’s working folder and environment so the program behaves as if it has its own private home and configuration area.
 
-**Data flow**: It resolves the `codex-exec` binary path, constructs `assert_cmd::Command::new(...)`, sets `current_dir` to `self.cwd.path()`, sets `CODEX_HOME`, `CODEX_SQLITE_HOME`, and `CODEX_API_KEY_ENV_VAR`, and returns the configured command.
+**Data flow**: It reads the builder’s temporary home and current-working-directory paths. It finds the compiled `codex-exec` binary, creates a command object for it, then attaches the temporary paths and a dummy API key as environment variables. The result is a command object that a test can add arguments to and then run.
 
-**Call relations**: This is the base subprocess-construction method; `cmd_with_server` builds on it to inject a mock server URL.
+**Call relations**: This is the basic command factory used by tests directly or indirectly. `TestCodexExecBuilder::cmd_with_server` starts by calling it, then adds extra settings for tests that need a fake server.
 
 *Call graph*: called by 1 (cmd_with_server); 3 external calls (path, new, cargo_bin).
 
@@ -5573,11 +5587,11 @@ fn cmd(&self) -> assert_cmd::Command
 fn cmd_with_server(&self, server: &MockServer) -> assert_cmd::Command
 ```
 
-**Purpose**: Builds a `codex-exec` command configured to talk to a specific mock server via an inline config override.
+**Purpose**: Builds a `codex-exec` test command that talks to a fake HTTP server instead of the normal API endpoint. This lets tests control the server responses and avoid real network calls.
 
-**Data flow**: It starts from `self.cmd()`, formats the server base URL as `<server.uri()>/v1`, serializes that URL with `toml_string_literal`, appends `-c openai_base_url=<quoted>` arguments, and returns the command.
+**Data flow**: It takes a `MockServer`, asks `cmd` for the standard isolated command, then builds a base URL from the mock server’s address with `/v1` added. It appends command-line configuration arguments that set `openai_base_url` to that mock URL. The output is the same kind of command object, but preconfigured to use the test server.
 
-**Call relations**: CLI tests that need remote API interactions use this wrapper instead of `cmd`.
+**Call relations**: It extends the setup done by `TestCodexExecBuilder::cmd`. Tests use it when they need to verify how `codex-exec` behaves while sending requests to a controlled fake server.
 
 *Call graph*: calls 1 internal fn (cmd); 1 external calls (format!).
 
@@ -5588,11 +5602,11 @@ fn cmd_with_server(&self, server: &MockServer) -> assert_cmd::Command
 fn cwd_path(&self) -> &Path
 ```
 
-**Purpose**: Returns the temporary working-directory path used by the subprocess.
+**Purpose**: Returns the temporary current working directory used by this test setup. Tests use this when they need to create input files before running `codex-exec` or inspect files afterward.
 
-**Data flow**: It returns `self.cwd.path()`.
+**Data flow**: It reads the builder’s temporary working-directory object and returns its filesystem path. It does not create, delete, or modify anything.
 
-**Call relations**: Tests use this to seed workspace files or inspect cwd-relative outputs.
+**Call relations**: This is a small access point for tests that need to interact with the command’s workspace. It supports the wider test flow by letting callers prepare or check the same folder that `cmd` uses as the command’s current directory.
 
 *Call graph*: 1 external calls (path).
 
@@ -5603,11 +5617,11 @@ fn cwd_path(&self) -> &Path
 fn home_path(&self) -> &Path
 ```
 
-**Purpose**: Returns the temporary home-directory path used by the subprocess.
+**Purpose**: Returns the temporary home directory used for Codex state in this test setup. Tests use it to check configuration, database, or rollout files without looking in a real user home directory.
 
-**Data flow**: It returns `self.home.path()`.
+**Data flow**: It reads the builder’s temporary home object and returns its filesystem path. Nothing is changed; it simply exposes the path for the test to use.
 
-**Call relations**: Tests use this to inspect persisted config, rollout, or database state under the isolated home.
+**Call relations**: This complements `cmd`, which passes this same path through environment variables. Tests can run the command and then use `home_path` to inspect whatever the command wrote into its isolated home.
 
 *Call graph*: 1 external calls (path).
 
@@ -5618,11 +5632,11 @@ fn home_path(&self) -> &Path
 fn toml_string_literal(value: &str) -> String
 ```
 
-**Purpose**: Serializes a string as a quoted literal suitable for embedding in TOML config override syntax.
+**Purpose**: Turns a plain string into a quoted string literal suitable for putting into a TOML configuration value. TOML is a common configuration-file format, and this avoids hand-writing quotes and escapes incorrectly.
 
-**Data flow**: It takes a string slice, serializes it with `serde_json::to_string`, and returns the resulting quoted/escaped `String`.
+**Data flow**: It receives a string value, serializes it using JSON string rules, and returns the quoted result. For ordinary strings, this produces the same kind of escaped text needed here for the command-line configuration override.
 
-**Call relations**: `cmd_with_server` uses this to safely embed the mock server URL in the `-c` override argument.
+**Call relations**: This helper is used by `TestCodexExecBuilder::cmd_with_server` when inserting the mock server URL into the `openai_base_url` configuration argument. It keeps that generated argument safe even if the URL contains characters that need quoting.
 
 *Call graph*: 1 external calls (to_string).
 
@@ -5633,10 +5647,10 @@ fn toml_string_literal(value: &str) -> String
 fn test_codex_exec() -> TestCodexExecBuilder
 ```
 
-**Purpose**: Constructs a fresh `TestCodexExecBuilder` with isolated temp home and cwd directories.
+**Purpose**: Creates a fresh `TestCodexExecBuilder` for a test. Each call gives the test its own temporary home and working directory.
 
-**Data flow**: It allocates two `TempDir`s, stores them in `TestCodexExecBuilder { home, cwd }`, and returns the builder.
+**Data flow**: It creates two new temporary directories: one for Codex home/state and one for the command’s working folder. It stores them in a `TestCodexExecBuilder` and returns that builder to the caller. The temporary directories live as long as the builder lives and are cleaned up afterward by the temporary-directory library.
 
-**Call relations**: CLI tests call this constructor first, then derive commands with `cmd` or `cmd_with_server`.
+**Call relations**: This is the main entry point used by many `codex-exec` tests. Those tests call it first, then use methods such as `cmd`, `cmd_with_server`, `cwd_path`, and `home_path` to prepare, run, and inspect isolated command executions.
 
 *Call graph*: called by 28 (accepts_add_dir_flag, accepts_multiple_add_dir_flags, exec_includes_workspace_agents_md_in_request, exec_prefers_workspace_agents_override_md, run_exec_with_auto_review_config, exec_uses_codex_api_key_env_var, does_not_persist_rollout_file_in_ephemeral_mode, persists_rollout_file_by_default, exec_hook_trust_bypass_runs_session_start_hook, exits_non_zero_when_required_mcp_server_fails_to_initialize (+15 more)); 1 external calls (new).

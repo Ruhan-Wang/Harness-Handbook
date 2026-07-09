@@ -1,8 +1,10 @@
 # App-server integration suites — transport, protocol contracts, and client connection behavior  `stage-23.1.4.2`
 
-This stage sits in the integration-test layer that exercises the app server as a live boundary between clients and upstream realtime services. Rather than unit-testing internals, it verifies the externally visible contracts around transport startup, connection lifetime, handshake metadata, and protocol gating across multiple features working together.
+This stage is a set of integration tests for the app server’s live client connections. It checks the “front door” behavior: how desktop clients connect, prove who they are, exchange messages, use realtime features, and disconnect. These tests sit around the main work loop, where the server is already running and must behave predictably while clients talk to it.
 
-connection_handling_websocket.rs is the core transport suite: it drives websocket sessions end to end and checks connection scoping, health endpoints, authentication variants, startup guardrails, and how loaded threads behave when clients reconnect. connection_handling_websocket_unix.rs extends that coverage on Unix by proving graceful shutdown and restart behavior when signals arrive during an active turn, using helpers that observe process exit and websocket disconnect timing. attestation.rs focuses on the handshake path, confirming that attestation is requested through JSON-RPC and then propagated into the websocket upgrade as the encoded x-oai-attestation header. experimental_api.rs enforces client-visible protocol contracts by rejecting experimental methods and fields unless explicitly opted into. realtime_conversation.rs ties the stage together with broad end-to-end coverage for realtime conversations across WebSocket and WebRTC, v1/v2 differences, sideband translation, and delegated background-agent turns.
+The WebSocket tests check the basic pipe between client and server. They make sure separate clients do not leak into each other, authentication is enforced, health checks work, and reconnecting clients can recover recent work. The Unix WebSocket shutdown tests add pressure: they send Ctrl-C-style signals while a request is active and confirm the server waits, exits fast on a second signal, and closes cleanly.
+
+The attestation test follows a proof token from the desktop client into the outgoing ChatGPT connection handshake. The experimental API test makes sure new features stay locked unless the client opts in. The realtime conversation tests cover the full live experience: text, audio, WebRTC setup, feature flags, handoffs to background agents, and expected error behavior.
 
 ## Files in this stage
 
@@ -11,13 +13,13 @@ These tests establish the core websocket transport behavior, then extend it with
 
 ### `app-server/tests/suite/v2/connection_handling_websocket.rs`
 
-`test` · `startup and request handling`
+`test` · `integration test run`
 
-This file serves two roles: it contains end-to-end websocket transport tests, and it exports a set of `pub(super)` helpers used by other v2 test modules. The tests launch the real `codex-app-server` binary as a subprocess with `--listen`, parse its bound websocket address from stderr, and then interact with it using `tokio_tungstenite`. The helper type alias `WsClient` standardizes the websocket stream type, while `DEFAULT_READ_TIMEOUT` is tuned for slower CI environments.
+This is an integration test file: it starts a real `codex-app-server` process, connects to it like an outside client would, sends JSON-RPC messages, and checks the replies. JSON-RPC is a simple request-and-response format where each request has a method name and an id so the response can be matched back to it. WebSocket is the long-lived network connection used to carry those messages.
 
-The transport tests cover per-connection request routing and initialization state, HTTP `/readyz` and `/healthz` served on the same listener, browser-origin rejection without auth, capability-token auth, signed short-lived bearer-token auth, startup rejection for too-short signing secrets, startup rejection for unauthenticated non-loopback listeners, and persistence of the last loaded thread across disconnect/reconnect until idle timeout. Authentication helpers build websocket handshake requests with optional `Authorization` and `Origin` headers, and `signed_bearer_token` constructs HS256 JWT-like tokens for the signed-bearer tests.
+The file exists to catch mistakes that only show up when the whole server is running. For example, two browser tabs might both use request id `77`; the server must reply to the right tab, not mix them up. A server bound to all network interfaces must not start without authentication, because that could expose a local control API to the network. Browser `Origin` headers and bearer tokens are also tested so unsafe connections are rejected.
 
-The helper layer includes subprocess spawning, retrying websocket and HTTP connection attempts until the listener is ready, JSON-RPC send/read utilities, silence assertions, and convenience wrappers for initialize, thread start, and loaded-thread listing. `read_jsonrpc_message` is careful about websocket control frames: it replies to pings with pongs, ignores pongs and raw frame variants, and treats close or binary frames as errors. `connectable_bind_addr` rewrites unspecified listener addresses like `0.0.0.0` or `::` to loopback equivalents so tests can connect reliably.
+The helper functions are like test tools on a workbench. Some create a temporary config file, start the server, and wait until it prints its bound address. Others open WebSockets, build authorized handshake requests, send JSON-RPC messages, read only the response with a chosen id, or confirm that no message arrived. Together, they let the tests describe real user-level behavior while hiding the repetitive plumbing.
 
 #### Function details
 
@@ -27,11 +29,11 @@ The helper layer includes subprocess spawning, retrying websocket and HTTP conne
 async fn websocket_transport_routes_per_connection_handshake_and_responses() -> Result<()>
 ```
 
-**Purpose**: Verifies websocket initialization and subsequent JSON-RPC responses are scoped to the connection that issued the request. It also checks that uninitialized connections receive `Not initialized` errors and that identical request ids on different sockets do not collide.
+**Purpose**: This test proves that each WebSocket connection has its own initialization state and its own request routing. It protects against a serious bug where one client could receive another client’s response or where request ids collide across connections.
 
-**Data flow**: Creates config and spawns the websocket server, opens two websocket clients, sends initialize on `ws1` and reads its response, asserts `ws2` receives no message, sends `config/read` on uninitialized `ws2` and reads an error with message `Not initialized`, initializes `ws2`, then sends `config/read` with id 77 on both sockets and reads separate responses from each. It asserts both responses carry id 77 and contain a `config` object, then kills the subprocess.
+**Data flow**: It creates a temporary server configuration, starts the app server, opens two WebSocket clients, and sends initialization and config-read requests on each one. It checks that connection one receives only its own initialize response, connection two gets a clear "Not initialized" error before it initializes, and both clients can safely use the same request id later. At the end it stops the spawned server process.
 
-**Call relations**: Invoked by the test harness. It relies heavily on the helper stack—`spawn_websocket_server`, `connect_websocket`, `send_initialize_request`, `send_config_read_request`, `read_response_for_id`, `read_error_for_id`, and `assert_no_message`—to express the transport-scoping contract.
+**Call relations**: This test is the top-level story. It relies on setup helpers such as `create_config_toml`, `spawn_websocket_server`, and `connect_websocket`, then uses message helpers like `send_initialize_request`, `send_config_read_request`, `read_response_for_id`, `read_error_for_id`, and `assert_no_message` to exercise the server.
 
 *Call graph*: calls 8 internal fn (assert_no_message, connect_websocket, create_config_toml, read_error_for_id, read_response_for_id, send_config_read_request, send_initialize_request, spawn_websocket_server); 6 external calls (from_millis, new, new, create_mock_responses_server_sequence_unchecked, assert!, assert_eq!).
 
@@ -42,11 +44,11 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> 
 async fn websocket_transport_serves_health_endpoints_on_same_listener() -> Result<()>
 ```
 
-**Purpose**: Checks that the websocket listener also serves HTTP health endpoints and still accepts websocket traffic. It validates listener multiplexing between HTTP and websocket protocols.
+**Purpose**: This test checks that the WebSocket listener also serves simple HTTP health endpoints. That matters because monitoring systems often ask `/readyz` or `/healthz` to decide whether a service is alive.
 
-**Data flow**: Creates config, spawns the websocket server, constructs a `reqwest::Client`, performs `GET /readyz` and `GET /healthz` via `http_get`, asserts both return `StatusCode::OK`, then opens a websocket connection, sends initialize, reads the response, asserts the id matches, and kills the subprocess.
+**Data flow**: It starts the app server, makes normal HTTP GET requests to `/readyz` and `/healthz`, and expects successful HTTP status codes. Then it also opens a WebSocket on the same address and initializes it, proving the same listener can serve both health checks and WebSocket traffic. Finally it kills the server process.
 
-**Call relations**: Run by the harness. It combines the HTTP retry helper `http_get` with the websocket helpers to prove both protocols are available on the same bound address.
+**Call relations**: The test calls `http_get` for the health-check side and `connect_websocket`, `send_initialize_request`, and `read_response_for_id` for the WebSocket side. `spawn_websocket_server` and `create_config_toml` provide the real server and its temporary configuration.
 
 *Call graph*: calls 7 internal fn (connect_websocket, create_config_toml, http_get, read_response_for_id, send_initialize_request, spawn_websocket_server, new); 4 external calls (new, new, create_mock_responses_server_sequence_unchecked, assert_eq!).
 
@@ -57,11 +59,11 @@ async fn websocket_transport_serves_health_endpoints_on_same_listener() -> Resul
 async fn websocket_transport_rejects_browser_origin_without_auth() -> Result<()>
 ```
 
-**Purpose**: Verifies that a browser-style `Origin` header from a non-loopback site is rejected when no websocket auth is configured. It protects the listener against unauthenticated browser-origin access.
+**Purpose**: This test confirms that an unauthenticated browser-style connection from an untrusted website is blocked. It protects users from a web page trying to control a local app server through the browser.
 
-**Data flow**: Starts the websocket server, first confirms a normal loopback websocket connection can initialize successfully, then drops that socket and attempts a new websocket handshake with `Origin: https://evil.example` and no bearer token. It expects an HTTP 403 rejection from `assert_websocket_connect_rejected_with_headers`, then kills the subprocess.
+**Data flow**: It first starts the server and proves that a normal loopback WebSocket client can initialize successfully. Then it tries a WebSocket handshake with an `Origin` header set to `https://evil.example` and no bearer token. The expected result is an HTTP forbidden rejection, after which the server is stopped.
 
-**Call relations**: Invoked by the harness. It uses a successful baseline connection before exercising the rejection path, and delegates the handshake-status assertion to `assert_websocket_connect_rejected_with_headers`.
+**Call relations**: The happy-path connection uses `connect_websocket`, `send_initialize_request`, and `read_response_for_id`. The unsafe browser-style attempt is delegated to `assert_websocket_connect_rejected_with_headers`, which builds the request and checks the rejection status.
 
 *Call graph*: calls 6 internal fn (assert_websocket_connect_rejected_with_headers, connect_websocket, create_config_toml, read_response_for_id, send_initialize_request, spawn_websocket_server); 4 external calls (new, new, create_mock_responses_server_sequence_unchecked, assert_eq!).
 
@@ -72,11 +74,11 @@ async fn websocket_transport_rejects_browser_origin_without_auth() -> Result<()>
 async fn websocket_transport_rejects_missing_and_invalid_capability_tokens() -> Result<()>
 ```
 
-**Purpose**: Checks capability-token authentication: missing or wrong bearer tokens must be rejected, while the configured token is accepted. It validates the token-file auth mode end to end.
+**Purpose**: This test checks the fixed bearer-token authentication mode. It proves that the server rejects clients with no token or the wrong token, while accepting the exact token from its configured token file.
 
-**Data flow**: Writes a token file containing `super-secret-token`, creates config, spawns the websocket server with `--ws-auth capability-token --ws-token-file <file>` on `ws://0.0.0.0:0`, attempts websocket connections with no token and with `wrong-token` and expects rejection, then connects with bearer token `super-secret-token`, sends initialize, reads the response, asserts the id, and kills the subprocess.
+**Data flow**: It writes a token file into a temporary app home, starts the server bound to `0.0.0.0` with capability-token authentication, and tries three connections. Missing token and wrong token both must be rejected. The correct token opens a WebSocket, sends initialize, receives the matching response, and then the test stops the server.
 
-**Call relations**: Called by the harness. It depends on `spawn_websocket_server_with_args` for auth-mode startup and on `assert_websocket_connect_rejected` / `connect_websocket_with_bearer` for the handshake checks.
+**Call relations**: The test starts the server through `spawn_websocket_server_with_args` because it needs custom authentication flags. It uses `assert_websocket_connect_rejected` for failed handshakes and `connect_websocket_with_bearer`, `send_initialize_request`, and `read_response_for_id` for the accepted client.
 
 *Call graph*: calls 6 internal fn (assert_websocket_connect_rejected, connect_websocket_with_bearer, create_config_toml, read_response_for_id, send_initialize_request, spawn_websocket_server_with_args); 6 external calls (new, new, create_mock_responses_server_sequence_unchecked, assert_eq!, write, vec!).
 
@@ -87,11 +89,11 @@ async fn websocket_transport_rejects_missing_and_invalid_capability_tokens() -> 
 async fn websocket_transport_verifies_signed_short_lived_bearer_tokens() -> Result<()>
 ```
 
-**Purpose**: Exercises signed bearer-token authentication with expiry, not-before, issuer, audience, and signature validation. It proves only correctly signed and timely tokens are accepted.
+**Purpose**: This test checks the signed bearer-token mode, where clients present short-lived tokens similar to JSON Web Tokens. It verifies that the server rejects expired, malformed, not-yet-valid, wrong-issuer, wrong-audience, and wrongly signed tokens, while accepting a valid one.
 
-**Data flow**: Writes a 32-byte shared secret file, creates config, spawns the websocket server with signed-bearer auth arguments including issuer, audience, and max clock skew, then generates several tokens with `signed_bearer_token`: expired, malformed, not-yet-valid, wrong issuer, wrong audience, wrong signature, and valid. It asserts all invalid tokens are rejected, connects successfully with the valid token, sends initialize, reads the response, asserts the id, and kills the subprocess.
+**Data flow**: It writes a shared signing secret, starts the server with signed-token settings, then creates several token strings with different claims and signatures. Each bad token is sent in a WebSocket handshake and must be rejected. A valid token is finally used to connect, send initialize, and read a successful response before the server is stopped.
 
-**Call relations**: Invoked by the harness. It uses `signed_bearer_token` to synthesize test credentials and `assert_websocket_connect_rejected` / `connect_websocket_with_bearer` to drive the handshake outcomes.
+**Call relations**: This test depends on `signed_bearer_token` to create test tokens. It uses `assert_websocket_connect_rejected` for the negative cases, then `connect_websocket_with_bearer`, `send_initialize_request`, and `read_response_for_id` to prove the valid token path works.
 
 *Call graph*: calls 7 internal fn (assert_websocket_connect_rejected, connect_websocket_with_bearer, create_config_toml, read_response_for_id, send_initialize_request, signed_bearer_token, spawn_websocket_server_with_args); 8 external calls (new, new, create_mock_responses_server_sequence_unchecked, assert_eq!, format!, json!, write, vec!).
 
@@ -102,11 +104,11 @@ async fn websocket_transport_verifies_signed_short_lived_bearer_tokens() -> Resu
 async fn websocket_transport_rejects_short_signed_bearer_secret_configuration() -> Result<()>
 ```
 
-**Purpose**: Checks server startup fails when signed-bearer auth is configured with a secret shorter than 32 bytes. This validates startup-time configuration hardening rather than handshake-time behavior.
+**Purpose**: This test confirms that the server refuses to start signed-token authentication with a signing secret that is too short. A weak secret would make tokens easier to forge, so startup must fail loudly.
 
-**Data flow**: Writes a too-short shared secret file and config, runs the websocket server to completion with signed-bearer auth arguments using `run_websocket_server_to_completion_with_args`, asserts the process exits unsuccessfully, decodes stderr as UTF-8, and asserts it contains `must be at least 32 bytes`.
+**Data flow**: It writes a too-short secret file, creates the normal temporary config, and runs the app server with signed-bearer-token flags until it exits. It expects a failed exit status and checks standard error for a message saying the secret must be at least 32 bytes.
 
-**Call relations**: Run by the harness as a startup validation test. It bypasses the normal spawn-and-connect helpers because the expected outcome is immediate process failure.
+**Call relations**: Unlike tests that keep the server running, this one uses `run_websocket_server_to_completion_with_args` because failure during startup is the expected behavior. `create_config_toml` supplies the rest of the needed app configuration.
 
 *Call graph*: calls 2 internal fn (create_config_toml, run_websocket_server_to_completion_with_args); 6 external calls (from_utf8, new, new, create_mock_responses_server_sequence_unchecked, assert!, write).
 
@@ -117,11 +119,11 @@ async fn websocket_transport_rejects_short_signed_bearer_secret_configuration() 
 async fn websocket_transport_rejects_unauthenticated_non_loopback_startup() -> Result<()>
 ```
 
-**Purpose**: Verifies the server refuses to start a non-loopback websocket listener without authentication. It enforces a startup safety invariant for exposed listeners.
+**Purpose**: This test checks a safety rule: the server must not listen on all network interfaces without WebSocket authentication. Without this guard, a machine could accidentally expose the app server to other devices.
 
-**Data flow**: Creates config, runs the websocket server to completion with listen URL `ws://0.0.0.0:0` and no auth args, asserts the process exits unsuccessfully, decodes stderr, and checks it contains `refusing to start non-loopback websocket listener`.
+**Data flow**: It creates a temporary config and tries to run the server at `ws://0.0.0.0:0` without auth flags. The server is expected to exit unsuccessfully, and the test checks that standard error explains it refused to start a non-loopback unauthenticated listener.
 
-**Call relations**: Invoked by the harness. Like the short-secret test, it uses `run_websocket_server_to_completion_with_args` because the expected behavior is startup failure before any client connects.
+**Call relations**: The test uses `run_websocket_server_to_completion_with_args` because the intended outcome is an immediate startup failure. It uses `create_config_toml` only to make the app otherwise startable, so the failure is clearly about listener safety.
 
 *Call graph*: calls 2 internal fn (create_config_toml, run_websocket_server_to_completion_with_args); 5 external calls (from_utf8, new, new, create_mock_responses_server_sequence_unchecked, assert!).
 
@@ -132,11 +134,11 @@ async fn websocket_transport_rejects_unauthenticated_non_loopback_startup() -> R
 async fn websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_timeout() -> Result<()>
 ```
 
-**Purpose**: Checks that after a websocket client disconnects, its last loaded thread remains visible to a reconnecting client until the server’s idle timeout expires. It validates temporary retention of loaded-thread state across reconnects.
+**Purpose**: This test checks reconnect behavior for loaded threads. It proves that when a client disconnects, the thread it had loaded does not disappear immediately, giving a reconnecting client time to find it again.
 
-**Data flow**: Creates config and spawns the websocket server, connects `ws1`, initializes it, starts a thread, asserts the loaded-thread list contains that thread, closes `ws1`, connects `ws2`, initializes it, and repeatedly requests loaded threads until the same thread id appears. It then kills the subprocess.
+**Data flow**: It starts the server, connects client one, initializes it, starts a thread, and checks that the thread is listed as loaded. It then closes client one, opens client two, initializes it, and repeatedly asks for the loaded thread list until the same thread appears. The server process is killed at the end.
 
-**Call relations**: Called by the harness. It uses `start_thread`, `assert_loaded_threads`, and `wait_for_loaded_threads` to express the before-disconnect and after-reconnect observations.
+**Call relations**: The test combines connection helpers with thread helpers: `start_thread` creates the thread, `assert_loaded_threads` checks the first client’s view, and `wait_for_loaded_threads` polls from the reconnecting client until the expected state appears.
 
 *Call graph*: calls 8 internal fn (assert_loaded_threads, connect_websocket, create_config_toml, read_response_for_id, send_initialize_request, spawn_websocket_server, start_thread, wait_for_loaded_threads); 3 external calls (new, new, create_mock_responses_server_sequence_unchecked).
 
@@ -147,11 +149,11 @@ async fn websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_tim
 async fn spawn_websocket_server(codex_home: &Path) -> Result<(Child, SocketAddr)>
 ```
 
-**Purpose**: Starts the app-server websocket listener on loopback with default arguments and returns the child process plus bound socket address. It is the common subprocess launcher used by websocket-based tests.
+**Purpose**: This helper starts the app server with the normal test WebSocket address, limited to local connections. Tests use it when they do not need special command-line authentication options.
 
-**Data flow**: Accepts a CODEX_HOME path and forwards it to `spawn_websocket_server_with_args` with listen URL `ws://127.0.0.1:0` and no extra args. It returns the spawned `tokio::process::Child` and parsed `SocketAddr`.
+**Data flow**: It receives the temporary `CODEX_HOME` path and passes it to the more flexible server-spawning helper with `ws://127.0.0.1:0`, meaning "bind to localhost on any free port." It returns the child process handle and the actual socket address printed by the server.
 
-**Call relations**: Used by tests in this file and by other modules such as command-exec and Unix signal-handling tests. It is a thin convenience wrapper over `spawn_websocket_server_with_args`.
+**Call relations**: Many tests call this as the simple startup path. It immediately hands off to `spawn_websocket_server_with_args`, which performs the real process launch and address detection.
 
 *Call graph*: calls 1 internal fn (spawn_websocket_server_with_args); called by 8 (command_exec_process_ids_are_connection_scoped_and_disconnect_terminates_process, websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_timeout, websocket_transport_rejects_browser_origin_without_auth, websocket_transport_routes_per_connection_handshake_and_responses, websocket_transport_serves_health_endpoints_on_same_listener, start_ctrl_c_restart_fixture, thread_name_updated_broadcasts_for_loaded_threads, thread_name_updated_broadcasts_for_not_loaded_threads).
 
@@ -166,11 +168,11 @@ async fn spawn_websocket_server_with_args(
 ) -> Result<(Child, SocketAddr)>
 ```
 
-**Purpose**: Launches the real `codex-app-server` binary with websocket listener arguments, waits until it reports its bound address on stderr, and returns the running child plus parsed socket address. It is the core subprocess bootstrap helper for websocket integration tests.
+**Purpose**: This helper launches a real `codex-app-server` process and waits until it reports the WebSocket address it bound to. It is the main bridge between the test code and the real server binary.
 
-**Data flow**: Builds a `tokio::process::Command` for the cargo-built `codex-app-server`, adds `--listen`, disables plugin startup tasks, appends extra args, nulls stdin/stdout, pipes stderr, sets `CODEX_HOME` and `RUST_LOG`, and spawns the child with `kill_on_drop(true)`. It then reads stderr lines through `BufReader::lines()` until timeout, strips ANSI escape sequences from each line, scans whitespace tokens for a `ws://<addr>` prefix, parses the first valid `SocketAddr`, spawns a background task to continue echoing remaining stderr lines, and returns `(process, bind_addr)`.
+**Data flow**: It takes a config directory, listen URL, and extra command-line arguments. It builds a command with the right environment, starts the process, reads its standard error line by line, strips terminal color codes, and searches for a `ws://host:port` token. Once found, it keeps printing later stderr lines in the background and returns the process plus bind address.
 
-**Call relations**: Called directly by auth-related tests and indirectly through `spawn_websocket_server`. Other modules reuse it when they need a real websocket listener with custom auth flags.
+**Call relations**: Simple startup goes through `spawn_websocket_server`, while authentication tests call this directly to add flags. The returned address is then used by connection helpers such as `connect_websocket_with_bearer` and `http_get`.
 
 *Call graph*: called by 3 (spawn_websocket_server, websocket_transport_rejects_missing_and_invalid_capability_tokens, websocket_transport_verifies_signed_short_lived_bearer_tokens); 11 external calls (new, now, null, piped, with_capacity, new, cargo_bin, eprintln!, matches!, spawn (+1 more)).
 
@@ -181,11 +183,11 @@ async fn spawn_websocket_server_with_args(
 async fn connect_websocket(bind_addr: SocketAddr) -> Result<WsClient>
 ```
 
-**Purpose**: Connects to the websocket listener without authentication. It is the default client constructor for tests that do not need bearer tokens.
+**Purpose**: This helper opens a WebSocket connection without an authorization token. It is used for tests where local unauthenticated access is expected to be allowed.
 
-**Data flow**: Accepts a bound socket address and forwards it to `connect_websocket_with_bearer` with `None` for the bearer token. It returns an established `WsClient`.
+**Data flow**: It receives the server bind address and passes it to `connect_websocket_with_bearer` with no token. The output is an open WebSocket stream ready to send and receive JSON-RPC messages.
 
-**Call relations**: Used throughout this file and by sibling test modules. It is a convenience wrapper over the more general authenticated connector.
+**Call relations**: Most happy-path tests use this small wrapper. It delegates all connection retry and request-building work to `connect_websocket_with_bearer`.
 
 *Call graph*: calls 1 internal fn (connect_websocket_with_bearer); called by 8 (command_exec_process_ids_are_connection_scoped_and_disconnect_terminates_process, websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_timeout, websocket_transport_rejects_browser_origin_without_auth, websocket_transport_routes_per_connection_handshake_and_responses, websocket_transport_serves_health_endpoints_on_same_listener, start_ctrl_c_restart_fixture, thread_name_updated_broadcasts_for_loaded_threads, thread_name_updated_broadcasts_for_not_loaded_threads).
 
@@ -199,11 +201,11 @@ async fn connect_websocket_with_bearer(
 ) -> Result<WsClient>
 ```
 
-**Purpose**: Attempts to establish a websocket connection, optionally with a bearer token, retrying until the listener is ready or the timeout expires. It normalizes unspecified bind addresses to loopback before connecting.
+**Purpose**: This helper opens a WebSocket connection, optionally adding a bearer token in the authorization header. It retries briefly because the server process may need a moment before it accepts connections.
 
-**Data flow**: Formats `ws://<connectable_bind_addr(bind_addr)>`, builds an HTTP websocket request with `websocket_request`, computes a deadline, and loops calling `connect_async(request.clone())`. On success it returns the websocket stream; on failure before the deadline it sleeps 50 ms and retries; after the deadline it returns an error describing the failed URL and last error.
+**Data flow**: It turns the bind address into a usable local address, builds a WebSocket handshake request with `websocket_request`, and repeatedly tries to connect until success or the default timeout. On success it returns the open WebSocket stream; on timeout it reports a clear failure.
 
-**Call relations**: Called by `connect_websocket` and directly by auth tests. It depends on `websocket_request` for header construction and provides the retry behavior that hides listener startup races from callers.
+**Call relations**: Authentication tests call this directly with valid tokens. `connect_websocket` calls it with no token for normal local tests, and it relies on `websocket_request` to add headers correctly.
 
 *Call graph*: calls 1 internal fn (websocket_request); called by 3 (connect_websocket, websocket_transport_rejects_missing_and_invalid_capability_tokens, websocket_transport_verifies_signed_short_lived_bearer_tokens); 6 external calls (from_millis, now, bail!, format!, sleep, connect_async).
 
@@ -217,11 +219,11 @@ async fn assert_websocket_connect_rejected(
 ) -> Result<()>
 ```
 
-**Purpose**: Asserts that a websocket handshake is rejected with HTTP 401 Unauthorized when using the default no-origin rejection path. It is a small wrapper for auth rejection tests.
+**Purpose**: This helper checks that a WebSocket handshake is rejected with the normal unauthorized status. It keeps negative authentication tests short and clear.
 
-**Data flow**: Accepts a bind address and optional bearer token, then calls `assert_websocket_connect_rejected_with_headers` with no origin and expected status `StatusCode::UNAUTHORIZED`. It returns `Ok(())` only if the handshake fails with that status.
+**Data flow**: It receives a bind address and optional bearer token, then calls the more general rejection helper with no `Origin` header and an expected `401 Unauthorized` status. It returns success only if the rejection matches.
 
-**Call relations**: Used by the capability-token and signed-bearer-token tests. It delegates the actual handshake attempt and status inspection to `assert_websocket_connect_rejected_with_headers`.
+**Call relations**: Token-authentication tests call this for missing, invalid, expired, malformed, or otherwise unacceptable credentials. It delegates the actual handshake attempt to `assert_websocket_connect_rejected_with_headers`.
 
 *Call graph*: calls 1 internal fn (assert_websocket_connect_rejected_with_headers); called by 2 (websocket_transport_rejects_missing_and_invalid_capability_tokens, websocket_transport_verifies_signed_short_lived_bearer_tokens).
 
@@ -237,11 +239,11 @@ async fn assert_websocket_connect_rejected_with_headers(
 ) -> Result<()>
 ```
 
-**Purpose**: Attempts a websocket handshake with optional bearer token and origin header and asserts the server rejects it with a specific HTTP status. It distinguishes expected HTTP rejection from unexpected websocket or transport errors.
+**Purpose**: This helper attempts a WebSocket connection and expects the server to refuse it with a particular HTTP status. It is useful for checking security rules during the WebSocket handshake.
 
-**Data flow**: Builds a websocket URL from `connectable_bind_addr`, constructs a request with `websocket_request`, and calls `connect_async`. If the handshake unexpectedly succeeds it returns an error naming the received status; if it fails with `WsError::Http(response)` it asserts `response.status() == expected_status`; any other error is treated as an unexpected failure mode.
+**Data flow**: It builds a WebSocket request with optional bearer-token and origin headers, tries to connect, and then interprets the outcome. A successful connection is treated as a test failure. An HTTP rejection succeeds only if its status matches the expected status.
 
-**Call relations**: Called by `assert_websocket_connect_rejected` and directly by the browser-origin rejection test. It is the central assertion helper for negative handshake cases.
+**Call relations**: `assert_websocket_connect_rejected` uses this for standard unauthorized failures. The browser-origin test calls it directly because it needs to set an `Origin` header and expects `403 Forbidden`.
 
 *Call graph*: calls 1 internal fn (websocket_request); called by 2 (assert_websocket_connect_rejected, websocket_transport_rejects_browser_origin_without_auth); 4 external calls (assert_eq!, bail!, format!, connect_async).
 
@@ -256,11 +258,11 @@ async fn run_websocket_server_to_completion_with_args(
 ) -> Result<std::process::Output>
 ```
 
-**Purpose**: Runs the app-server websocket binary to process completion and captures its output, with a timeout. It is used for tests where startup itself is expected to fail.
+**Purpose**: This helper runs the app server and waits for it to exit, instead of keeping it alive. It is used when a test expects startup to fail because of unsafe or invalid configuration.
 
-**Data flow**: Builds a `tokio::process::Command` for `codex-app-server` with listen URL, disabled plugin startup tasks, extra args, null stdin/stdout, piped stderr, and environment variables, then awaits `cmd.output()` under `DEFAULT_READ_TIMEOUT`. It returns the captured `std::process::Output` or a contextual timeout/spawn error.
+**Data flow**: It builds the same kind of command as the long-running server helper, with the supplied listen URL and extra flags. It captures standard error, waits up to the default timeout for the process to finish, and returns the completed process output.
 
-**Call relations**: Used only by the startup-failure tests for short signing secrets and unauthenticated non-loopback listeners. It complements `spawn_websocket_server_with_args`, which is for successful startup cases.
+**Call relations**: Startup-failure tests call this to inspect the exit status and error text. It is separate from `spawn_websocket_server_with_args`, which waits for a successful bind address and returns a running process.
 
 *Call graph*: called by 2 (websocket_transport_rejects_short_signed_bearer_secret_configuration, websocket_transport_rejects_unauthenticated_non_loopback_startup); 5 external calls (null, piped, new, cargo_bin, timeout).
 
@@ -275,11 +277,11 @@ async fn http_get(
 ) -> Result<reqwest::Response>
 ```
 
-**Purpose**: Performs an HTTP GET against the websocket listener’s HTTP side, retrying until the listener is ready or timeout expires. It smooths over startup races for health endpoint tests.
+**Purpose**: This helper performs an HTTP GET request against the server, retrying until the listener is ready. It is used to test health endpoints that share the same address as the WebSocket server.
 
-**Data flow**: Normalizes the bind address with `connectable_bind_addr`, computes a deadline, and loops calling `client.get(format!("http://{addr}{path}")).send().await`. On success it returns the `reqwest::Response`; on failure before the deadline it sleeps 50 ms and retries; after the deadline it returns an error naming the URL and last failure.
+**Data flow**: It receives an HTTP client, bind address, and path. It converts wildcard bind addresses into connectable loopback addresses, repeatedly sends `GET http://address/path`, and returns the first successful HTTP response object. If no request succeeds before the timeout, it fails the test.
 
-**Call relations**: Called only by `websocket_transport_serves_health_endpoints_on_same_listener`. It mirrors the retry behavior of `connect_websocket_with_bearer` but for plain HTTP requests.
+**Call relations**: The health-endpoint test calls this for `/readyz` and `/healthz`. It uses `connectable_bind_addr` so tests can connect even when the server reports a wildcard address like `0.0.0.0`.
 
 *Call graph*: calls 1 internal fn (connectable_bind_addr); called by 1 (websocket_transport_serves_health_endpoints_on_same_listener); 6 external calls (from_millis, now, get, bail!, format!, sleep).
 
@@ -294,11 +296,11 @@ fn websocket_request(
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>>
 ```
 
-**Purpose**: Constructs a websocket handshake request with optional bearer-token and origin headers. It centralizes header formatting and validation for websocket clients.
+**Purpose**: This helper builds the HTTP request used to start a WebSocket handshake. It can add authorization and origin headers so tests can simulate different kinds of clients.
 
-**Data flow**: Converts the URL into a client request, optionally inserts `Authorization: Bearer <token>` and `Origin: <origin>` headers using validated `HeaderValue`s, and returns the resulting HTTP request object. Invalid header values produce contextual errors.
+**Data flow**: It starts from a WebSocket URL, converts it into a client request, optionally inserts an `Authorization: Bearer ...` header, and optionally inserts an `Origin` header. It returns the finished request or an error if a header value is invalid.
 
-**Call relations**: Used by both connection helpers and rejection helpers. It keeps handshake request construction consistent across successful and negative websocket tests.
+**Call relations**: Connection helpers use this before calling the WebSocket library. `connect_websocket_with_bearer` uses it for accepted connections, while `assert_websocket_connect_rejected_with_headers` uses it for rejected handshakes.
 
 *Call graph*: called by 2 (assert_websocket_connect_rejected_with_headers, connect_websocket_with_bearer); 2 external calls (from_str, format!).
 
@@ -313,11 +315,11 @@ async fn send_initialize_request(
 ) -> Result<()>
 ```
 
-**Purpose**: Sends a JSON-RPC `initialize` request over a websocket with a concrete `ClientInfo` payload. It is the standard handshake helper for websocket tests.
+**Purpose**: This helper sends the JSON-RPC `initialize` request that a client must send before using most server features. It identifies the test client by name and basic version information.
 
-**Data flow**: Builds `InitializeParams` containing `ClientInfo { name, title: Some("WebSocket Test Client"), version: "0.1.0" }` and `capabilities: None`, serializes it to JSON, and forwards it to `send_request` with method `initialize` and the provided id.
+**Data flow**: It takes an open WebSocket stream, request id, and client name. It builds initialization parameters containing client metadata, converts them to JSON, and sends them as an `initialize` request. Nothing is read here; callers read the response separately.
 
-**Call relations**: Used by many websocket tests in this file and by sibling modules. It sits at the start of most websocket flows before any other RPCs are allowed.
+**Call relations**: Nearly every WebSocket test calls this after connecting. It delegates the actual JSON-RPC request construction and sending to `send_request`.
 
 *Call graph*: calls 1 internal fn (send_request); called by 9 (command_exec_process_ids_are_connection_scoped_and_disconnect_terminates_process, websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_timeout, websocket_transport_rejects_browser_origin_without_auth, websocket_transport_rejects_missing_and_invalid_capability_tokens, websocket_transport_routes_per_connection_handshake_and_responses, websocket_transport_serves_health_endpoints_on_same_listener, websocket_transport_verifies_signed_short_lived_bearer_tokens, start_ctrl_c_restart_fixture, initialize_both_clients); 1 external calls (to_value).
 
@@ -328,11 +330,11 @@ async fn send_initialize_request(
 async fn start_thread(stream: &mut WsClient, id: i64) -> Result<String>
 ```
 
-**Purpose**: Starts a thread over websocket and returns its id. It is a websocket-specific convenience wrapper around `thread/start` plus response decoding.
+**Purpose**: This helper asks the server to start a new thread and returns the thread id. A thread here is a server-side conversation or work context that later tests can check as loaded.
 
-**Data flow**: Sends a `thread/start` request with `ThreadStartParams { model: Some("mock-model"), ..Default::default() }`, waits for the matching response via `read_response_for_id`, deserializes it to `ThreadStartResponse`, and returns `thread.id`.
+**Data flow**: It sends a `thread/start` request with a mock model, waits for the response with the same id, converts the generic JSON-RPC response into a typed thread-start response, and extracts the new thread’s id string.
 
-**Call relations**: Used by the loaded-thread reconnect test. It depends on `send_request` and `read_response_for_id` to hide the raw JSON-RPC mechanics.
+**Call relations**: The reconnect test uses this after initialization. It builds on `send_request` to send the command and `read_response_for_id` to wait for the matching answer.
 
 *Call graph*: calls 2 internal fn (read_response_for_id, send_request); called by 1 (websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_timeout); 2 external calls (default, to_value).
 
@@ -343,11 +345,11 @@ async fn start_thread(stream: &mut WsClient, id: i64) -> Result<String>
 async fn assert_loaded_threads(stream: &mut WsClient, id: i64, expected: &[&str]) -> Result<()>
 ```
 
-**Purpose**: Requests the loaded-thread list and asserts it exactly matches an expected set of thread ids with no pagination cursor. It is a one-shot assertion helper for thread-loading state.
+**Purpose**: This helper checks that the server’s loaded-thread list exactly matches an expected set. It makes ordering irrelevant by sorting both lists before comparing them.
 
-**Data flow**: Calls `request_loaded_threads`, sorts the returned `data` vector and the expected ids, asserts they are equal, asserts `next_cursor == None`, and returns `Ok(())`.
+**Data flow**: It sends a loaded-thread-list request through `request_loaded_threads`, receives the returned ids, sorts them, sorts the expected ids, and asserts that they are equal. It also checks there is no pagination cursor, meaning the full list fit in one response.
 
-**Call relations**: Called by the reconnect test immediately after starting a thread. It delegates the actual RPC to `request_loaded_threads` and focuses on exact-set comparison.
+**Call relations**: The reconnect test uses this immediately after starting a thread to prove the first client sees it as loaded. The actual request and response decoding are delegated to `request_loaded_threads`.
 
 *Call graph*: calls 1 internal fn (request_loaded_threads); called by 1 (websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_timeout); 1 external calls (assert_eq!).
 
@@ -362,11 +364,11 @@ async fn wait_for_loaded_threads(
 ) -> Result<()>
 ```
 
-**Purpose**: Polls `thread/loaded/list` until the returned thread ids match an expected set or timeout expires. It is used when loaded-thread state may appear asynchronously after reconnect.
+**Purpose**: This helper repeatedly asks for the loaded-thread list until it matches the expected ids or a timeout expires. It accounts for small delays in the server updating shared state.
 
-**Data flow**: Accepts a websocket client, starting request id, and expected thread ids, converts the expected ids to owned strings, then loops under `DEFAULT_READ_TIMEOUT` calling `request_loaded_threads` with incrementing ids, sorting the returned `data`, and comparing it to the expected vector. If they do not match yet, it sleeps 50 ms and retries; on timeout it returns a contextual error.
+**Data flow**: It starts with a request id, then loops: send a loaded-thread-list request, increment the id, sort the returned ids, compare to the expected list, and sleep briefly if they do not match yet. It returns success when the list matches, or a timeout error if it never does.
 
-**Call relations**: Used by the reconnect test after opening the second websocket. It builds on `request_loaded_threads` to turn a one-shot list RPC into an eventual-consistency wait.
+**Call relations**: The reconnect test uses this after opening the second client. It relies on `request_loaded_threads` for each poll and the default read timeout to avoid waiting forever.
 
 *Call graph*: calls 1 internal fn (request_loaded_threads); called by 1 (websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_timeout); 3 external calls (from_millis, sleep, timeout).
 
@@ -380,11 +382,11 @@ async fn request_loaded_threads(
 ) -> Result<ThreadLoadedListResponse>
 ```
 
-**Purpose**: Sends `thread/loaded/list` over websocket and returns the typed response. It is the low-level helper behind loaded-thread assertions and polling.
+**Purpose**: This helper sends the JSON-RPC request that asks the server which threads are currently loaded. It returns the typed response instead of leaving callers to parse JSON themselves.
 
-**Data flow**: Serializes `ThreadLoadedListParams::default()`, sends it with method `thread/loaded/list`, waits for the matching response via `read_response_for_id`, and deserializes it to `ThreadLoadedListResponse` with `to_response`.
+**Data flow**: It sends `thread/loaded/list` with default parameters, waits for the response matching the request id, and converts that response into `ThreadLoadedListResponse`. The result contains the thread ids and any pagination cursor.
 
-**Call relations**: Called by both `assert_loaded_threads` and `wait_for_loaded_threads`. It encapsulates the request/response mechanics for the loaded-thread listing RPC.
+**Call relations**: `assert_loaded_threads` uses this for a one-time exact check, and `wait_for_loaded_threads` uses it repeatedly while polling. It combines `send_request`, `read_response_for_id`, and typed response conversion.
 
 *Call graph*: calls 2 internal fn (read_response_for_id, send_request); called by 2 (assert_loaded_threads, wait_for_loaded_threads); 2 external calls (default, to_value).
 
@@ -395,11 +397,11 @@ async fn request_loaded_threads(
 async fn send_config_read_request(stream: &mut WsClient, id: i64) -> Result<()>
 ```
 
-**Purpose**: Sends a minimal `config/read` request over websocket. It is a tiny helper used in connection-routing tests.
+**Purpose**: This helper sends a request to read the server configuration. It is used to test whether a connection is initialized and whether responses route back to the correct client.
 
-**Data flow**: Calls `send_request` with method `config/read`, the provided id, and JSON params `{ "includeLayers": false }`. It returns once the request frame has been sent.
+**Data flow**: It takes a WebSocket stream and request id, builds a `config/read` request with `includeLayers` set to false, and sends it. The caller later reads either a normal response or an error for that id.
 
-**Call relations**: Used only by `websocket_transport_routes_per_connection_handshake_and_responses`. It exists to keep that test focused on routing behavior rather than request construction.
+**Call relations**: The per-connection routing test uses this before and after initialization. It delegates the common JSON-RPC sending work to `send_request`.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (websocket_transport_routes_per_connection_handshake_and_responses); 1 external calls (json!).
 
@@ -415,11 +417,11 @@ async fn send_request(
 ) -> Result<()>
 ```
 
-**Purpose**: Builds and sends a JSON-RPC request message over websocket. It is the generic request primitive used by higher-level websocket helpers.
+**Purpose**: This helper builds a JSON-RPC request message from a method name, id, and optional parameters. It gives tests one consistent way to send server commands.
 
-**Data flow**: Constructs `JSONRPCMessage::Request(JSONRPCRequest { id: RequestId::Integer(id), method, params, trace: None })` and passes it to `send_jsonrpc`. It returns any send or serialization error from the lower layer.
+**Data flow**: It receives the stream, method, numeric id, and optional JSON parameters. It wraps them in a JSON-RPC request object with an integer request id and no trace data, then passes the message to `send_jsonrpc`. It changes the WebSocket by writing one text frame to it.
 
-**Call relations**: Called by initialize, thread-start, turn-start, config-read, and other websocket helper functions across this and sibling modules. It is the central outbound JSON-RPC request constructor.
+**Call relations**: Higher-level helpers such as `send_initialize_request`, `send_config_read_request`, `start_thread`, and `request_loaded_threads` all use this. It hands off serialization and frame sending to `send_jsonrpc`.
 
 *Call graph*: calls 1 internal fn (send_jsonrpc); called by 9 (command_exec_process_ids_are_connection_scoped_and_disconnect_terminates_process, request_loaded_threads, send_config_read_request, send_initialize_request, start_thread, send_thread_start_request, send_turn_start_request, thread_name_updated_broadcasts_for_loaded_threads, thread_name_updated_broadcasts_for_not_loaded_threads); 2 external calls (Request, Integer).
 
@@ -430,11 +432,11 @@ async fn send_request(
 async fn send_jsonrpc(stream: &mut WsClient, message: JSONRPCMessage) -> Result<()>
 ```
 
-**Purpose**: Serializes a `JSONRPCMessage` and sends it as a websocket text frame. It is the lowest-level outbound transport helper in this file.
+**Purpose**: This helper serializes a JSON-RPC message and sends it as a WebSocket text frame. It is the lowest-level sending tool in this file.
 
-**Data flow**: Converts the message to a JSON string with `serde_json::to_string`, wraps it in `WebSocketMessage::Text`, sends it on the websocket sink, and returns `Ok(())` or a contextual send error.
+**Data flow**: It takes an already-built JSON-RPC message, turns it into a JSON string, wraps that string as a WebSocket text message, and writes it to the stream. On failure it returns an error that explains the frame could not be sent.
 
-**Call relations**: Called only by `send_request`. It isolates the actual websocket frame emission from request construction.
+**Call relations**: `send_request` calls this after constructing request messages. Other helpers stay one level higher and do not need to know about WebSocket frame details.
 
 *Call graph*: called by 1 (send_request); 3 external calls (Text, send, to_string).
 
@@ -448,11 +450,11 @@ async fn read_response_for_id(
 ) -> Result<JSONRPCResponse>
 ```
 
-**Purpose**: Reads websocket JSON-RPC messages until it finds a response with the specified request id. It filters out unrelated responses and notifications.
+**Purpose**: This helper reads incoming WebSocket messages until it finds the response for a specific request id. It lets tests ignore unrelated messages that may arrive on the same connection.
 
-**Data flow**: Converts the integer id to `RequestId::Integer`, loops on `read_jsonrpc_message`, and returns the first `JSONRPCMessage::Response` whose `id` matches the target. Other messages are ignored.
+**Data flow**: It turns the numeric id into a JSON-RPC request id, then repeatedly calls `read_jsonrpc_message`. If a message is a response with the target id, it returns that response; otherwise it keeps reading.
 
-**Call relations**: Used widely by websocket tests and helpers after sending requests. It depends on `read_jsonrpc_message` for frame parsing and message decoding.
+**Call relations**: Most tests and helper functions use this after sending a request. It depends on `read_jsonrpc_message` to do the raw WebSocket reading, ping handling, and JSON parsing.
 
 *Call graph*: calls 1 internal fn (read_jsonrpc_message); called by 11 (request_loaded_threads, start_thread, websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_timeout, websocket_transport_rejects_browser_origin_without_auth, websocket_transport_rejects_missing_and_invalid_capability_tokens, websocket_transport_routes_per_connection_handshake_and_responses, websocket_transport_serves_health_endpoints_on_same_listener, websocket_transport_verifies_signed_short_lived_bearer_tokens, start_ctrl_c_restart_fixture, initialize_both_clients (+1 more)); 1 external calls (Integer).
 
@@ -466,11 +468,11 @@ async fn read_notification_for_method(
 ) -> Result<JSONRPCNotification>
 ```
 
-**Purpose**: Reads websocket JSON-RPC messages until it finds a notification with the specified method name. It is a generic notification filter for websocket tests.
+**Purpose**: This helper waits for a JSON-RPC notification with a particular method name. A notification is a one-way message from the server that is not a direct response to a request.
 
-**Data flow**: Loops on `read_jsonrpc_message` and returns the first `JSONRPCMessage::Notification` whose `method` equals the requested method string. All other messages are skipped.
+**Data flow**: It repeatedly reads JSON-RPC messages from the stream. When it sees a notification whose method matches the requested method, it returns that notification. Other messages are ignored.
 
-**Call relations**: Used by thread-name update tests in the broader suite. It complements `read_response_for_id` by filtering on notification method instead of request id.
+**Call relations**: Other WebSocket tests in the same suite use this when they expect server broadcasts, such as thread-name update notifications. It uses `read_jsonrpc_message` for the actual frame reading and parsing.
 
 *Call graph*: calls 1 internal fn (read_jsonrpc_message); called by 2 (thread_name_updated_broadcasts_for_loaded_threads, thread_name_updated_broadcasts_for_not_loaded_threads).
 
@@ -485,11 +487,11 @@ async fn read_response_and_notification_for_method(
 ) -> Result<(JSONRPCResponse, JSONRPCNotification)>
 ```
 
-**Purpose**: Collects both a specific response and a specific notification from the websocket stream, in either arrival order, while rejecting duplicate matching notifications. It is useful for RPCs that are expected to produce both artifacts.
+**Purpose**: This helper waits until both a specific response and a specific notification have arrived, in either order. It is useful when one action causes both an immediate reply and a broadcast.
 
-**Data flow**: Tracks a target `RequestId::Integer(id)` plus an optional response and notification slot, loops on `read_jsonrpc_message`, stores the matching response when seen, stores the first matching notification for the given method, errors if a second matching notification arrives before completion, ignores unrelated messages, and finally returns the pair once both slots are filled.
+**Data flow**: It tracks two empty slots: one for the response with the target request id and one for the notification with the target method. It reads messages until both slots are filled. If the same notification arrives twice before completion, it fails the test to flag an unexpected duplicate.
 
-**Call relations**: Used by thread-name update tests elsewhere in the suite. It builds on `read_jsonrpc_message` to coordinate two expected outputs from one logical action.
+**Call relations**: Thread-name broadcast tests use this to avoid depending on message order. Like the other readers, it relies on `read_jsonrpc_message` for WebSocket and JSON details.
 
 *Call graph*: calls 1 internal fn (read_jsonrpc_message); called by 2 (thread_name_updated_broadcasts_for_loaded_threads, thread_name_updated_broadcasts_for_not_loaded_threads); 2 external calls (Integer, bail!).
 
@@ -500,11 +502,11 @@ async fn read_response_and_notification_for_method(
 async fn read_error_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCError>
 ```
 
-**Purpose**: Reads websocket JSON-RPC messages until it finds an error object for the specified request id. It is the error-path counterpart to `read_response_for_id`.
+**Purpose**: This helper waits for a JSON-RPC error response for a specific request id. It is used when the correct server behavior is to reject a request but keep the connection alive.
 
-**Data flow**: Converts the integer id to `RequestId::Integer`, loops on `read_jsonrpc_message`, and returns the first `JSONRPCMessage::Error` whose `id` matches. Other messages are ignored.
+**Data flow**: It repeatedly reads JSON-RPC messages and checks whether each one is an error with the target id. When it finds the matching error, it returns it; unrelated messages are skipped.
 
-**Call relations**: Used by the connection-routing test to observe the `Not initialized` error. It shares the same filtering pattern as `read_response_for_id` but for error messages.
+**Call relations**: The per-connection initialization test uses this when an uninitialized client tries to read config. It shares the low-level reading path through `read_jsonrpc_message`.
 
 *Call graph*: calls 1 internal fn (read_jsonrpc_message); called by 1 (websocket_transport_routes_per_connection_handshake_and_responses); 1 external calls (Integer).
 
@@ -515,11 +517,11 @@ async fn read_error_for_id(stream: &mut WsClient, id: i64) -> Result<JSONRPCErro
 async fn read_jsonrpc_message(stream: &mut WsClient) -> Result<JSONRPCMessage>
 ```
 
-**Purpose**: Reads the next meaningful JSON-RPC message from a websocket stream, handling control frames and enforcing timeouts. It is the central inbound transport parser for websocket tests.
+**Purpose**: This helper reads one meaningful JSON-RPC message from a WebSocket stream. It also deals with WebSocket housekeeping, such as replying to ping frames with pong frames.
 
-**Data flow**: Waits under `DEFAULT_READ_TIMEOUT` for the next websocket frame from `stream.next()`, errors if the stream ends or frame read fails, then matches on the frame: `Text` is parsed from JSON into `JSONRPCMessage` and returned; `Ping` triggers an immediate `Pong` reply and the loop continues; `Pong` and raw `Frame` variants are ignored; `Close` produces an error; `Binary` also produces an error. The function loops until it can return a parsed JSON-RPC message.
+**Data flow**: It waits for the next WebSocket frame with a timeout. Text frames are parsed as JSON-RPC messages and returned. Ping frames are answered with pong and then the loop continues. Pong frames and raw protocol frames are ignored; close, binary, read errors, and timeouts become test failures.
 
-**Call relations**: This helper underpins all websocket read-side utilities in this file and is also reused by sibling modules such as command-exec websocket tests. It centralizes protocol housekeeping so higher-level readers can focus on filtering by id or method.
+**Call relations**: All higher-level message readers depend on this function. It is the shared doorway from raw WebSocket frames into structured JSON-RPC messages.
 
 *Call graph*: called by 7 (command_exec_process_ids_are_connection_scoped_and_disconnect_terminates_process, read_command_exec_delta_ws, read_initialize_response, read_error_for_id, read_notification_for_method, read_response_and_notification_for_method, read_response_for_id); 6 external calls (Pong, next, send, bail!, from_str, timeout).
 
@@ -530,11 +532,11 @@ async fn read_jsonrpc_message(stream: &mut WsClient) -> Result<JSONRPCMessage>
 async fn assert_no_message(stream: &mut WsClient, wait_for: Duration) -> Result<()>
 ```
 
-**Purpose**: Asserts that no websocket frame arrives within a specified duration. It is used to prove absence of cross-connection leakage or unexpected broadcasts.
+**Purpose**: This helper confirms that a WebSocket stays silent for a short period. It is used to prove that messages did not leak to the wrong connection.
 
-**Data flow**: Runs `timeout(wait_for, stream.next())`; if a frame arrives, a read error occurs, or the stream closes, it returns an error describing the unexpected event. If the timeout elapses first, it returns `Ok(())`.
+**Data flow**: It waits for one frame for the requested duration. If any frame, read error, or connection close appears, it fails. If the wait times out with no frame, that silence is considered success.
 
-**Call relations**: Used by the connection-routing test, the command-exec websocket scoping test, and thread-name tests elsewhere. It is the negative-space counterpart to the positive read helpers.
+**Call relations**: Connection-isolation and broadcast tests call this after actions that should not produce messages on a given client. It uses the raw stream directly because it is checking for any frame at all, not just JSON-RPC text.
 
 *Call graph*: called by 4 (command_exec_process_ids_are_connection_scoped_and_disconnect_terminates_process, websocket_transport_routes_per_connection_handshake_and_responses, thread_name_updated_broadcasts_for_loaded_threads, thread_name_updated_broadcasts_for_not_loaded_threads); 3 external calls (next, bail!, timeout).
 
@@ -549,11 +551,11 @@ fn create_config_toml(
 ) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes a minimal mock-provider `config.toml` suitable for websocket transport tests and many sibling integration tests. It standardizes model, approval policy, sandbox mode, and mock provider settings.
+**Purpose**: This helper writes a minimal `config.toml` for tests. It points the app server at a mock model provider so tests do not call a real external service.
 
-**Data flow**: Joins `config.toml` under the provided CODEX_HOME path and writes a formatted TOML string containing `model = "mock-model"`, the supplied `approval_policy`, `sandbox_mode = "read-only"`, `model_provider = "mock_provider"`, and a `[model_providers.mock_provider]` table pointing at `<server_uri>/v1` with zero retries.
+**Data flow**: It receives the temporary app home path, mock server URI, and approval policy string. It writes a TOML configuration file containing the mock model, read-only sandbox mode, provider base URL, and retry settings. The output is a file on disk or an I/O error.
 
-**Call relations**: Used extensively across this file and by other v2 test modules such as command-exec and Unix websocket signal tests. It is the shared config fixture generator for app-server subprocess tests.
+**Call relations**: Almost every integration test in this area uses this before starting the server. The spawned app server reads the file through `CODEX_HOME`, so the test controls the server’s environment.
 
 *Call graph*: called by 32 (command_exec_accepts_permission_profile, command_exec_env_overrides_merge_with_server_environment_and_support_unset, command_exec_non_streaming_respects_output_cap, command_exec_permission_profile_does_not_reuse_default_network_proxy, command_exec_permission_profile_project_roots_use_command_cwd, command_exec_permission_profile_starts_selected_network_proxy, command_exec_pipe_streams_output_and_accepts_write, command_exec_process_ids_are_connection_scoped_and_disconnect_terminates_process, command_exec_rejects_disable_output_cap_with_output_bytes_cap, command_exec_rejects_disable_timeout_with_timeout_ms (+15 more)); 3 external calls (join, format!, write).
 
@@ -564,11 +566,11 @@ fn create_config_toml(
 fn connectable_bind_addr(bind_addr: SocketAddr) -> SocketAddr
 ```
 
-**Purpose**: Rewrites unspecified listener addresses to loopback addresses so tests can connect to listeners bound on `0.0.0.0` or `::`. It avoids trying to dial an unspecified address directly.
+**Purpose**: This helper turns wildcard bind addresses into addresses a client can actually connect to. A server may listen on `0.0.0.0`, but clients should connect to `127.0.0.1` in tests.
 
-**Data flow**: Matches on the provided `SocketAddr`; if it is IPv4 unspecified, returns `127.0.0.1:<port>`; if IPv6 unspecified, returns `::1:<port>`; otherwise returns the original address unchanged.
+**Data flow**: It receives a socket address. If the address is an unspecified IPv4 address, it returns the same port on `127.0.0.1`; if it is unspecified IPv6, it returns the same port on `::1`. Otherwise it returns the original address unchanged.
 
-**Call relations**: Used by `connect_websocket_with_bearer` and `http_get` before constructing URLs. It is a small but important normalization helper for tests that intentionally start non-loopback listeners.
+**Call relations**: `http_get` uses this before building an HTTP URL. WebSocket connection helpers use the same idea when building their connection URL.
 
 *Call graph*: called by 1 (http_get); 1 external calls (from).
 
@@ -579,24 +581,24 @@ fn connectable_bind_addr(bind_addr: SocketAddr) -> SocketAddr
 fn signed_bearer_token(shared_secret: &[u8], claims: serde_json::Value) -> Result<String>
 ```
 
-**Purpose**: Constructs an HS256-signed JWT-like bearer token from arbitrary JSON claims for websocket auth tests. It is a local token generator, not a general JWT library wrapper.
+**Purpose**: This helper creates a signed test bearer token using HMAC-SHA256. HMAC is a shared-secret signature method that lets the server check the token was made by someone who knows the same secret.
 
-**Data flow**: Base64url-encodes a fixed header `{"alg":"HS256","typ":"JWT"}` and the serialized claims JSON, concatenates them as `header.claims`, initializes `HmacSha256` with the shared secret, signs the payload bytes, base64url-encodes the signature, and returns `header.claims.signature` as a string.
+**Data flow**: It takes secret bytes and a JSON object of claims, builds a token header, base64-url encodes the header and claims, signs the two-part payload with the shared secret, encodes the signature, and returns the final three-part token string. If JSON conversion or signing setup fails, it returns an error.
 
-**Call relations**: Used only by `websocket_transport_verifies_signed_short_lived_bearer_tokens`. It supplies concrete tokens for the server’s signed-bearer validation path.
+**Call relations**: The signed-token authentication test uses this to manufacture valid and invalid tokens by changing claims or the signing secret. The produced strings are passed to `connect_websocket_with_bearer` or rejection helpers as bearer credentials.
 
 *Call graph*: called by 1 (websocket_transport_verifies_signed_short_lived_bearer_tokens); 3 external calls (new_from_slice, format!, to_vec).
 
 
 ### `app-server/tests/suite/v2/connection_handling_websocket_unix.rs`
 
-`test` · `teardown`
+`test` · `test execution`
 
-This Unix-only companion to the websocket transport tests focuses on process lifecycle under POSIX signals. Each test starts a real websocket app-server subprocess with a mock `/responses` endpoint that intentionally delays completion of a turn, then sends `SIGINT`, `SIGTERM`, or `SIGHUP` while that turn is in flight. The expected behavior differs by signal count: the first `SIGINT` or `SIGTERM` should begin graceful drain and wait for the running turn to finish before exit, a second signal should force earlier exit, and repeated `SIGHUP` should continue waiting rather than escalating.
+This is a Unix-only behavior test for graceful shutdown. In everyday terms, it checks that the app server does not slam the door while it is still helping a user. The tests start a real app-server process, connect to it over WebSocket, begin a conversation turn, and arrange for the mocked model response to be delayed. That delay creates a known moment where work is still in progress.
 
-The shared fixture builder `start_ctrl_c_restart_fixture` mounts a delayed SSE response, writes config, spawns the websocket server, initializes a websocket client, starts a thread, starts a turn, and then waits until the mock server has actually received the `/responses` POST. That last step is important: it guarantees the turn is genuinely running before any signal is sent, so the tests are measuring shutdown semantics rather than startup races.
+Once the server is busy, each test sends an operating-system signal. A signal is a simple message from the operating system to a process, such as “please stop” or “reload.” The file checks several cases: one Ctrl-C waits for the running turn to finish, a second Ctrl-C forces shutdown sooner, SIGTERM behaves similarly, and repeated SIGHUP keeps waiting rather than forcing an exit.
 
-Helper functions wrap raw `kill` invocations (`send_sigint`, `send_sigterm`, `send_sighup`, `send_signal`), assert that the subprocess does not exit too early, wait for eventual exit with contextual timeout messages, and consume websocket frames until a disconnect is observed. `expect_websocket_disconnect` mirrors the main websocket reader’s control-frame handling by replying to pings while waiting for closure, ensuring the client side does not itself cause the connection to fail prematurely.
+The helper functions act like a test harness. They create temporary configuration, start a mock HTTP server, launch the WebSocket server, send protocol requests, wait until the server has made its outbound `/responses` call, then send Unix signals with the `kill` command. Finally, they verify two important outcomes: the process exits within the expected time, and the WebSocket client sees the connection close. Without these tests, shutdown bugs could leave users with interrupted work, hanging clients, or processes that never exit.
 
 #### Function details
 
@@ -606,11 +608,11 @@ Helper functions wrap raw `kill` invocations (`send_sigint`, `send_sigterm`, `se
 async fn websocket_transport_ctrl_c_waits_for_running_turn_before_exit() -> Result<()>
 ```
 
-**Purpose**: Verifies a single Ctrl-C (`SIGINT`) triggers graceful shutdown that waits for the in-flight turn to finish before the app-server exits. It also checks the websocket eventually disconnects cleanly.
+**Purpose**: This test checks the normal Ctrl-C path. It proves that one interrupt signal does not immediately kill the WebSocket server while a turn is still running; instead, the server waits for the work to finish and then exits cleanly.
 
-**Data flow**: Builds a delayed-turn fixture with `start_ctrl_c_restart_fixture`, sends `SIGINT` to the subprocess, asserts the process does not exit within 300 ms, then waits up to 10 seconds for process exit and asserts the exit status is successful. Finally it waits for websocket disconnect and returns `Ok(())`.
+**Data flow**: It starts a prepared server fixture with a delayed turn response, sends one Ctrl-C signal to the child process, and watches the process for a short window to make sure it stays alive. Then it waits longer for the delayed work to finish, checks that the process exits successfully, and confirms that the WebSocket connection closes.
 
-**Call relations**: Invoked by the Tokio test harness. It depends on the shared fixture setup plus `send_sigint`, `assert_process_does_not_exit_within`, `wait_for_process_exit_within`, and `expect_websocket_disconnect` to express the graceful-drain contract.
+**Call relations**: This is one of the top-level test cases. It relies on start_ctrl_c_restart_fixture to create a busy server, uses send_sigint to deliver the interrupt, uses assert_process_does_not_exit_within and wait_for_process_exit_within to check timing, and finishes with expect_websocket_disconnect to verify the client side saw shutdown.
 
 *Call graph*: calls 5 internal fn (assert_process_does_not_exit_within, expect_websocket_disconnect, send_sigint, start_ctrl_c_restart_fixture, wait_for_process_exit_within); 3 external calls (from_millis, from_secs, assert!).
 
@@ -621,11 +623,11 @@ async fn websocket_transport_ctrl_c_waits_for_running_turn_before_exit() -> Resu
 async fn websocket_transport_second_ctrl_c_forces_exit_while_turn_running() -> Result<()>
 ```
 
-**Purpose**: Checks that a second Ctrl-C escalates shutdown and forces the app-server to exit promptly even while a turn is still running. It distinguishes first-signal graceful drain from second-signal forced termination.
+**Purpose**: This test checks the emergency Ctrl-C path. It proves that if the user presses Ctrl-C a second time while the server is still draining work, the server exits promptly instead of waiting for the full running turn.
 
-**Data flow**: Starts the delayed-turn fixture, sends `SIGINT`, confirms the process stays alive for at least 300 ms, sends `SIGINT` again, waits up to 2 seconds for exit, asserts the exit status is successful, and then waits for websocket disconnect.
+**Data flow**: It starts the same delayed-turn fixture, sends one Ctrl-C, and confirms the server does not exit immediately. It then sends a second Ctrl-C, waits only a short time for the process to exit, checks that the exit was successful, and verifies the WebSocket is disconnected.
 
-**Call relations**: Called by the harness. It reuses the same fixture and helper sequence as the single-Ctrl-C test but adds a second signal and a shorter forced-exit timeout.
+**Call relations**: This top-level test shares the same setup and checking helpers as the single-Ctrl-C test. The difference is that it calls send_sigint twice, using the second call to exercise the forced-exit behavior.
 
 *Call graph*: calls 5 internal fn (assert_process_does_not_exit_within, expect_websocket_disconnect, send_sigint, start_ctrl_c_restart_fixture, wait_for_process_exit_within); 3 external calls (from_millis, from_secs, assert!).
 
@@ -636,11 +638,11 @@ async fn websocket_transport_second_ctrl_c_forces_exit_while_turn_running() -> R
 async fn websocket_transport_sigterm_waits_for_running_turn_before_exit() -> Result<()>
 ```
 
-**Purpose**: Verifies a single `SIGTERM` behaves like graceful shutdown, waiting for the running turn to complete before process exit. It ensures TERM follows the same drain semantics as Ctrl-C.
+**Purpose**: This test checks graceful shutdown for SIGTERM, a common Unix signal meaning “please terminate.” It makes sure SIGTERM behaves like a polite stop request while a turn is running.
 
-**Data flow**: Creates the delayed-turn fixture, sends `SIGTERM`, asserts the process does not exit within 300 ms, waits up to 10 seconds for exit, asserts success, and then waits for websocket disconnect.
+**Data flow**: It creates a server that is busy with a delayed response, sends SIGTERM to the server process, and confirms the process does not exit during a short early window. After the delayed turn has time to finish, it waits for a successful process exit and then checks that the WebSocket connection closes.
 
-**Call relations**: Invoked by the harness. It mirrors the Ctrl-C graceful test but uses `send_sigterm` to exercise the TERM signal path.
+**Call relations**: This top-level test uses start_ctrl_c_restart_fixture for setup, send_sigterm for the Unix signal, the process-wait helpers for timing expectations, and expect_websocket_disconnect for the final client-side shutdown check.
 
 *Call graph*: calls 5 internal fn (assert_process_does_not_exit_within, expect_websocket_disconnect, send_sigterm, start_ctrl_c_restart_fixture, wait_for_process_exit_within); 3 external calls (from_millis, from_secs, assert!).
 
@@ -651,11 +653,11 @@ async fn websocket_transport_sigterm_waits_for_running_turn_before_exit() -> Res
 async fn websocket_transport_second_sigterm_forces_exit_while_turn_running() -> Result<()>
 ```
 
-**Purpose**: Checks that a second `SIGTERM` forces prompt exit while a turn is still running. It validates escalation behavior for repeated TERM signals.
+**Purpose**: This test checks that a second SIGTERM forces the server to stop sooner. It protects against a server that keeps waiting forever even after being asked to terminate repeatedly.
 
-**Data flow**: Starts the delayed-turn fixture, sends `SIGTERM`, confirms the process remains alive briefly, sends `SIGTERM` again, waits up to 2 seconds for exit, asserts success, and waits for websocket disconnect.
+**Data flow**: It starts a busy WebSocket server, sends SIGTERM once, and verifies the process is still alive briefly. It then sends SIGTERM again, waits for the process to exit within a shorter timeout, checks that the exit succeeded, and confirms the WebSocket connection is gone.
 
-**Call relations**: Run by the harness. It is the TERM analogue of the second-Ctrl-C escalation test and uses the same helper sequence with a different signal sender.
+**Call relations**: This top-level test follows the same pattern as the second-Ctrl-C test, but uses send_sigterm instead of send_sigint. It depends on the shared setup, process timing, and WebSocket disconnect helpers.
 
 *Call graph*: calls 5 internal fn (assert_process_does_not_exit_within, expect_websocket_disconnect, send_sigterm, start_ctrl_c_restart_fixture, wait_for_process_exit_within); 3 external calls (from_millis, from_secs, assert!).
 
@@ -666,11 +668,11 @@ async fn websocket_transport_second_sigterm_forces_exit_while_turn_running() -> 
 async fn websocket_transport_repeated_sighup_keeps_waiting_for_running_turn() -> Result<()>
 ```
 
-**Purpose**: Verifies repeated `SIGHUP` signals do not escalate to forced termination and the server continues waiting for the running turn to finish. It captures the distinct restart-oriented semantics of HUP.
+**Purpose**: This test checks that repeated SIGHUP signals do not force the server to quit while work is running. SIGHUP often means “reload” or “restart,” and here the expected behavior is still graceful waiting.
 
-**Data flow**: Starts the delayed-turn fixture, sends `SIGHUP`, asserts the process does not exit within 300 ms, sends `SIGHUP` again, asserts it still does not exit within 300 ms, then waits up to 10 seconds for graceful exit, asserts success, and waits for websocket disconnect.
+**Data flow**: It starts a server with an in-progress delayed turn, sends SIGHUP, and confirms the process does not exit right away. It sends SIGHUP again, confirms the process still does not exit right away, then waits for the turn to finish and verifies successful process exit and WebSocket disconnection.
 
-**Call relations**: Invoked by the harness. It uses `send_sighup` plus the same process and websocket wait helpers to show that repeated HUP differs from repeated INT/TERM.
+**Call relations**: This top-level test uses start_ctrl_c_restart_fixture to get the server into a busy state, calls send_sighup twice, and uses the same process and WebSocket assertions used by the Ctrl-C and SIGTERM tests.
 
 *Call graph*: calls 5 internal fn (assert_process_does_not_exit_within, expect_websocket_disconnect, send_sighup, start_ctrl_c_restart_fixture, wait_for_process_exit_within); 3 external calls (from_millis, from_secs, assert!).
 
@@ -681,11 +683,11 @@ async fn websocket_transport_repeated_sighup_keeps_waiting_for_running_turn() ->
 async fn start_ctrl_c_restart_fixture(turn_delay: Duration) -> Result<GracefulCtrlCFixture>
 ```
 
-**Purpose**: Sets up a running websocket app-server with an active delayed turn so signal-handling tests can observe shutdown behavior mid-request. It returns the temp home, mock server, child process, and connected websocket client.
+**Purpose**: This helper builds the full test scene: a mock model server, temporary configuration, a real WebSocket app-server process, and an active running turn that is intentionally delayed. Tests use it so they all begin from the same reliable “server is busy” state.
 
-**Data flow**: Starts a wiremock server, creates a delayed SSE `/responses` reply using `create_final_assistant_message_sse_response("Done")` and `responses::sse_response(...).set_delay(turn_delay)`, mounts it for one POST, creates a temp CODEX_HOME and writes config, spawns the websocket server, connects a websocket client, sends initialize and verifies the response id, sends `thread/start` and deserializes `ThreadStartResponse` to get the thread id, sends `turn/start` for that thread and verifies the response id, waits for the mock server to observe a `/responses` POST via `wait_for_responses_post`, and returns a `GracefulCtrlCFixture` containing the resources.
+**Data flow**: It receives a delay duration for the mocked turn response. It starts a mock HTTP server, configures that mock to delay the `/responses` reply, writes temporary app configuration, launches the WebSocket server, connects a WebSocket client, initializes the protocol, starts a thread, starts a turn, and waits until the app server has actually called `/responses`. It returns a fixture containing the temporary home directory, mock server, child process, and WebSocket client.
 
-**Call relations**: Called by all five signal-handling tests. It depends on websocket helpers from the sibling module for transport setup and on local helpers `send_thread_start_request`, `send_turn_start_request`, and `wait_for_responses_post` to ensure the turn is truly in flight before signals are sent.
+**Call relations**: All five top-level signal tests call this first. Inside, it hands protocol details to helpers from the shared WebSocket test module and to this file’s send_thread_start_request, send_turn_start_request, and wait_for_responses_post helpers.
 
 *Call graph*: calls 10 internal fn (connect_websocket, create_config_toml, read_response_for_id, send_initialize_request, spawn_websocket_server, send_thread_start_request, send_turn_start_request, wait_for_responses_post, sse_response, start_mock_server); called by 5 (websocket_transport_ctrl_c_waits_for_running_turn_before_exit, websocket_transport_repeated_sighup_keeps_waiting_for_running_turn, websocket_transport_second_ctrl_c_forces_exit_while_turn_running, websocket_transport_second_sigterm_forces_exit_while_turn_running, websocket_transport_sigterm_waits_for_running_turn_before_exit); 8 external calls (from_secs, given, new, create_final_assistant_message_sse_response, to_response, assert_eq!, method, path_regex).
 
@@ -696,11 +698,11 @@ async fn start_ctrl_c_restart_fixture(turn_delay: Duration) -> Result<GracefulCt
 async fn send_thread_start_request(stream: &mut WsClient, id: i64) -> Result<()>
 ```
 
-**Purpose**: Sends a websocket `thread/start` request with the mock model. It is a small fixture helper used during signal-handling setup.
+**Purpose**: This helper asks the WebSocket server to create a new conversation thread. A thread is the container that later turns belong to.
 
-**Data flow**: Serializes `ThreadStartParams { model: Some("mock-model"), ..Default::default() }` and forwards it to `send_request` with method `thread/start` and the provided id. It returns once the request has been sent.
+**Data flow**: It takes a mutable WebSocket client and a request id. It builds a `thread/start` request with a mock model name, converts the request body into JSON, sends it through the WebSocket, and returns success or an error from sending.
 
-**Call relations**: Used only by `start_ctrl_c_restart_fixture`. It keeps the fixture setup concise by hiding the request construction details.
+**Call relations**: start_ctrl_c_restart_fixture calls this after initialization. The response gives the fixture a thread id, which is then passed into send_turn_start_request so the test can begin real work.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (start_ctrl_c_restart_fixture); 2 external calls (default, to_value).
 
@@ -711,11 +713,11 @@ async fn send_thread_start_request(stream: &mut WsClient, id: i64) -> Result<()>
 async fn send_turn_start_request(stream: &mut WsClient, id: i64, thread_id: &str) -> Result<()>
 ```
 
-**Purpose**: Sends a websocket `turn/start` request with a single text input targeting a specific thread. It is the fixture helper that begins the long-running turn.
+**Purpose**: This helper asks the server to start a user turn in an existing thread. A turn is one round of user input and assistant response.
 
-**Data flow**: Builds `TurnStartParams` with the supplied `thread_id`, no client user message id, and one `V2UserInput::Text { text: "Hello", text_elements: Vec::new() }`, serializes it, and sends it via `send_request` with method `turn/start` and the provided id.
+**Data flow**: It takes a WebSocket client, request id, and thread id. It builds a `turn/start` request containing a simple text input, converts that request to JSON, sends it over the WebSocket, and returns whether sending succeeded.
 
-**Call relations**: Called only by `start_ctrl_c_restart_fixture`. It is paired with `wait_for_responses_post` so the fixture knows the delayed turn has actually reached the mock backend.
+**Call relations**: start_ctrl_c_restart_fixture calls this after it has created a thread. Starting the turn is what causes the app server to call the mocked `/responses` endpoint, creating the in-progress work that the signal tests need.
 
 *Call graph*: calls 1 internal fn (send_request); called by 1 (start_ctrl_c_restart_fixture); 3 external calls (default, to_value, vec!).
 
@@ -726,11 +728,11 @@ async fn send_turn_start_request(stream: &mut WsClient, id: i64, thread_id: &str
 async fn wait_for_responses_post(server: &wiremock::MockServer, wait_for: Duration) -> Result<()>
 ```
 
-**Purpose**: Polls the mock server until it has received a POST request whose path ends with `/responses`. It ensures the turn request is actively being processed before shutdown signals are sent.
+**Purpose**: This helper waits until the app server has actually begun its outbound model request. That matters because the shutdown signal should be sent while a turn is truly running, not before the work starts.
 
-**Data flow**: Computes a deadline from the supplied duration, repeatedly fetches `server.received_requests()`, scans for any request with method `POST` and a path ending in `/responses`, and returns once found. If the deadline expires first it returns a timeout error; between polls it sleeps for 10 ms.
+**Data flow**: It takes the mock server and a maximum wait time. It repeatedly reads the mock server’s received requests, looking for a POST request whose path ends in `/responses`. If it sees one, it returns success; if the deadline passes, it returns an error.
 
-**Call relations**: Used only by `start_ctrl_c_restart_fixture`. It turns wiremock request logs into a synchronization point that eliminates races in the signal tests.
+**Call relations**: start_ctrl_c_restart_fixture calls this after sending the turn-start request. It acts as the gate between setup and the signal tests, ensuring the process is in the right busy state before any test sends Ctrl-C, SIGTERM, or SIGHUP.
 
 *Call graph*: called by 1 (start_ctrl_c_restart_fixture); 5 external calls (from_millis, now, received_requests, bail!, sleep).
 
@@ -741,11 +743,11 @@ async fn wait_for_responses_post(server: &wiremock::MockServer, wait_for: Durati
 fn send_sigint(process: &Child) -> Result<()>
 ```
 
-**Purpose**: Sends `SIGINT` to the app-server subprocess. It is a thin named wrapper around the generic signal sender.
+**Purpose**: This small helper sends SIGINT to the server process. SIGINT is the signal normally produced by pressing Ctrl-C in a terminal.
 
-**Data flow**: Accepts a `tokio::process::Child` reference and calls `send_signal(process, "-INT")`. It returns any error from signal delivery.
+**Data flow**: It receives the child process, chooses the `-INT` signal name, and passes both to send_signal. It returns success if the signal command succeeds, or an error if it fails.
 
-**Call relations**: Used by the two Ctrl-C tests. It exists for readability so those tests can name the signal they are exercising.
+**Call relations**: The Ctrl-C tests call this instead of calling send_signal directly. It keeps those tests readable by naming the signal in human terms.
 
 *Call graph*: calls 1 internal fn (send_signal); called by 2 (websocket_transport_ctrl_c_waits_for_running_turn_before_exit, websocket_transport_second_ctrl_c_forces_exit_while_turn_running).
 
@@ -756,11 +758,11 @@ fn send_sigint(process: &Child) -> Result<()>
 fn send_sigterm(process: &Child) -> Result<()>
 ```
 
-**Purpose**: Sends `SIGTERM` to the app-server subprocess. It is the TERM-specific wrapper around `send_signal`.
+**Purpose**: This small helper sends SIGTERM to the server process. SIGTERM is a standard Unix request asking a process to terminate.
 
-**Data flow**: Accepts a child-process reference and forwards it to `send_signal(process, "-TERM")`. It returns `Ok(())` on successful `kill` invocation.
+**Data flow**: It receives the child process, chooses the `-TERM` signal name, and delegates the actual operating-system command to send_signal. It returns the result of that lower-level helper.
 
-**Call relations**: Used by the two SIGTERM tests. Like `send_sigint`, it is a readability wrapper over the generic signal helper.
+**Call relations**: The SIGTERM tests call this to express their intent clearly. send_signal does the shared work of finding the process id and invoking `kill`.
 
 *Call graph*: calls 1 internal fn (send_signal); called by 2 (websocket_transport_second_sigterm_forces_exit_while_turn_running, websocket_transport_sigterm_waits_for_running_turn_before_exit).
 
@@ -771,11 +773,11 @@ fn send_sigterm(process: &Child) -> Result<()>
 fn send_sighup(process: &Child) -> Result<()>
 ```
 
-**Purpose**: Sends `SIGHUP` to the app-server subprocess. It is the HUP-specific wrapper around `send_signal`.
+**Purpose**: This small helper sends SIGHUP to the server process. In this test suite, SIGHUP represents a restart-style signal that should still wait for running work.
 
-**Data flow**: Accepts a child-process reference and calls `send_signal(process, "-HUP")`. It returns any error from the underlying `kill` command.
+**Data flow**: It receives the child process, selects the `-HUP` signal name, and passes it to send_signal. The output is success if the signal was delivered, otherwise an error.
 
-**Call relations**: Used only by the repeated-SIGHUP test. It keeps that test’s intent explicit.
+**Call relations**: The repeated-SIGHUP test calls this twice. It uses the same shared signal-sending path as Ctrl-C and SIGTERM, but labels the signal behavior being tested.
 
 *Call graph*: calls 1 internal fn (send_signal); called by 1 (websocket_transport_repeated_sighup_keeps_waiting_for_running_turn).
 
@@ -786,11 +788,11 @@ fn send_sighup(process: &Child) -> Result<()>
 fn send_signal(process: &Child, signal: &str) -> Result<()>
 ```
 
-**Purpose**: Invokes the system `kill` command to send a named POSIX signal to the subprocess pid. It is the low-level Unix signal delivery helper for this file.
+**Purpose**: This helper does the actual Unix signal delivery. It uses the system `kill` command to send a named signal to the app-server child process.
 
-**Data flow**: Extracts the child pid with `process.id()`, errors if absent, runs `kill <signal> <pid>` via `std::process::Command`, adds context if the command cannot be invoked, checks the exit status, and returns an error if `kill` itself exits unsuccessfully.
+**Data flow**: It receives a child process and a signal string such as `-INT`. It reads the process id, runs `kill <signal> <pid>`, checks the command’s exit status, and returns success only if the command reports success.
 
-**Call relations**: Called by `send_sigint`, `send_sigterm`, and `send_sighup`. It centralizes the actual OS interaction so the tests can work with semantic signal-specific wrappers.
+**Call relations**: send_sigint, send_sigterm, and send_sighup all call this. It centralizes the low-level operating-system interaction so the tests can talk in terms of the signal they care about.
 
 *Call graph*: called by 3 (send_sighup, send_sigint, send_sigterm); 3 external calls (id, new, bail!).
 
@@ -801,11 +803,11 @@ fn send_signal(process: &Child, signal: &str) -> Result<()>
 async fn assert_process_does_not_exit_within(process: &mut Child, window: Duration) -> Result<()>
 ```
 
-**Purpose**: Asserts the subprocess remains alive for at least a given time window. It is used to prove the server does not terminate immediately after the first graceful-drain signal.
+**Purpose**: This helper confirms that the server stays alive for a short period. It is used to prove the server is waiting for running work instead of stopping immediately.
 
-**Data flow**: Runs `timeout(window, process.wait())`; if the timeout elapses, it returns `Ok(())` because the process stayed alive long enough. If `process.wait()` completes successfully within the window, it returns an error saying the process exited too early; if waiting itself errors, that error is wrapped with context.
+**Data flow**: It receives the child process and a time window. It waits for the process only up to that window. If the timeout expires, that is success because the process did not exit; if the process exits during the window, it returns an error explaining that it exited too early.
 
-**Call relations**: Used by all five signal-handling tests immediately after sending the first signal. It complements `wait_for_process_exit_within`, which checks the eventual exit.
+**Call relations**: Each top-level signal test calls this after the first signal, and the SIGHUP test calls it after each SIGHUP. It pairs with wait_for_process_exit_within: first the tests prove “not yet,” then later they prove “now it should exit.”
 
 *Call graph*: called by 5 (websocket_transport_ctrl_c_waits_for_running_turn_before_exit, websocket_transport_repeated_sighup_keeps_waiting_for_running_turn, websocket_transport_second_ctrl_c_forces_exit_while_turn_running, websocket_transport_second_sigterm_forces_exit_while_turn_running, websocket_transport_sigterm_waits_for_running_turn_before_exit); 3 external calls (wait, bail!, timeout).
 
@@ -820,11 +822,11 @@ async fn wait_for_process_exit_within(
 ) -> Result<std::process::ExitStatus>
 ```
 
-**Purpose**: Waits for the subprocess to exit within a bounded time and returns its exit status. It is the positive counterpart to `assert_process_does_not_exit_within`.
+**Purpose**: This helper waits for the app-server process to finish, but only for a limited time. It prevents tests from hanging forever if shutdown breaks.
 
-**Data flow**: Runs `timeout(window, process.wait())`, applies the caller-provided timeout context string if the deadline expires, and otherwise returns the resulting `std::process::ExitStatus` or a contextual wait error.
+**Data flow**: It receives the child process, a maximum wait time, and a timeout message. It waits for the process to exit within that time. If it exits, it returns the process exit status; if it does not, or waiting itself fails, it returns a clear error.
 
-**Call relations**: Called by all signal-handling tests after they have established whether the process should still be alive. The tests then assert the returned status indicates success.
+**Call relations**: All top-level signal tests use this after the expected waiting or forced-exit point. The tests then inspect the returned exit status to make sure the shutdown was considered successful.
 
 *Call graph*: called by 5 (websocket_transport_ctrl_c_waits_for_running_turn_before_exit, websocket_transport_repeated_sighup_keeps_waiting_for_running_turn, websocket_transport_second_ctrl_c_forces_exit_while_turn_running, websocket_transport_second_sigterm_forces_exit_while_turn_running, websocket_transport_sigterm_waits_for_running_turn_before_exit); 2 external calls (wait, timeout).
 
@@ -835,11 +837,11 @@ async fn wait_for_process_exit_within(
 async fn expect_websocket_disconnect(stream: &mut WsClient) -> Result<()>
 ```
 
-**Purpose**: Consumes websocket frames until the connection closes or errors, replying to pings while waiting. It confirms the client observes disconnect after server shutdown.
+**Purpose**: This helper verifies that the WebSocket client sees the server close or drop the connection. It makes sure shutdown is visible to the connected client, not just to the operating system process table.
 
-**Data flow**: Loops reading `stream.next()` under `DEFAULT_READ_TIMEOUT`; `None` or a `Close` frame counts as success and returns `Ok(())`, `Ping` triggers a `Pong` reply and continues, `Pong`, raw `Frame`, `Text`, and `Binary` frames are ignored while waiting, and any websocket read error also counts as disconnect success.
+**Data flow**: It reads WebSocket frames until it sees the stream end, a close frame, or a read error. If the server sends a ping while the helper is waiting, it replies with a pong so the connection stays well-behaved during shutdown. If no disconnect arrives before the read timeout, it returns an error.
 
-**Call relations**: Used by all signal-handling tests after process exit. It mirrors the control-frame handling in the main websocket helper module so the client side remains well-behaved while waiting for shutdown.
+**Call relations**: Every top-level signal test calls this after the process exits. It is the final check that shutdown cleaned up the network connection rather than leaving the client waiting.
 
 *Call graph*: called by 5 (websocket_transport_ctrl_c_waits_for_running_turn_before_exit, websocket_transport_repeated_sighup_keeps_waiting_for_running_turn, websocket_transport_second_ctrl_c_forces_exit_while_turn_running, websocket_transport_second_sigterm_forces_exit_while_turn_running, websocket_transport_sigterm_waits_for_running_turn_before_exit); 4 external calls (Pong, next, send, timeout).
 
@@ -849,11 +851,13 @@ These tests verify client-visible protocol contracts at connection setup, coveri
 
 ### `app-server/tests/suite/v2/attestation.rs`
 
-`test` · `turn startup and websocket handshake in integration tests`
+`test` · `test run`
 
-This file contains a single end-to-end integration test plus a config writer. The test spins up a local websocket test server that accepts two connections: one disposable connection consumed by the app server's `/models` refresh probe during thread startup, and a second connection that serves the warmup and real response streams for the turn under test. The app server is configured with a mock provider that requires OpenAI auth and supports websockets, and a ChatGPT auth fixture is written so the websocket path is actually used.
+This test protects an important trust path. The app server sometimes needs to open a WebSocket connection to the ChatGPT backend, and that connection may need an attestation header: a small signed-looking proof that says the request came through an approved client. Without this behavior, the server might connect successfully in simple cases but fail in environments that require that extra proof.
 
-Initialization is performed with explicit client metadata (`codex_desktop`) and `InitializeCapabilities` enabling both `experimental_api` and `request_attestation`. After starting a thread and a turn, the test enters a loop reading arbitrary JSON-RPC messages from the server. Every `ServerRequest::AttestationGenerate` is answered with `AttestationGenerateResponse { token: "v1.integration-test" }`, while the loop exits only after `turn/completed` arrives. The test asserts that at least one attestation request occurred, then inspects the websocket server's recorded handshake and checks that header `x-oai-attestation` equals the app-server encoded JSON wrapper `{"v":1,"s":0,"t":"v1.integration-test"}`. This captures the full round trip from capability negotiation through runtime request/response and transport-layer header injection.
+The test builds a miniature world around the app server. It starts a fake WebSocket server that records the incoming handshake headers. It creates a temporary Codex home folder with a test configuration pointing ChatGPT traffic at that fake server. It also writes fake ChatGPT login credentials so the app server believes it can use ChatGPT-style authentication.
+
+Then the test starts the app server and initializes it as if it were being used by Codex Desktop. During initialization, the client advertises that it supports the experimental API and can answer attestation requests. The test starts a thread, starts a turn with a simple user message, and then watches messages from the server. When the server asks for an attestation token, the test replies with a known token. Finally, it checks the fake WebSocket server’s recorded handshake to make sure the outgoing connection included the expected `x-oai-attestation` header. The helper function at the bottom writes the exact config needed to force this path.
 
 #### Function details
 
@@ -863,11 +867,11 @@ Initialization is performed with explicit client metadata (`codex_desktop`) and 
 async fn attestation_generate_round_trip_adds_header_to_responses_websocket_handshake() -> Result<()>
 ```
 
-**Purpose**: Exercises the full attestation flow for websocket-backed Responses API turns. It verifies that the server requests attestation from the client and forwards the returned token in the websocket handshake header.
+**Purpose**: This is the main integration test. It proves that when the app server needs an attestation token for a WebSocket connection, it asks the client for one and adds the resulting value to the outgoing WebSocket handshake header.
 
-**Data flow**: Starts a local websocket server with one throwaway connection config and one real response-stream config, creates temp codex-home config via `create_chatgpt_websocket_config`, writes ChatGPT auth, starts the app server with `OPENAI_API_KEY` unset, initializes it with client info and capabilities requesting attestation, starts a thread and then a turn, loops over incoming JSON-RPC messages responding to each `ServerRequest::AttestationGenerate` with `AttestationGenerateResponse { token: ATTESTATION_HEADER }` until `turn/completed` arrives, asserts at least one attestation request was seen, waits for one websocket handshake on the test server, and asserts the handshake's `x-oai-attestation` header equals `APP_SERVER_ATTESTATION_HEADER`; finally shuts down the websocket server.
+**Data flow**: The test starts with a fake local WebSocket server, a temporary configuration folder, and fake ChatGPT credentials. It launches the app server with that setup, initializes it with a client that says it can provide attestations, starts a conversation turn, and waits for the server to request an attestation. The test sends back a known token, then inspects the fake WebSocket server’s recorded handshake. The expected result is that the handshake contains the `x-oai-attestation` header with the app server’s wrapped version of that token.
 
-**Call relations**: This is the file's sole top-level test and drives both the JSON-RPC control plane and websocket transport plane to verify attestation propagation.
+**Call relations**: This function drives the whole scenario. It calls the local helper `create_chatgpt_websocket_config` to write a test configuration, uses test-support tools to start the fake WebSocket service and app server, and responds when the app server sends an attestation request. The final check connects the incoming server request, the test’s reply, and the outgoing WebSocket header into one end-to-end proof.
 
 *Call graph*: calls 4 internal fn (new, new_with_env, create_chatgpt_websocket_config, start_websocket_server_with_headers); 14 external calls (default, try_from, new, Integer, default, to_response, write_chatgpt_auth, assert!, assert_eq!, bail! (+4 more)).
 
@@ -878,22 +882,24 @@ async fn attestation_generate_round_trip_adds_header_to_responses_websocket_hand
 fn create_chatgpt_websocket_config(codex_home: &Path, server_uri: &str) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes a provider config that forces websocket-capable, OpenAI-authenticated Responses API traffic against a supplied local server URI.
+**Purpose**: This helper writes a temporary `config.toml` file that makes the app server use the fake test server as its ChatGPT provider. It keeps the main test focused on behavior instead of file-writing details.
 
-**Data flow**: Takes codex-home path and `server_uri` → writes `config.toml` containing model defaults, `model_provider = "mock_provider"`, and a `[model_providers.mock_provider]` section with `base_url = "{server_uri}/v1"`, `wire_api = "responses"`, zero retries, `requires_openai_auth = true`, and `supports_websockets = true` → returns `std::io::Result<()>`.
+**Data flow**: It receives the temporary Codex home path and the fake server’s base address. It builds a small TOML configuration string that selects a mock model provider, enables the responses API over WebSockets, disables retries, and marks the provider as requiring OpenAI-style authentication. It writes that text to `config.toml` inside the temporary home folder and returns success or a file-writing error.
 
-**Call relations**: Called by the attestation round-trip test before starting the app server so the turn uses the websocket transport under test.
+**Call relations**: The main test calls this before starting the app server. That timing matters because the app server reads this configuration at startup, so the helper sets the route that later causes the app server’s conversation turn to connect to the fake WebSocket server where the handshake header can be checked.
 
 *Call graph*: called by 1 (attestation_generate_round_trip_adds_header_to_responses_websocket_handshake); 3 external calls (join, format!, write).
 
 
 ### `app-server/tests/suite/v2/experimental_api.rs`
 
-`test` · `startup and request validation`
+`test` · `test run`
 
-This file is a focused capability-gating test suite for the app server's experimental API surface. Most tests follow the same pattern: create a temporary Codex home, optionally write a minimal mock-provider `config.toml`, start `TestAppServer`, initialize it with `InitializeCapabilities { experimental_api: false, ... }`, verify initialization returned a JSON-RPC response rather than some other message, then send one experimental request or a request containing one experimental field. The expected failure shape is standardized through `assert_experimental_capability_error`: JSON-RPC code `-32600`, a message of the form `"<reason> requires experimentalApi capability"`, and no error data.
+This is a safety net for the server’s experimental features. The app server speaks JSON-RPC, a request-and-response message format where each request has a method name and an id. Some methods and fields are marked experimental, meaning clients should not be able to use them unless they opted in during initialization. Without these tests, a client could accidentally rely on unstable behavior, or the server could expose features it meant to keep behind a capability flag.
 
-The covered surface includes the dedicated mock experimental method, realtime conversation start (including explicit WebRTC transport), thread memory mode changes, thread settings updates, `ThreadStartParams.mock_experimental_field`, and granular approval policy via `AskForApproval::Granular`. One positive control confirms that a normal `thread/start` with only a model set is still accepted without the capability, proving the gate is field-specific rather than blanket denial of thread creation. Helper functions keep the tests concise: `default_client_info` produces a stable `ClientInfo` using `DEFAULT_CLIENT_NAME`, and `create_config_toml` writes the minimal provider configuration needed for thread-start tests that must parse model settings.
+Each test starts a temporary server home directory, launches a test app server, and initializes it as a client that says `experimental_api: false`. Then the test sends one request that uses an experimental method or option. The expected result is a JSON-RPC error saying that the exact method or field requires the `experimentalApi` capability.
+
+A few tests create a mock model-provider configuration first, because starting a thread needs a provider to talk to. One test is the important counterexample: it starts a normal thread without experimental fields and confirms that the server accepts it even without experimental access. In other words, this file checks both sides of the gate: experimental things are blocked, but normal things are not.
 
 #### Function details
 
@@ -903,11 +909,11 @@ The covered surface includes the dedicated mock experimental method, realtime co
 async fn mock_experimental_method_requires_experimental_api_capability() -> Result<()>
 ```
 
-**Purpose**: Verifies that calling the mock experimental RPC method without `experimental_api` enabled is rejected with the standard invalid-request error.
+**Purpose**: This test proves that the mock experimental JSON-RPC method is blocked unless the client opts into experimental API support. It protects the server from accepting a clearly experimental method from a non-experimental client.
 
-**Data flow**: It creates a temp home, starts `TestAppServer`, initializes with `default_client_info()` and `InitializeCapabilities` where `experimental_api` is false, pattern-matches the initialize result as `JSONRPCMessage::Response`, then sends `MockExperimentalMethodParams::default()`. It waits for the error message for that request ID and passes the resulting `JSONRPCError` plus the method name string to `assert_experimental_capability_error`.
+**Data flow**: It creates a temporary server home, starts a test app server, and initializes it with `experimental_api` set to false. It then sends a mock experimental request, waits for the matching error response, and checks that the error says `mock/experimentalMethod` requires the experimental capability.
 
-**Call relations**: The test harness invokes it directly. It depends on `default_client_info` to build the initialize payload and delegates final validation to `assert_experimental_capability_error` after the server returns an error for the experimental method call.
+**Call relations**: This test uses `default_client_info` to build the fake client identity and `assert_experimental_capability_error` to verify the exact error shape. It relies on the test server helpers to start the server, send the request, and read the JSON-RPC error before the timeout.
 
 *Call graph*: calls 3 internal fn (new, assert_experimental_capability_error, default_client_info); 5 external calls (new, bail!, Integer, default, timeout).
 
@@ -918,11 +924,11 @@ async fn mock_experimental_method_requires_experimental_api_capability() -> Resu
 async fn realtime_conversation_start_requires_experimental_api_capability() -> Result<()>
 ```
 
-**Purpose**: Confirms that `thread/realtime/start` is capability-gated even for a basic audio realtime session request.
+**Purpose**: This test checks that starting a realtime audio conversation is treated as experimental. A client that did not opt in should receive a clear rejection instead of starting the session.
 
-**Data flow**: It initializes a fresh server with `experimental_api: false`, then sends `ThreadRealtimeStartParams` populated with a thread ID, audio output modality, and a prompt. After waiting for the request-specific error response, it validates the error contents against the expected `thread/realtime/start` reason string.
+**Data flow**: It starts a fresh test server, initializes as a client without experimental API support, and sends a `thread/realtime/start` request with audio output and a simple prompt. It waits for the response tied to that request id, then confirms the server returned the expected capability error.
 
-**Call relations**: Called by the test runner, it follows the common initialize-then-request pattern and uses `default_client_info` plus `assert_experimental_capability_error` to keep setup and assertions consistent with the other gating tests.
+**Call relations**: Like the other gatekeeping tests, it gets client details from `default_client_info` and sends the final error into `assert_experimental_capability_error`. The timeout wrapper keeps the test from hanging if the server fails to answer.
 
 *Call graph*: calls 3 internal fn (new, assert_experimental_capability_error, default_client_info); 4 external calls (new, bail!, Integer, timeout).
 
@@ -933,11 +939,11 @@ async fn realtime_conversation_start_requires_experimental_api_capability() -> R
 async fn thread_memory_mode_set_requires_experimental_api_capability() -> Result<()>
 ```
 
-**Purpose**: Checks that changing a thread's memory mode is treated as experimental and rejected when the client did not opt into the experimental API.
+**Purpose**: This test makes sure changing a thread’s memory mode is not allowed for clients that have not enabled the experimental API. It verifies that memory-related experimental controls stay behind the capability gate.
 
-**Data flow**: It starts and initializes the server with experimental support disabled, sends `ThreadMemoryModeSetParams` targeting `thr_123` with `ThreadMemoryMode::Disabled`, waits for the JSON-RPC error tied to that request ID, and validates the code/message/data triple through the shared assertion helper.
+**Data flow**: It creates and initializes a test server with experimental support turned off. Then it asks to set the memory mode for a sample thread to disabled, reads the matching JSON-RPC error, and checks that the error names `thread/memoryMode/set` as requiring experimental access.
 
-**Call relations**: This test is another direct harness entrypoint. It uses `default_client_info` during initialization and funnels the returned error into `assert_experimental_capability_error` with the `thread/memoryMode/set` reason.
+**Call relations**: The setup follows the same pattern as the other tests: `default_client_info` supplies the client metadata, and `assert_experimental_capability_error` checks the server’s rejection. The test server helper sends the memory-mode request and reads the response stream.
 
 *Call graph*: calls 3 internal fn (new, assert_experimental_capability_error, default_client_info); 4 external calls (new, bail!, Integer, timeout).
 
@@ -948,11 +954,11 @@ async fn thread_memory_mode_set_requires_experimental_api_capability() -> Result
 async fn thread_settings_update_requires_experimental_api_capability() -> Result<()>
 ```
 
-**Purpose**: Ensures `thread/settings/update` cannot be used by clients that did not advertise experimental API support.
+**Purpose**: This test verifies that updating thread settings is an experimental operation when called through this API. A non-experimental client should not be able to change those settings.
 
-**Data flow**: After standard initialization with `experimental_api: false`, it sends `ThreadSettingsUpdateParams` containing a thread ID and default values for the remaining fields. It waits for the request's error response and checks that the server reports `thread/settings/update requires experimentalApi capability` with code `-32600` and no data.
+**Data flow**: It starts a test server, initializes with `experimental_api` set to false, and sends a thread settings update request for a sample thread using otherwise default settings. It waits for the server error and checks that the message points to `thread/settings/update` as the blocked feature.
 
-**Call relations**: Invoked by the test harness, it mirrors the other negative tests and delegates the exact error-shape check to `assert_experimental_capability_error`.
+**Call relations**: It shares the common client setup through `default_client_info` and the common error check through `assert_experimental_capability_error`. The default parameter helper fills in unused fields so the test focuses only on the capability rule.
 
 *Call graph*: calls 3 internal fn (new, assert_experimental_capability_error, default_client_info); 5 external calls (default, new, bail!, Integer, timeout).
 
@@ -963,11 +969,11 @@ async fn thread_settings_update_requires_experimental_api_capability() -> Result
 async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<()>
 ```
 
-**Purpose**: Verifies that the WebRTC variant of realtime start is also blocked behind the same experimental capability gate.
+**Purpose**: This test checks the WebRTC form of realtime conversation startup. WebRTC is a browser-friendly realtime media transport, and this test makes sure it also requires experimental API opt-in.
 
-**Data flow**: It initializes the server without experimental support, sends `ThreadRealtimeStartParams` whose `transport` is `Some(ThreadRealtimeStartTransport::Webrtc { sdp })`, waits for the error response for that request ID, and validates the returned `JSONRPCError` against the shared expectation for `thread/realtime/start`.
+**Data flow**: It launches a fresh test server and initializes a client without experimental support. The test sends a realtime start request that includes a WebRTC offer string, then reads the error for that request and verifies that `thread/realtime/start` is rejected for lacking experimental capability.
 
-**Call relations**: This test is entered by the async test runner and reuses `default_client_info` and `assert_experimental_capability_error`; its distinguishing input is the explicit WebRTC transport payload.
+**Call relations**: This is a variant of the realtime start test, but with the transport field set to WebRTC. It uses `default_client_info` for setup and `assert_experimental_capability_error` for the shared expected-error check.
 
 *Call graph*: calls 3 internal fn (new, assert_experimental_capability_error, default_client_info); 4 external calls (new, bail!, Integer, timeout).
 
@@ -978,11 +984,11 @@ async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<
 async fn thread_start_mock_field_requires_experimental_api_capability() -> Result<()>
 ```
 
-**Purpose**: Checks that an experimental field embedded inside `thread/start` is rejected even though the base method itself is normally allowed.
+**Purpose**: This test confirms that even an experimental field inside an otherwise normal `thread/start` request is blocked. The server should reject the specific field, not silently accept it.
 
-**Data flow**: It first creates a mock responses server and writes a minimal provider config via `create_config_toml`, then initializes `TestAppServer` with `experimental_api: false`. It sends `ThreadStartParams` with `mock_experimental_field: Some("mock")`, waits for the error response, and validates that the reason string names `thread/start.mockExperimentalField`.
+**Data flow**: It starts a mock model-provider server, writes a temporary configuration that points to it, and launches the app server. After initializing without experimental API support, it sends a thread start request containing `mock_experimental_field`. The test reads the error response and verifies that the message names `thread/start.mockExperimentalField`.
 
-**Call relations**: The test runner invokes it directly. It relies on `create_config_toml` because thread start needs model-provider configuration, and then uses `assert_experimental_capability_error` to verify the field-level gate.
+**Call relations**: `create_config_toml` prepares the local config needed for thread startup, and `default_client_info` supplies the client identity. Once the request fails, `assert_experimental_capability_error` checks that the rejection is the standard experimental-capability error.
 
 *Call graph*: calls 4 internal fn (new, assert_experimental_capability_error, create_config_toml, default_client_info); 7 external calls (default, new, new, bail!, Integer, create_mock_responses_server_sequence_unchecked, timeout).
 
@@ -993,11 +999,11 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
 async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capability() -> Result<()>
 ```
 
-**Purpose**: Provides the positive control showing that ordinary thread creation still works when experimental API support is disabled.
+**Purpose**: This test is the positive control: it proves that normal thread startup still works when experimental API support is off. That matters because the capability gate should block only experimental features, not the basic product flow.
 
-**Data flow**: It creates a mock provider config, initializes the server with `experimental_api: false`, sends `ThreadStartParams` containing only `model: Some("mock-model")`, waits for a normal JSON-RPC response, and deserializes it into `ThreadStartResponse`. The test succeeds if deserialization works and no error is returned.
+**Data flow**: It creates a mock provider, writes a matching config file, starts the app server, and initializes a client without experimental support. It then sends a plain thread start request with a model name, waits for a normal JSON-RPC response, and parses it as a `ThreadStartResponse`.
 
-**Call relations**: This test is the counterpart to the negative thread-start cases. It uses `create_config_toml` for provider setup and `to_response` to prove the server accepted the non-experimental request path.
+**Call relations**: `create_config_toml` makes the mock provider usable by the server, and `default_client_info` keeps initialization consistent with the other tests. Instead of calling the shared error assertion, this test converts the response with `to_response` to prove the request succeeded.
 
 *Call graph*: calls 3 internal fn (new, create_config_toml, default_client_info); 8 external calls (default, new, new, bail!, Integer, create_mock_responses_server_sequence_unchecked, to_response, timeout).
 
@@ -1008,11 +1014,11 @@ async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capa
 async fn thread_start_granular_approval_policy_requires_experimental_api_capability() -> Result<()>
 ```
 
-**Purpose**: Verifies that the granular approval-policy variant on thread start is considered experimental and rejected without the capability.
+**Purpose**: This test checks that the granular approval policy is experimental. Granular approval means separate switches for different kinds of permission prompts, and the server should not allow that detailed policy unless the client opted in.
 
-**Data flow**: It writes provider config, initializes with `experimental_api: false`, sends `ThreadStartParams` whose `approval_policy` is `Some(AskForApproval::Granular { ... })`, waits for the request error, and checks that the reason string is `askForApproval.granular`.
+**Data flow**: It prepares a mock provider configuration, starts the app server, and initializes without experimental support. It sends a thread start request whose approval policy is the granular variant, reads the error for that request, and confirms the server says `askForApproval.granular` requires experimental access.
 
-**Call relations**: Invoked by the test harness, it shares setup with the other thread-start tests and delegates exact error validation to `assert_experimental_capability_error`.
+**Call relations**: `create_config_toml` supplies the test configuration needed before a thread can start, while `default_client_info` supplies the fake client identity. The final error is checked through `assert_experimental_capability_error`, matching the pattern used by the other blocked-feature tests.
 
 *Call graph*: calls 4 internal fn (new, assert_experimental_capability_error, create_config_toml, default_client_info); 7 external calls (default, new, new, bail!, Integer, create_mock_responses_server_sequence_unchecked, timeout).
 
@@ -1023,11 +1029,11 @@ async fn thread_start_granular_approval_policy_requires_experimental_api_capabil
 fn default_client_info() -> ClientInfo
 ```
 
-**Purpose**: Constructs the standard `ClientInfo` used by this file's initialization calls.
+**Purpose**: This helper builds the same simple client identity for every test. It keeps the tests focused on experimental capability behavior instead of repeating client-name and version details.
 
-**Data flow**: It takes no arguments and returns a `ClientInfo` with `name` copied from `DEFAULT_CLIENT_NAME`, `title` set to `None`, and `version` fixed at `0.1.0`. It does not read or mutate external state.
+**Data flow**: It takes no input. It returns a `ClientInfo` value with the default test client name, no title, and version `0.1.0`.
 
-**Call relations**: All tests in this file that call `initialize_with_capabilities` use this helper so they share the same client identity while varying only capability flags and subsequent requests.
+**Call relations**: All the tests call this during initialization so they present themselves to the server in a consistent way. The only thing the tests vary is the capability flag, which makes failures easier to understand.
 
 *Call graph*: called by 8 (mock_experimental_method_requires_experimental_api_capability, realtime_conversation_start_requires_experimental_api_capability, realtime_webrtc_start_requires_experimental_api_capability, thread_memory_mode_set_requires_experimental_api_capability, thread_settings_update_requires_experimental_api_capability, thread_start_granular_approval_policy_requires_experimental_api_capability, thread_start_mock_field_requires_experimental_api_capability, thread_start_without_dynamic_tools_allows_without_experimental_api_capability).
 
@@ -1038,11 +1044,11 @@ fn default_client_info() -> ClientInfo
 fn assert_experimental_capability_error(error: JSONRPCError, reason: &str)
 ```
 
-**Purpose**: Centralizes the exact JSON-RPC error shape expected when an experimental method or field is used without `experimentalApi` capability.
+**Purpose**: This helper checks that a server error is exactly the expected experimental-capability rejection. It avoids copying the same three assertions into every test.
 
-**Data flow**: It accepts a `JSONRPCError` and a reason string, reads `error.error.code`, `message`, and `data`, and asserts that they equal `-32600`, `"<reason> requires experimentalApi capability"`, and `None` respectively. It returns unit and only produces output through assertion failures.
+**Data flow**: It receives a JSON-RPC error and the method or field name that should appear in the message. It checks that the error code is `-32600`, the message says that the named feature requires `experimentalApi` capability, and there is no extra error data.
 
-**Call relations**: Every negative test in this file calls it after obtaining an error response, so it serves as the shared terminal assertion step for the capability-gating flow.
+**Call relations**: The tests that expect rejection pass their received server error here after reading it from the test server stream. This helper is the shared ruler that makes sure all experimental-gate failures look the same.
 
 *Call graph*: called by 7 (mock_experimental_method_requires_experimental_api_capability, realtime_conversation_start_requires_experimental_api_capability, realtime_webrtc_start_requires_experimental_api_capability, thread_memory_mode_set_requires_experimental_api_capability, thread_settings_update_requires_experimental_api_capability, thread_start_granular_approval_policy_requires_experimental_api_capability, thread_start_mock_field_requires_experimental_api_capability); 1 external calls (assert_eq!).
 
@@ -1053,11 +1059,11 @@ fn assert_experimental_capability_error(error: JSONRPCError, reason: &str)
 fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()>
 ```
 
-**Purpose**: Writes the minimal `config.toml` needed for tests that must start threads against a mock Responses provider.
+**Purpose**: This helper writes a minimal test configuration file that tells the app server to use a mock model provider. Tests need this when they send `thread/start` requests, because thread startup expects model-provider settings to exist.
 
-**Data flow**: It takes a Codex home path and mock server URI, joins `config.toml` under the home directory, formats a TOML string containing model, approval policy, sandbox mode, provider selection, and provider endpoint/retry settings, and writes that file to disk. It returns the `std::io::Result<()>` from `std::fs::write`.
+**Data flow**: It receives the temporary Codex home directory and the mock server’s URI. It writes a `config.toml` file there with a mock model, a safe approval policy, read-only sandbox mode, and provider connection details pointing at the mock server. It returns success or a file-writing error.
 
-**Call relations**: Only the thread-start-related tests call this helper, because those requests need a configured model provider before the server can accept them.
+**Call relations**: The thread-start tests call this before launching or using the app server so the server can resolve the model provider during the request. It is not used by tests that only check methods rejected before any provider configuration matters.
 
 *Call graph*: called by 3 (thread_start_granular_approval_policy_requires_experimental_api_capability, thread_start_mock_field_requires_experimental_api_capability, thread_start_without_dynamic_tools_allows_without_experimental_api_capability); 3 external calls (join, format!, write).
 
@@ -1067,11 +1073,13 @@ This suite exercises full end-to-end realtime conversation behavior across trans
 
 ### `app-server/tests/suite/v2/realtime_conversation.rs`
 
-`test` · `request handling`
+`test` · `test execution`
 
-This is a large integration-style test suite for realtime conversation behavior. It defines small protocol fixtures (`session_updated`, `v2_background_agent_tool_call`), assertion helpers for expected upstream sideband frames, and a reusable `RealtimeE2eHarness` that wires together a `TestAppServer`, a mock Responses server for ordinary background-agent turns, a fake realtime sideband WebSocket server, captured WebRTC call-create requests, config generation, API-key login, and an initial thread. The harness can start realtime over plain WebSocket or WebRTC, append audio/text/speech, inspect outbound sideband frames, and collect mocked Responses requests.
+Realtime conversation is a complicated path: the app server talks to a client over JSON-RPC, talks to a mocked OpenAI Responses endpoint for background work, and talks to a mocked realtime WebSocket for live speech and text events. This file builds that whole miniature world in tests. Think of it like a stage set: fake servers play the outside services, a TestAppServer plays the real app server, and each test watches what messages move between them.
 
-The tests cover startup-context generation and suppression, supported voice listing, stop/closed notifications, and backend error surfacing. They also distinguish Realtime V1 and V2 semantics: v1 uses `quicksilver`, no tools, and `conversation.handoff.append`; v2 uses `realtime`, explicit `background_agent` and `remain_silent` tools, developer/user item injection, and `function_call_output` plus optional `response.create`. Several regressions focus on delegated background-agent turns triggered from realtime tool calls, including transcript-envelope construction, steering while a task is active, ordering of progress updates before final function output, shell-tool execution inside delegated turns, and ensuring sideband audio continues while delegated work is blocked. Additional tests verify append-only text behavior while a realtime response is active or cancelled, and that long backend outputs are truncated before being injected back into realtime context. The file also includes low-level helpers for multipart WebRTC call assertions, JSON normalization, gated SSE responses, config writing keyed off feature flags, and notification polling.
+The tests cover both older v1 realtime behavior and newer v2 behavior. They verify that starting a realtime session sends the right session settings, WebRTC offers are posted as multipart requests, SDP answers are returned to the client, audio and text are forwarded correctly, and server events become typed client notifications. They also check the handoff path where realtime asks a background agent to do work, including progress updates, final function-call outputs, steering an already-running task, and delegated shell commands.
+
+Many helper functions keep the tests readable. The harness creates temporary config, starts mock HTTP and WebSocket servers, logs in with a fake API key, starts a thread, and offers small methods for sending realtime input or reading notifications. Without this file, regressions in the realtime protocol could silently break desktop or voice clients.
 
 #### Function details
 
@@ -1081,11 +1089,11 @@ The tests cover startup-context generation and suppression, supported voice list
 fn new() -> Self
 ```
 
-**Purpose**: Creates a request-capture matcher that records every wiremock request it sees.
+**Purpose**: Creates a small recorder for WebRTC call-creation HTTP requests. Tests use it when they need to inspect exactly what the app server posted to the realtime calls endpoint.
 
-**Data flow**: Allocates an `Arc<Mutex<Vec<WiremockRequest>>>` initialized to an empty vector and returns `RealtimeCallRequestCapture { requests }`.
+**Data flow**: It starts with no inputs, creates an empty shared list protected by a mutex, and returns a capture object that can safely collect requests from the mock server.
 
-**Call relations**: Harness setup and direct WebRTC tests instantiate this helper before mounting `/v1/realtime/calls` so later assertions can inspect the exact multipart request body.
+**Call relations**: The realtime harness and WebRTC-specific tests create this before mounting a mock endpoint. Later, the mock matching hook records incoming requests and tests read them back with `RealtimeCallRequestCapture::single_request`.
 
 *Call graph*: called by 5 (new_with_main_loop_responses_server_and_sandbox, realtime_webrtc_start_emits_sdp_notification, conversation_webrtc_start_posts_generated_session, conversation_webrtc_start_uses_avas_architecture_query, conversation_webrtc_start_uses_configured_call_base_url_for_avas); 3 external calls (new, new, new).
 
@@ -1096,11 +1104,11 @@ fn new() -> Self
 fn single_request(&self) -> WiremockRequest
 ```
 
-**Purpose**: Returns the only captured realtime call-create request, asserting exactly one was recorded.
+**Purpose**: Returns the one captured realtime call request and fails the test if there was not exactly one. This keeps tests strict about duplicate or missing WebRTC call creation.
 
-**Data flow**: Locks the internal request vector, recovers from poison by taking the inner value, asserts `len() == 1`, clones the sole `WiremockRequest`, and returns it.
+**Data flow**: It reads the shared request list, checks that its length is one, clones that request, and gives the clone back to the test.
 
-**Call relations**: WebRTC tests call this after startup to inspect the call-create HTTP request and verify SDP/session payload formatting.
+**Call relations**: WebRTC tests call this after starting realtime. The returned request is then passed to assertions such as `assert_call_create_multipart` or inspected directly.
 
 *Call graph*: 1 external calls (assert_eq!).
 
@@ -1111,11 +1119,11 @@ fn single_request(&self) -> WiremockRequest
 fn matches(&self, request: &WiremockRequest) -> bool
 ```
 
-**Purpose**: Implements `wiremock::Match` by recording the incoming request and always matching it.
+**Purpose**: Records every HTTP request that reaches the mock realtime call endpoint. It always returns true so it behaves as a passive recorder, not a filter.
 
-**Data flow**: Locks the internal request vector, pushes a clone of the incoming `WiremockRequest`, and returns `true`.
+**Data flow**: It receives a mock HTTP request, locks the shared list, stores a clone of the request, and reports that the request matched.
 
-**Call relations**: Wiremock invokes this matcher whenever the mounted `/v1/realtime/calls` endpoint is hit, allowing tests to capture requests without constraining them.
+**Call relations**: Wiremock calls this while matching `/v1/realtime/calls`. Tests later retrieve the captured request through `single_request` to verify headers and body content.
 
 *Call graph*: 1 external calls (clone).
 
@@ -1126,11 +1134,11 @@ fn matches(&self, request: &WiremockRequest) -> bool
 fn normalized_json_string(raw: &str) -> Result<String>
 ```
 
-**Purpose**: Parses and reserializes JSON to a canonical compact string for stable multipart-body comparisons.
+**Purpose**: Turns a JSON string into a stable, compact JSON string for comparison. This avoids false test failures caused only by spacing or formatting differences.
 
-**Data flow**: Parses the input string into `serde_json::Value`, adds context if parsing fails, then serializes it back with `serde_json::to_string`, again adding context on failure.
+**Data flow**: It takes raw JSON text, parses it into a JSON value, serializes that value back into a normalized string, and returns an error if either step fails.
 
-**Call relations**: Multipart assertion helpers and one direct WebRTC test use this to compare JSON session payloads independent of whitespace formatting.
+**Call relations**: Multipart assertion helpers and WebRTC tests use this before comparing generated session JSON with expected JSON embedded in the test.
 
 *Call graph*: called by 2 (assert_call_create_multipart, realtime_webrtc_start_emits_sdp_notification); 2 external calls (from_str, to_string).
 
@@ -1141,11 +1149,11 @@ fn normalized_json_string(raw: &str) -> Result<String>
 fn respond(&self, _: &WiremockRequest) -> ResponseTemplate
 ```
 
-**Purpose**: Delays an SSE response until an external gate is released, then returns the scripted SSE payload.
+**Purpose**: Delays a mocked streaming response until a test explicitly opens a gate. This lets tests simulate a background agent task that is still running.
 
-**Data flow**: Locks `gate_rx`, takes the optional `mpsc::Receiver<()>`, blocks on `recv()` if present, and finally returns `responses::sse_response(self.response.clone())`.
+**Data flow**: It receives a mock HTTP request, waits on a one-shot channel if one is present, then returns the stored server-sent-events response text. Server-sent events are streaming HTTP messages.
 
-**Call relations**: Steering and nonblocking-audio tests mount this responder on the mock Responses server to keep a delegated background-agent turn in flight while other realtime events continue.
+**Call relations**: Wiremock calls this when a delegated Responses request arrives. Concurrency tests use the delay to prove realtime sideband messages still flow while background work is blocked.
 
 *Call graph*: calls 1 internal fn (sse_response).
 
@@ -1156,11 +1164,11 @@ fn respond(&self, _: &WiremockRequest) -> ResponseTemplate
 fn config_value(self) -> &'static str
 ```
 
-**Purpose**: Maps the test enum to the config string used in `[realtime].version`.
+**Purpose**: Converts the test enum for realtime version into the string expected in the temporary config file.
 
-**Data flow**: Returns `"v1"` for `RealtimeTestVersion::V1` and `"v2"` for `RealtimeTestVersion::V2`.
+**Data flow**: It takes either the V1 or V2 enum value and returns `"v1"` or `"v2"`.
 
-**Call relations**: Config-writing helpers call this when generating `config.toml` for harness-backed tests.
+**Call relations**: `create_config_toml_with_realtime_version` calls this while writing config for each harness or direct test setup.
 
 *Call graph*: called by 1 (create_config_toml_with_realtime_version).
 
@@ -1171,11 +1179,11 @@ fn config_value(self) -> &'static str
 fn config_value(self) -> &'static str
 ```
 
-**Purpose**: Maps the sandbox enum to the config string used in `sandbox_mode`.
+**Purpose**: Converts the test sandbox choice into the config-file string used by the app server.
 
-**Data flow**: Returns `"read-only"` or `"danger-full-access"` depending on the enum variant.
+**Data flow**: It takes the sandbox enum and returns either `"read-only"` or `"danger-full-access"`.
 
-**Call relations**: Harness config generation uses this to switch delegated-turn shell-tool permissions for specific tests.
+**Call relations**: `create_config_toml_with_realtime_version` uses this so tests can choose whether delegated shell tools are allowed.
 
 *Call graph*: called by 1 (create_config_toml_with_realtime_version).
 
@@ -1190,11 +1198,11 @@ async fn new(
     ) -> Result<Self>
 ```
 
-**Purpose**: Builds a full realtime test harness using a scripted Responses server and default read-only sandbox.
+**Purpose**: Builds the standard realtime end-to-end test harness with a read-only sandbox. It is the common setup path for most tests.
 
-**Data flow**: Starts a mock Responses server from the provided scripted SSE responses, then forwards all setup to `new_with_main_loop_responses_server_and_sandbox` with `RealtimeTestSandbox::ReadOnly`.
+**Data flow**: It receives a realtime version, scripted Responses output, and scripted realtime WebSocket behavior. It starts a mock Responses server from the script, then delegates to the fuller setup method and returns a ready harness.
 
-**Call relations**: Most realtime integration tests call this constructor to get a ready-to-use app server, thread id, sideband server, and call-capture fixture.
+**Call relations**: Most WebRTC realtime tests call this first. It hands setup work to `new_with_main_loop_responses_server_and_sandbox` so all harness variants share the same core initialization.
 
 *Call graph*: called by 11 (realtime_automatic_handoff_output_is_item_and_append_speaks, realtime_automatic_standalone_output_is_item_and_append_speaks, webrtc_v1_default_automatic_output_uses_handoff_append, webrtc_v1_handoff_request_delegates_context_and_manual_append_speaks, webrtc_v1_start_posts_offer_returns_sdp_and_joins_sideband, webrtc_v2_assistant_output_without_handoff_reaches_realtime_context, webrtc_v2_background_agent_progress_is_sent_before_function_output, webrtc_v2_background_agent_tool_call_delegates_and_returns_function_output, webrtc_v2_forwards_audio_and_text_between_client_and_sideband, webrtc_v2_text_input_is_append_only_when_response_is_cancelled (+1 more)); 2 external calls (new_with_main_loop_responses_server_and_sandbox, create_mock_responses_server_sequence_unchecked).
 
@@ -1209,11 +1217,11 @@ async fn new_with_sandbox(
         sandbox: RealtimeTestSa
 ```
 
-**Purpose**: Builds the full realtime harness while allowing the caller to choose the sandbox mode.
+**Purpose**: Builds the realtime harness while letting the test choose the sandbox mode. This is needed for tests that expect delegated shell commands to run.
 
-**Data flow**: Starts a mock Responses server from the provided script and forwards setup to `new_with_main_loop_responses_server_and_sandbox` with the supplied sandbox enum.
+**Data flow**: It takes version, main-loop script, sideband script, and sandbox choice. It creates the mock Responses server, writes matching config through the shared setup path, and returns the harness.
 
-**Call relations**: The delegated shell-tool test uses this constructor so the background-agent turn can execute shell commands under `danger-full-access`.
+**Call relations**: The delegated shell-tool test uses this with a permissive sandbox. Internally it follows the same setup route as `RealtimeE2eHarness::new`.
 
 *Call graph*: called by 1 (webrtc_v2_tool_call_delegated_turn_can_execute_shell_tool); 2 external calls (new_with_main_loop_responses_server_and_sandbox, create_mock_responses_server_sequence_unchecked).
 
@@ -1228,11 +1236,11 @@ async fn new_with_main_loop_responses_server(
     ) ->
 ```
 
-**Purpose**: Builds the harness around an already-created mock Responses server, using the default read-only sandbox.
+**Purpose**: Builds the realtime harness around a mock Responses server that the test created itself. This is useful when the test needs special server behavior, such as delayed streaming.
 
-**Data flow**: Forwards the provided `MockServer`, realtime version, and sideband script to `new_with_main_loop_responses_server_and_sandbox` with `ReadOnly` sandbox.
+**Data flow**: It receives an already-running mock Responses server plus realtime version and sideband script, then forwards everything to the shared setup method with the default read-only sandbox.
 
-**Call relations**: Tests that need custom wiremock behavior, such as gated SSE responses, call this constructor instead of letting the harness create the Responses server.
+**Call relations**: Tests for steering and nonblocking audio create custom gated servers and then call this to plug them into the rest of the harness.
 
 *Call graph*: called by 2 (webrtc_v2_background_agent_steering_ack_requests_response_create, webrtc_v2_tool_call_does_not_block_sideband_audio); 1 external calls (new_with_main_loop_responses_server_and_sandbox).
 
@@ -1246,11 +1254,11 @@ async fn new_with_main_loop_responses_server_and_sandbox(
         realtime_sideband: RealtimeSidebandScri
 ```
 
-**Purpose**: Performs the complete harness setup: call-create mock, sideband WebSocket server, config file, app-server startup, API-key login, and initial thread creation.
+**Purpose**: Performs the full harness setup: mock HTTP endpoints, mock WebSocket realtime server, temporary config, app-server startup, login, and initial thread creation.
 
-**Data flow**: Creates a `RealtimeCallRequestCapture`, mounts `POST /v1/realtime/calls` on the provided Responses server to return a fixed SDP answer and `Location` header, starts the sideband WebSocket server with scripted connections, creates a temp codex home, writes realtime config with selected version and sandbox, starts `TestAppServer`, initializes it, logs in with API key, sends `thread/start`, decodes `ThreadStartResponse`, and stores the resulting thread id alongside the servers and capture object in `RealtimeE2eHarness`.
+**Data flow**: It takes version, Responses server, sideband script, and sandbox. It mounts a fake WebRTC call endpoint, starts a fake realtime WebSocket, writes config, starts `TestAppServer`, logs in, creates a thread, and returns all those pieces in one harness object.
 
-**Call relations**: All harness constructors funnel into this method. It is the central orchestration point that wires together every external dependency needed by the higher-level realtime tests.
+**Call relations**: All other harness constructors funnel into this method. Later tests use the returned harness methods to start realtime, send input, read notifications, inspect upstream requests, and shut down the fake realtime server.
 
 *Call graph*: calls 5 internal fn (new, new, create_config_toml_with_realtime_version, login_with_api_key, start_websocket_server_with_headers); 11 external calls (given, uri, new, new, Integer, default, Override, to_response, timeout, method (+1 more)).
 
@@ -1261,11 +1269,11 @@ async fn new_with_main_loop_responses_server_and_sandbox(
 async fn start_webrtc_realtime(&mut self, offer_sdp: &str) -> Result<StartedWebrtcRealtime>
 ```
 
-**Purpose**: Starts realtime over WebRTC using default `codex_responses_as_items = None` behavior.
+**Purpose**: Starts a WebRTC realtime session with the default response-item settings. It gives tests a short way to begin the common WebRTC flow.
 
-**Data flow**: Delegates to `start_webrtc_realtime_with_codex_responses_as_items(offer_sdp, None)` and returns the resulting `StartedWebrtcRealtime` bundle.
+**Data flow**: It receives an offer SDP string, passes it along with no special `codex_responses_as_items` override, and returns the started notification plus SDP answer.
 
-**Call relations**: Many WebRTC tests use this convenience wrapper when they do not need to force backend responses into realtime items.
+**Call relations**: Many WebRTC tests call this after constructing the harness. It delegates to `start_webrtc_realtime_with_codex_responses_as_items` for the actual JSON-RPC request and notification reads.
 
 *Call graph*: calls 1 internal fn (start_webrtc_realtime_with_codex_responses_as_items).
 
@@ -1279,11 +1287,11 @@ async fn start_webrtc_realtime_with_codex_response_items(
     ) -> Result<StartedWebrtcRealtime>
 ```
 
-**Purpose**: Starts WebRTC realtime while explicitly enabling backend responses to be injected as realtime items.
+**Purpose**: Starts WebRTC realtime while asking Codex responses to be added as realtime conversation items. Tests use this to check context-update behavior.
 
-**Data flow**: Delegates to `start_webrtc_realtime_with_codex_responses_as_items(offer_sdp, Some(true))` and returns the started/session-SDP notifications.
+**Data flow**: It takes an offer SDP, sets the response-item option to true, and returns the same started-and-SDP result as the base starter.
 
-**Call relations**: Tests that assert backend output is reflected into realtime context call this wrapper to enable the item-injection mode.
+**Call relations**: Tests that verify backend output is inserted into realtime context call this. It shares all mechanics with `start_webrtc_realtime_with_codex_responses_as_items`.
 
 *Call graph*: calls 1 internal fn (start_webrtc_realtime_with_codex_responses_as_items).
 
@@ -1298,11 +1306,11 @@ async fn start_webrtc_realtime_with_codex_responses_as_items(
     ) -> Result<StartedWebrtcRealtime>
 ```
 
-**Purpose**: Sends the realtime-start RPC for WebRTC transport and waits for both the started and SDP notifications visible to the client.
+**Purpose**: Sends the actual JSON-RPC request that starts a WebRTC realtime session and waits for the client-visible startup notifications.
 
-**Data flow**: Builds `ThreadRealtimeStartParams` using the harness thread id, optional `codex_responses_as_items`, optional `codex_response_item_prefix`, audio output modality, optional backend prompt, and `ThreadRealtimeStartTransport::Webrtc { sdp }`. It sends the request, waits for and decodes the empty `ThreadRealtimeStartResponse`, then reads `thread/realtime/started` and `thread/realtime/sdp` notifications and returns them as `StartedWebrtcRealtime`.
+**Data flow**: It builds start parameters from the harness thread id, offer SDP, output modality, prompt, and optional response-item setting. It sends the request, waits for the response, then reads `thread/realtime/started` and `thread/realtime/sdp` notifications and returns them together.
 
-**Call relations**: All harness WebRTC start helpers route through this method. It bridges the synchronous JSON-RPC start call and the asynchronous notifications that tests assert on next.
+**Call relations**: The two simpler WebRTC start helpers call this. Its result drives the rest of each test, which then inspects sideband WebSocket messages or sends more realtime input.
 
 *Call graph*: calls 2 internal fn (read_stream_until_response_message, send_thread_realtime_start_request); called by 2 (start_webrtc_realtime, start_webrtc_realtime_with_codex_response_items); 3 external calls (Integer, to_response, timeout).
 
@@ -1313,11 +1321,11 @@ async fn start_webrtc_realtime_with_codex_responses_as_items(
 async fn read_notification(&mut self, method: &str) -> Result<T>
 ```
 
-**Purpose**: Harness-scoped wrapper around the module-level typed notification reader.
+**Purpose**: Reads one typed notification from the app server for this harness. It saves tests from repeatedly passing the underlying app-server client.
 
-**Data flow**: Forwards the mutable harness app-server handle and method string to the free `read_notification` helper and returns the deserialized notification payload.
+**Data flow**: It takes a notification method name, asks the shared `read_notification` helper to wait for that method, deserializes the payload into the requested type, and returns it.
 
-**Call relations**: Higher-level harness tests use this method to keep notification reads concise and tied to the harness instance.
+**Call relations**: Harness-based tests call this throughout turn and realtime flows. It is a thin wrapper over the file-level `read_notification` helper.
 
 *Call graph*: calls 1 internal fn (read_notification).
 
@@ -1328,11 +1336,11 @@ async fn read_notification(&mut self, method: &str) -> Result<T>
 async fn sideband_outbound_request(&self, request_index: usize) -> Value
 ```
 
-**Purpose**: Returns the nth JSON frame the app server sent upstream on the fake realtime sideband WebSocket.
+**Purpose**: Fetches a JSON message that the app server sent upstream to the fake realtime WebSocket. This lets tests inspect the protocol frames the server produced.
 
-**Data flow**: Waits under `DEFAULT_TIMEOUT` for `realtime_server.wait_for_request(0, request_index)`, panics if the timeout expires, and returns the request body parsed as JSON `Value`.
+**Data flow**: It takes a request index, waits for that indexed WebSocket request on the first connection, parses its body as JSON, and returns the JSON value. The wait is bounded by a timeout.
 
-**Call relations**: Most harness-backed tests use this to assert exact upstream protocol frames such as `session.update`, `conversation.item.create`, `function_call_output`, and `response.create`.
+**Call relations**: Most harness tests use this after starting realtime or sending input. The returned JSON is checked by assertion helpers such as `assert_v2_session_update` and `assert_v2_function_call_output`.
 
 *Call graph*: calls 1 internal fn (wait_for_request); 1 external calls (timeout).
 
@@ -1343,11 +1351,11 @@ async fn sideband_outbound_request(&self, request_index: usize) -> Value
 async fn append_audio(&mut self, thread_id: String) -> Result<()>
 ```
 
-**Purpose**: Sends a realtime append-audio RPC with a fixed sample chunk and asserts the typed success response.
+**Purpose**: Simulates a client app sending an audio chunk into an active realtime conversation.
 
-**Data flow**: Builds `ThreadRealtimeAppendAudioParams` with the provided thread id and a `ThreadRealtimeAudioChunk` containing base64 `BQYH`, 24 kHz mono metadata, and no item id; sends the request; waits for the response; decodes `ThreadRealtimeAppendAudioResponse`; and returns success.
+**Data flow**: It takes a thread id, sends a JSON-RPC append-audio request containing a small base64 audio payload and audio metadata, waits for the response, verifies it has the expected response type, and returns success.
 
-**Call relations**: Harness-backed streaming tests call this helper to drive client-to-realtime audio input without repeating request boilerplate.
+**Call relations**: Tests call this when they need to prove client audio reaches the realtime sideband. Afterward they inspect the outbound WebSocket request.
 
 *Call graph*: calls 2 internal fn (read_stream_until_response_message, send_thread_realtime_append_audio_request); 3 external calls (Integer, to_response, timeout).
 
@@ -1358,11 +1366,11 @@ async fn append_audio(&mut self, thread_id: String) -> Result<()>
 async fn append_text(&mut self, thread_id: String, text: &str) -> Result<()>
 ```
 
-**Purpose**: Sends a realtime append-text RPC as a user text message and asserts success.
+**Purpose**: Simulates a client app sending user text into an active realtime conversation.
 
-**Data flow**: Builds `ThreadRealtimeAppendTextParams` with the provided thread id, text, and `ConversationTextRole::User`, sends the request, waits for the response, decodes `ThreadRealtimeAppendTextResponse`, and returns success.
+**Data flow**: It takes a thread id and text, sends a JSON-RPC append-text request with the user role, waits for the response, checks the response type, and returns success.
 
-**Call relations**: Used by harness tests that verify user text is translated into upstream realtime conversation items.
+**Call relations**: Forwarding and append-only regression tests use this. They then read the sideband message to ensure the app server translated the text correctly.
 
 *Call graph*: calls 2 internal fn (read_stream_until_response_message, send_thread_realtime_append_text_request); 3 external calls (Integer, to_response, timeout).
 
@@ -1373,11 +1381,11 @@ async fn append_text(&mut self, thread_id: String, text: &str) -> Result<()>
 async fn append_speech(&mut self, thread_id: String, text: &str) -> Result<()>
 ```
 
-**Purpose**: Sends a realtime append-speech RPC and asserts the typed success response.
+**Purpose**: Simulates manually appending speech output for realtime to say aloud.
 
-**Data flow**: Builds `ThreadRealtimeAppendSpeechParams` from the provided thread id and text, sends the request, waits for the response, decodes `ThreadRealtimeAppendSpeechResponse`, and returns success.
+**Data flow**: It takes a thread id and text, sends a JSON-RPC append-speech request, waits for the matching response, checks the response type, and returns success.
 
-**Call relations**: Tests use this helper when they want app-server to inject spoken progress or manual updates back into realtime.
+**Call relations**: Tests for manual spoken updates call this after background output. They then verify the sideband received either a v1 handoff append or a v2 progress update plus response request.
 
 *Call graph*: calls 2 internal fn (read_stream_until_response_message, send_thread_realtime_append_speech_request); 3 external calls (Integer, to_response, timeout).
 
@@ -1388,11 +1396,11 @@ async fn append_speech(&mut self, thread_id: String, text: &str) -> Result<()>
 async fn main_loop_responses_requests(&self) -> Result<Vec<Value>>
 ```
 
-**Purpose**: Fetches the JSON bodies of all mocked Responses API requests issued during the test.
+**Purpose**: Returns the JSON request bodies sent to the mocked Responses API during the test.
 
-**Data flow**: Delegates to `responses_requests(&self.main_loop_responses_server)` and returns the collected `Vec<Value>`.
+**Data flow**: It reads the harness mock Responses server, filters for `/responses` calls, parses each body as JSON, and returns the list.
 
-**Call relations**: Delegation tests call this after a background-agent turn completes to inspect the exact prompt/context sent to the ordinary Responses API.
+**Call relations**: Delegation tests call this after a background-agent turn to confirm the prompt, transcript context, steering text, or shell output was sent to the normal background agent path.
 
 *Call graph*: calls 1 internal fn (responses_requests).
 
@@ -1403,11 +1411,11 @@ async fn main_loop_responses_requests(&self) -> Result<Vec<Value>>
 async fn shutdown(self)
 ```
 
-**Purpose**: Stops the fake realtime sideband server owned by the harness.
+**Purpose**: Stops the fake realtime WebSocket server used by the harness. This cleans up the test environment.
 
-**Data flow**: Consumes the harness and awaits `self.realtime_server.shutdown()`.
+**Data flow**: It consumes the harness and calls shutdown on its realtime server. No value is returned.
 
-**Call relations**: Most harness-backed tests call this at the end to cleanly terminate the sideband server.
+**Call relations**: Harness-based tests call this at the end so mock server tasks do not leak into later tests.
 
 *Call graph*: calls 1 internal fn (shutdown).
 
@@ -1418,11 +1426,11 @@ async fn shutdown(self)
 fn main_loop_responses(responses: Vec<String>) -> MainLoopResponsesScript
 ```
 
-**Purpose**: Wraps a vector of scripted SSE payload strings into `MainLoopResponsesScript`.
+**Purpose**: Wraps a list of scripted server-sent-event response bodies into the small struct used by the harness.
 
-**Data flow**: Constructs and returns `MainLoopResponsesScript { responses }`.
+**Data flow**: It takes a vector of response strings and returns a `MainLoopResponsesScript` containing them.
 
-**Call relations**: Many harness-backed tests use this helper to describe the mocked ordinary Responses stream that delegated background-agent turns will consume.
+**Call relations**: Tests use this when they want the mocked background-agent Responses endpoint to return specific outputs. `no_main_loop_responses` uses it for the empty case.
 
 *Call graph*: called by 9 (no_main_loop_responses, realtime_automatic_handoff_output_is_item_and_append_speaks, realtime_automatic_standalone_output_is_item_and_append_speaks, webrtc_v1_default_automatic_output_uses_handoff_append, webrtc_v1_handoff_request_delegates_context_and_manual_append_speaks, webrtc_v2_assistant_output_without_handoff_reaches_realtime_context, webrtc_v2_background_agent_progress_is_sent_before_function_output, webrtc_v2_background_agent_tool_call_delegates_and_returns_function_output, webrtc_v2_tool_call_delegated_turn_can_execute_shell_tool).
 
@@ -1433,11 +1441,11 @@ fn main_loop_responses(responses: Vec<String>) -> MainLoopResponsesScript
 fn no_main_loop_responses() -> MainLoopResponsesScript
 ```
 
-**Purpose**: Creates an empty main-loop Responses script.
+**Purpose**: Creates an empty background-agent response script. This is for tests where realtime should not call the normal Responses loop.
 
-**Data flow**: Calls `main_loop_responses(Vec::new())` and returns the resulting script.
+**Data flow**: It creates an empty vector and passes it to `main_loop_responses`, returning the script wrapper.
 
-**Call relations**: Tests that only exercise realtime transport behavior without delegated background-agent turns use this helper.
+**Call relations**: Tests that focus only on realtime WebSocket forwarding or startup use this to make unexpected Responses calls obvious.
 
 *Call graph*: calls 1 internal fn (main_loop_responses); called by 4 (webrtc_v1_start_posts_offer_returns_sdp_and_joins_sideband, webrtc_v2_forwards_audio_and_text_between_client_and_sideband, webrtc_v2_text_input_is_append_only_when_response_is_cancelled, webrtc_v2_text_input_is_append_only_while_response_is_active); 1 external calls (new).
 
@@ -1448,11 +1456,11 @@ fn no_main_loop_responses() -> MainLoopResponsesScript
 fn realtime_sideband(connections: Vec<WebSocketConnectionConfig>) -> RealtimeSidebandScript
 ```
 
-**Purpose**: Wraps scripted WebSocket connection configs into `RealtimeSidebandScript`.
+**Purpose**: Wraps scripted WebSocket connection behavior for the fake realtime sideband server.
 
-**Data flow**: Constructs and returns `RealtimeSidebandScript { connections }`.
+**Data flow**: It takes a list of connection configurations and returns a `RealtimeSidebandScript` containing them.
 
-**Call relations**: Harness-backed tests use this helper to define the fake realtime server’s per-connection event scripts.
+**Call relations**: Harness tests call this while building their fake realtime server behavior. The harness later starts a WebSocket server from the wrapped connections.
 
 *Call graph*: called by 14 (realtime_automatic_handoff_output_is_item_and_append_speaks, realtime_automatic_standalone_output_is_item_and_append_speaks, webrtc_v1_default_automatic_output_uses_handoff_append, webrtc_v1_handoff_request_delegates_context_and_manual_append_speaks, webrtc_v1_start_posts_offer_returns_sdp_and_joins_sideband, webrtc_v2_assistant_output_without_handoff_reaches_realtime_context, webrtc_v2_background_agent_progress_is_sent_before_function_output, webrtc_v2_background_agent_steering_ack_requests_response_create, webrtc_v2_background_agent_tool_call_delegates_and_returns_function_output, webrtc_v2_forwards_audio_and_text_between_client_and_sideband (+4 more)).
 
@@ -1465,11 +1473,11 @@ fn realtime_sideband_connection(
 ) -> WebSocketConnectionConfig
 ```
 
-**Purpose**: Builds a sideband connection config that closes after the scripted requests are consumed.
+**Purpose**: Builds a default fake realtime WebSocket connection that sends scripted events and then closes after the expected requests.
 
-**Data flow**: Returns `WebSocketConnectionConfig` with the provided request batches, empty response headers, no accept delay, and `close_after_requests = true`.
+**Data flow**: It takes batches of JSON events to send in response to app-server requests, fills in default headers and timing, sets close-after-requests to true, and returns the connection config.
 
-**Call relations**: Most scripted sideband scenarios use this helper as the default connection behavior.
+**Call relations**: Most realtime sideband scripts use this. `open_realtime_sideband_connection` starts from it and changes the close behavior.
 
 *Call graph*: called by 1 (open_realtime_sideband_connection); 1 external calls (new).
 
@@ -1482,11 +1490,11 @@ fn open_realtime_sideband_connection(
 ) -> WebSocketConnectionConfig
 ```
 
-**Purpose**: Builds a sideband connection config that stays open after scripted requests.
+**Purpose**: Builds a fake realtime WebSocket connection that stays open after scripted requests. This is important for WebRTC sessions that should remain alive.
 
-**Data flow**: Creates a `WebSocketConnectionConfig` by reusing `realtime_sideband_connection` and overriding `close_after_requests = false`.
+**Data flow**: It takes scripted event batches, creates the normal sideband connection config, flips `close_after_requests` to false, and returns it.
 
-**Call relations**: The v1 WebRTC startup test uses this helper to prove the transport remains alive after SDP exchange.
+**Call relations**: The v1 WebRTC startup test uses this to prove starting a WebRTC transport does not immediately close the realtime sideband.
 
 *Call graph*: calls 1 internal fn (realtime_sideband_connection).
 
@@ -1497,11 +1505,11 @@ fn open_realtime_sideband_connection(
 fn session_updated(realtime_session_id: &str) -> Value
 ```
 
-**Purpose**: Creates a minimal `session.updated` server event fixture for the fake realtime sideband.
+**Purpose**: Creates a standard fake `session.updated` realtime event. It keeps test scripts short and consistent.
 
-**Data flow**: Returns a JSON value with `type = session.updated` and a `session` object containing the supplied realtime session id and fixed instructions `backend prompt`.
+**Data flow**: It takes a realtime session id and returns JSON with that id plus the test backend prompt as instructions.
 
-**Call relations**: Many sideband scripts begin with this event so the app server can observe the upstream session id and initial instructions.
+**Call relations**: Many sideband scripts use this as the first server event after the app server sends its session update.
 
 *Call graph*: 1 external calls (json!).
 
@@ -1512,11 +1520,11 @@ fn session_updated(realtime_session_id: &str) -> Value
 fn v2_background_agent_tool_call(call_id: &str, prompt: &str) -> Value
 ```
 
-**Purpose**: Creates a v2 realtime `conversation.item.done` function-call event for the `background_agent` tool.
+**Purpose**: Creates a fake v2 realtime function-call event asking the background agent to do work.
 
-**Data flow**: Returns a JSON value whose `item` has type `function_call`, name `background_agent`, the supplied `call_id`, and serialized JSON arguments containing the supplied prompt.
+**Data flow**: It takes a call id and prompt, builds a `conversation.item.done` JSON item for the `background_agent` function, and serializes the prompt into the function arguments field.
 
-**Call relations**: Delegation and steering tests use this fixture to trigger app-server background-agent handoff logic from the fake realtime sideband.
+**Call relations**: V2 delegation, steering, progress, shell-tool, and nonblocking tests place this event in sideband scripts to trigger the app server's background-agent path.
 
 *Call graph*: 1 external calls (json!).
 
@@ -1527,11 +1535,11 @@ fn v2_background_agent_tool_call(call_id: &str, prompt: &str) -> Value
 async fn realtime_conversation_streams_v2_notifications() -> Result<()>
 ```
 
-**Purpose**: End-to-end test for the v2 realtime notification stream, covering startup, audio/text append, transcript deltas, item-added events, handoff requests, upstream errors, and closure.
+**Purpose**: Tests the main v2 realtime event stream from startup through audio, transcript, handoff request, error, and close notifications.
 
-**Data flow**: Starts a mock Responses server and a scripted realtime WebSocket server that emits session update, output audio delta, assistant item, transcript deltas/done, a background-agent function call, and an error. It writes realtime-enabled config, starts and logs into the app server, creates a thread, starts realtime with audio modality and explicit model/voice, asserts the startup `session.update` request and handshake URI, appends audio and developer text, then reads and asserts typed notifications for output audio, item added, transcript deltas, transcript done, handoff item added, realtime error, and closed. Finally it inspects the outbound sideband requests to confirm one `session.update`, one `conversation.item.create` for developer text, and one `input_audio_buffer.append`.
+**Data flow**: It starts mock Responses and realtime servers, writes config, starts and logs into the app server, creates a thread, starts realtime, appends audio and text, then reads and checks the notifications sent back to the client.
 
-**Call relations**: This is a broad top-level integration test that exercises the core v2 realtime transport path without the harness abstraction, directly proving client-visible notifications and upstream sideband translation.
+**Call relations**: This direct test uses helpers such as `create_config_toml`, `login_with_api_key`, and `read_notification`. It also inspects the fake WebSocket connection to prove client input became the correct upstream realtime messages.
 
 *Call graph*: calls 4 internal fn (new, create_config_toml, login_with_api_key, start_websocket_server); 10 external calls (new, Integer, default, create_mock_responses_server_sequence_unchecked, to_response, assert!, assert_eq!, skip_if_no_network!, timeout, vec!).
 
@@ -1542,11 +1550,11 @@ async fn realtime_conversation_streams_v2_notifications() -> Result<()>
 async fn realtime_start_can_skip_startup_context() -> Result<()>
 ```
 
-**Purpose**: Verifies `include_startup_context = false` suppresses generated startup context in the initial realtime instructions.
+**Purpose**: Tests that a realtime start request can opt out of adding generated startup context to the realtime instructions.
 
-**Data flow**: Starts empty mock Responses and realtime servers, writes realtime-enabled config with generated startup context available, starts and logs into the app server, creates a thread, starts realtime with `include_startup_context: Some(false)`, waits for the started notification, then inspects the first sideband `session.update` request and asserts its instructions equal only `backend prompt` without the startup-context header.
+**Data flow**: It starts a session with `include_startup_context` set to false, reads the first sideband session update, and checks that the instructions contain only the backend prompt.
 
-**Call relations**: This test isolates one startup parameter branch in the realtime-start path and validates it by inspecting the upstream sideband request.
+**Call relations**: This test follows the direct setup pattern with `create_config_toml`, `login_with_api_key`, and `read_notification`, then validates the outbound WebSocket message.
 
 *Call graph*: calls 4 internal fn (new, create_config_toml, login_with_api_key, start_websocket_server); 11 external calls (new, new, Integer, default, create_mock_responses_server_sequence_unchecked, to_response, assert!, assert_eq!, skip_if_no_network!, timeout (+1 more)).
 
@@ -1557,11 +1565,11 @@ async fn realtime_start_can_skip_startup_context() -> Result<()>
 async fn realtime_text_output_modality_requests_text_output_and_final_transcript() -> Result<()>
 ```
 
-**Purpose**: Checks that text output modality requests `output_modalities = ["text"]` and that transcript notifications are emitted from text output without duplication from audio transcript completion.
+**Purpose**: Tests that text-only realtime mode asks the upstream service for text output and emits one final assistant transcript.
 
-**Data flow**: Starts mock servers where the sideband emits `session.updated`, two `response.output_text.delta` events, `response.output_audio_transcript.done`, and a final assistant message item. After config, startup, login, thread creation, and realtime start with `RealtimeOutputModality::Text`, it inspects the initial `session.update` request for `output_modalities = ["text"]`, then reads two transcript-delta notifications and one transcript-done notification and compares them to expected typed values. It finally asserts that no duplicate transcript-done notification arrives within 200 ms.
+**Data flow**: It starts realtime with text output modality, checks the session update requests `text`, consumes text delta and done events, and ensures no duplicate final transcript is emitted from a separate audio-transcript-done event.
 
-**Call relations**: This top-level test focuses on modality-specific translation from upstream realtime events into client notifications.
+**Call relations**: This test uses the direct app-server setup helpers and the generic notification reader. It guards against double-reporting final transcript text to clients.
 
 *Call graph*: calls 4 internal fn (new, create_config_toml, login_with_api_key, start_websocket_server); 11 external calls (new, new, Integer, default, create_mock_responses_server_sequence_unchecked, to_response, assert!, assert_eq!, skip_if_no_network!, timeout (+1 more)).
 
@@ -1572,11 +1580,11 @@ async fn realtime_text_output_modality_requests_text_output_and_final_transcript
 async fn realtime_list_voices_returns_supported_names() -> Result<()>
 ```
 
-**Purpose**: Verifies the voice-list RPC returns the expected supported voice sets and defaults for realtime v1 and v2.
+**Purpose**: Tests the JSON-RPC method that lists supported realtime voices. It verifies both v1 and v2 voice lists and defaults.
 
-**Data flow**: Writes realtime-enabled config pointing at dummy URLs, starts the app server, sends `thread/realtime/listVoices`, decodes `ThreadRealtimeListVoicesResponse`, and asserts the exact `RealtimeVoicesList` contents for `v1`, `v2`, `default_v1`, and `default_v2`.
+**Data flow**: It writes config, starts the app server, sends the list-voices request, converts the JSON-RPC response into the typed response, and compares it with the expected voice list.
 
-**Call relations**: This is a pure RPC test with no network side effects; it validates static capability reporting from the app server.
+**Call relations**: This test does not need network mocks beyond dummy config URLs because listing voices is local protocol behavior.
 
 *Call graph*: calls 2 internal fn (new, create_config_toml); 5 external calls (new, Integer, to_response, assert_eq!, timeout).
 
@@ -1587,11 +1595,11 @@ async fn realtime_list_voices_returns_supported_names() -> Result<()>
 async fn realtime_conversation_stop_emits_closed_notification() -> Result<()>
 ```
 
-**Purpose**: Ensures stopping an active realtime conversation returns success and emits a closed notification.
+**Purpose**: Tests that stopping an active realtime conversation sends a closed notification to the client.
 
-**Data flow**: Starts mock servers, writes realtime-enabled config, starts and logs into the app server, creates a thread, starts realtime with audio modality and backend prompt, reads the started notification, sends `thread/realtime/stop`, decodes `ThreadRealtimeStopResponse`, then reads `ThreadRealtimeClosedNotification` and asserts the thread id and a close reason of either `requested` or `transport_closed`.
+**Data flow**: It starts a realtime session, sends a stop request for the thread, reads the stop response, then waits for `thread/realtime/closed` and checks the close reason.
 
-**Call relations**: This test covers the explicit stop path after successful realtime startup and validates the asynchronous closure notification.
+**Call relations**: The test uses the same direct setup helpers as other startup tests and verifies the shutdown path exposed to client applications.
 
 *Call graph*: calls 4 internal fn (new, create_config_toml, login_with_api_key, start_websocket_server); 11 external calls (new, new, Integer, default, create_mock_responses_server_sequence_unchecked, to_response, assert!, assert_eq!, skip_if_no_network!, timeout (+1 more)).
 
@@ -1602,11 +1610,11 @@ async fn realtime_conversation_stop_emits_closed_notification() -> Result<()>
 async fn realtime_webrtc_start_emits_sdp_notification() -> Result<()>
 ```
 
-**Purpose**: Verifies WebRTC realtime startup performs call creation, emits started and SDP notifications, joins the sideband with the returned call id, and sends the expected multipart session payload.
+**Purpose**: Tests the v2 WebRTC startup path, including posting the offer, returning the SDP answer, joining the sideband, and forming the session payload.
 
-**Data flow**: Starts a mock Responses server with a captured `/v1/realtime/calls` endpoint returning `Location: /v1/realtime/calls/rtc_app_test` and SDP answer, plus a sideband WebSocket server. After writing config, starting and logging into the app server, and creating a thread, it sends realtime start with `ThreadRealtimeStartTransport::Webrtc { sdp: "v=offer\r\n" }`, decodes the start response, reads started and SDP notifications, inspects the first sideband `session.update` request and handshake URI, sends realtime stop and reads the closed notification, then inspects the captured HTTP request headers and multipart body to assert exact SDP and normalized JSON session contents.
+**Data flow**: It captures the HTTP call-create request, starts realtime with a WebRTC offer, reads started and SDP notifications, checks the sideband URL and startup context, then stops realtime and inspects the multipart call body.
 
-**Call relations**: This direct WebRTC test covers the full call-create plus sideband-join path without the harness abstraction, and it uses `normalized_json_string` for stable multipart comparison.
+**Call relations**: This test uses `RealtimeCallRequestCapture`, `normalized_json_string`, and direct setup helpers. It is the detailed v2 counterpart to harness-based WebRTC startup tests.
 
 *Call graph*: calls 6 internal fn (new, new, create_config_toml, login_with_api_key, normalized_json_string, start_websocket_server_with_headers); 17 external calls (given, new, from_utf8, new, new, Integer, default, Override, create_mock_responses_server_sequence_unchecked, to_response (+7 more)).
 
@@ -1617,11 +1625,11 @@ async fn realtime_webrtc_start_emits_sdp_notification() -> Result<()>
 async fn webrtc_v1_start_posts_offer_returns_sdp_and_joins_sideband() -> Result<()>
 ```
 
-**Purpose**: Harness-backed regression test for Realtime V1 WebRTC startup semantics.
+**Purpose**: Tests that v1 WebRTC startup posts the SDP offer, returns the answer, and joins the v1 sideband connection without closing immediately.
 
-**Data flow**: Builds a v1 harness with no delegated Responses traffic and an open sideband connection that emits `session.updated`, starts WebRTC realtime, asserts the returned `StartedWebrtcRealtime` contains v1 started and SDP notifications, verifies the captured call-create multipart body against `v1_session_create_json`, inspects the first sideband request with `assert_v1_session_update`, checks the handshake URI includes `intent=quicksilver&call_id=rtc_e2e`, and confirms no immediate `thread/realtime/closed` notification arrives.
+**Data flow**: It builds a v1 harness, starts WebRTC, compares the started and SDP notifications, checks the captured multipart request and session update, and confirms no early closed notification appears.
 
-**Call relations**: This test uses the reusable harness to focus on v1-specific startup differences from v2, especially the session type and sideband join URI.
+**Call relations**: It relies on the harness setup, `assert_call_create_multipart`, `v1_session_create_json`, and `assert_v1_session_update` to validate the v1-specific protocol.
 
 *Call graph*: calls 6 internal fn (new, assert_call_create_multipart, assert_v1_session_update, no_main_loop_responses, realtime_sideband, v1_session_create_json); 6 external calls (from_millis, assert!, assert_eq!, skip_if_no_network!, timeout, vec!).
 
@@ -1632,11 +1640,11 @@ async fn webrtc_v1_start_posts_offer_returns_sdp_and_joins_sideband() -> Result<
 async fn webrtc_v1_default_automatic_output_uses_handoff_append() -> Result<()>
 ```
 
-**Purpose**: Checks that automatic output from a delegated v1 background-agent turn is sent back to realtime as `conversation.handoff.append`.
+**Purpose**: Tests that automatic background-agent output in v1 is sent to realtime using the v1 handoff append message.
 
-**Data flow**: Creates a v1 harness whose delegated Responses turn returns `legacy automatic speech`, starts WebRTC realtime, verifies the initial v1 session update, starts a normal turn with user text, waits for `turn/completed`, then inspects the second sideband outbound request and asserts it is a `conversation.handoff.append` with `handoff_id = codex` and the delegated output text.
+**Data flow**: It starts a v1 harness with a final mocked assistant response, begins realtime, starts a normal text turn, waits for completion, then checks the sideband received `conversation.handoff.append` with the output text.
 
-**Call relations**: This harness-backed test covers the v1 automatic-output path after a standard app-server turn completes.
+**Call relations**: This connects the normal turn flow to the realtime v1 sideband. It uses the harness and `assert_v1_session_update` to keep setup and v1 session checks consistent.
 
 *Call graph*: calls 4 internal fn (new, assert_v1_session_update, main_loop_responses, realtime_sideband); 7 external calls (default, Integer, to_response, assert_eq!, skip_if_no_network!, timeout, vec!).
 
@@ -1647,11 +1655,11 @@ async fn webrtc_v1_default_automatic_output_uses_handoff_append() -> Result<()>
 async fn webrtc_v1_handoff_request_delegates_context_and_manual_append_speaks() -> Result<()>
 ```
 
-**Purpose**: Verifies a v1 handoff request launches a delegated Responses turn with transcript context and that manual speech append uses `conversation.handoff.append`.
+**Purpose**: Tests v1 handoff delegation: realtime asks for background work, transcript context is sent to Responses, and manual speech output is spoken back.
 
-**Data flow**: Creates a v1 harness whose sideband emits session update, completed user transcription, assistant transcript deltas, and `conversation.handoff.requested`, while the delegated Responses turn returns `delegated from v1`. After starting WebRTC realtime with backend responses as items, it waits for `turn/started` and `turn/completed`, fetches the mocked Responses request and asserts it contains a `<realtime_delegation>` envelope with input and transcript delta context, inspects the sideband context update item carrying the delegated result under `RESPONSE_ITEM_PREFIX`, then calls `append_speech` and asserts the next sideband request is a spoken `conversation.handoff.append`.
+**Data flow**: It scripts a v1 handoff request and transcript events, starts realtime with response items enabled, waits for the delegated turn to finish, inspects the Responses prompt, verifies context was inserted into realtime, then appends manual speech and checks it was sent as v1 handoff output.
 
-**Call relations**: This test exercises the v1 delegated-handoff path end to end, linking sideband tool-like events to a background-agent turn and then back to realtime context and speech.
+**Call relations**: This test uses the harness, multipart/session assertions, `response_request_contains_text`, and `append_speech` to cover both delegation and manual output paths.
 
 *Call graph*: calls 6 internal fn (new, assert_call_create_multipart, assert_v1_session_update, main_loop_responses, realtime_sideband, v1_session_create_json); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1662,11 +1670,11 @@ async fn webrtc_v1_handoff_request_delegates_context_and_manual_append_speaks() 
 async fn realtime_automatic_standalone_output_is_item_and_append_speaks() -> Result<()>
 ```
 
-**Purpose**: Checks that in v2, automatic standalone backend output is injected as a realtime context item, while manual speech append triggers both a progress item and `response.create`.
+**Purpose**: Tests v2 behavior when ordinary background-agent output happens during realtime without a handoff call.
 
-**Data flow**: Creates a v2 harness whose delegated Responses turn returns `automatic output`, starts WebRTC realtime with backend responses as items, starts a normal turn with user text, waits for `turn/completed`, asserts the next sideband request is a backend item update via `assert_v2_backend_item_update`, confirms no automatic `response.create` follows, then calls `append_speech` and asserts the subsequent sideband requests are a progress update and a `response.create`.
+**Data flow**: It starts v2 WebRTC with response items enabled, runs a normal text turn, verifies the automatic output is added as a backend context item without requesting realtime speech, then appends manual speech and checks that it does request a realtime response.
 
-**Call relations**: This harness-backed test distinguishes automatic backend context injection from explicit spoken updates in the v2 protocol.
+**Call relations**: It uses the harness plus v2 assertion helpers for backend item updates, progress updates, and response creation.
 
 *Call graph*: calls 6 internal fn (new, assert_v2_backend_item_update, assert_v2_progress_update, assert_v2_response_create, main_loop_responses, realtime_sideband); 9 external calls (default, from_millis, Integer, to_response, assert!, assert_eq!, skip_if_no_network!, timeout, vec!).
 
@@ -1677,11 +1685,11 @@ async fn realtime_automatic_standalone_output_is_item_and_append_speaks() -> Res
 async fn realtime_automatic_handoff_output_is_item_and_append_speaks() -> Result<()>
 ```
 
-**Purpose**: Verifies that automatic output from a v2 background-agent handoff becomes a backend item plus empty function-call output, while manual speech append still requests a realtime response.
+**Purpose**: Tests v2 behavior when automatic output is produced by a realtime background-agent handoff.
 
-**Data flow**: Creates a v2 harness whose sideband emits a background-agent tool call and whose delegated Responses turn returns `automatic final response`, starts WebRTC realtime with backend responses as items, waits for `turn/started` and `turn/completed`, asserts sideband request 1 is a backend item update, request 2 is a `function_call_output` with empty output for the original call id, confirms no automatic `response.create` follows, then appends speech and asserts the next two sideband requests are a progress update and `response.create`.
+**Data flow**: It scripts a v2 background-agent function call, waits for the delegated turn, verifies the final output is inserted as a backend item and the function-call output acknowledges completion, then checks manual speech creates a spoken realtime response.
 
-**Call relations**: This test covers the v2 handoff-completion path where realtime should receive both context and tool-call completion without automatically speaking.
+**Call relations**: This test connects `v2_background_agent_tool_call` with harness notification reads and v2 sideband assertion helpers.
 
 *Call graph*: calls 7 internal fn (new, assert_v2_backend_item_update, assert_v2_function_call_output, assert_v2_progress_update, assert_v2_response_create, main_loop_responses, realtime_sideband); 6 external calls (from_millis, assert!, assert_eq!, skip_if_no_network!, timeout, vec!).
 
@@ -1692,11 +1700,11 @@ async fn realtime_automatic_handoff_output_is_item_and_append_speaks() -> Result
 async fn webrtc_v2_assistant_output_without_handoff_reaches_realtime_context() -> Result<()>
 ```
 
-**Purpose**: Ensures direct assistant output from a normal v2 turn, even when long, is injected back into realtime context with truncation markers and size limits.
+**Purpose**: Tests that assistant output from a normal turn reaches realtime context even when no realtime handoff requested it.
 
-**Data flow**: Creates a v2 harness whose mocked Responses stream emits a commentary preamble and a very long final assistant message, starts WebRTC realtime with backend responses as items, starts a normal text turn, waits for `turn/completed`, asserts the first sideband update is a backend item for the preamble, then inspects the next sideband `conversation.item.create` developer message and checks that its text starts with `RESPONSE_ITEM_PREFIX` plus `[BACKEND]`, contains `tokens truncated`, and is at most 4000 characters.
+**Data flow**: It creates a long final answer plus a shorter preamble, runs a normal turn during v2 realtime, then checks that both pieces are sent as backend context items and that the long one is truncated to a safe size.
 
-**Call relations**: This harness-backed regression test focuses on the path that mirrors ordinary assistant output into realtime context without any background-agent handoff.
+**Call relations**: The test uses `main_loop_responses`, the harness, and `assert_v2_backend_item_update` to guard the path that keeps realtime aware of background Codex responses.
 
 *Call graph*: calls 4 internal fn (new, assert_v2_backend_item_update, main_loop_responses, realtime_sideband); 8 external calls (default, Integer, to_response, assert!, assert_eq!, skip_if_no_network!, timeout, vec!).
 
@@ -1707,11 +1715,11 @@ async fn webrtc_v2_assistant_output_without_handoff_reaches_realtime_context() -
 async fn webrtc_v2_forwards_audio_and_text_between_client_and_sideband() -> Result<()>
 ```
 
-**Purpose**: Verifies v2 WebRTC forwards client audio/text upstream and translates upstream transcript/audio events back into client notifications.
+**Purpose**: Tests two-way v2 forwarding: client audio and text go to the realtime sideband, and sideband transcript and audio come back as client notifications.
 
-**Data flow**: Creates a v2 harness whose sideband emits `session.updated`, then later an input-audio transcription delta and output-audio delta. After starting WebRTC realtime and asserting the initial v2 session update, it appends audio and text through the harness, reads transcript-delta and output-audio notifications from the app server, then inspects the outbound sideband requests to confirm one `input_audio_buffer.append` with `BQYH` and one user `conversation.item.create` carrying `[USER] hello`.
+**Data flow**: It starts a v2 harness, appends audio and text through JSON-RPC, reads transcript and audio notifications from sideband events, then inspects outbound WebSocket messages for the expected audio append and user text item.
 
-**Call relations**: This test covers the bidirectional streaming path between client RPCs and the upstream realtime sideband in v2.
+**Call relations**: This test uses `no_main_loop_responses`, `assert_v2_session_update`, and the harness append/read helpers to focus on realtime transport forwarding.
 
 *Call graph*: calls 4 internal fn (new, assert_v2_session_update, no_main_loop_responses, realtime_sideband); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1722,11 +1730,11 @@ async fn webrtc_v2_forwards_audio_and_text_between_client_and_sideband() -> Resu
 async fn webrtc_v2_text_input_is_append_only_while_response_is_active() -> Result<()>
 ```
 
-**Purpose**: Regression test ensuring v2 text input remains append-only while an upstream realtime response is active and does not trigger a new `response.create`.
+**Purpose**: Tests that v2 text input does not request a new realtime response while one is already active.
 
-**Data flow**: Creates a v2 harness whose sideband emits `session.updated`, then `response.created` and a transcript delta, and only later `response.done`. After startup and initial session-update assertion, it appends first text and verifies the corresponding user text item upstream, reads the transcript delta, appends second text while the response is still active, verifies another user text item upstream, then appends audio and confirms audio forwarding still works.
+**Data flow**: It scripts a response-created event, sends a first text item, reads an assistant delta, sends a second text item while the response is active, then sends audio and confirms all three outbound messages are only the expected append operations.
 
-**Call relations**: This harness-backed test targets a specific concurrency regression in the v2 sideband state machine around active responses.
+**Call relations**: This regression test uses the harness and `assert_v2_user_text_item` to protect append-only text behavior during active responses.
 
 *Call graph*: calls 5 internal fn (new, assert_v2_session_update, assert_v2_user_text_item, no_main_loop_responses, realtime_sideband); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1737,11 +1745,11 @@ async fn webrtc_v2_text_input_is_append_only_while_response_is_active() -> Resul
 async fn webrtc_v2_text_input_is_append_only_when_response_is_cancelled() -> Result<()>
 ```
 
-**Purpose**: Regression test ensuring append-only v2 text behavior also holds when the active response is later cancelled instead of completed.
+**Purpose**: Tests that v2 text input remains append-only while a response is open but later cancelled.
 
-**Data flow**: Creates a v2 harness whose sideband emits `session.updated`, then `response.created`, and only later `response.cancelled`. After startup and session-update assertion, it appends first text and verifies the user text item, appends second text while the response is still active, verifies another user text item, then appends audio and confirms the next upstream request is `input_audio_buffer.append` with `BQYH`.
+**Data flow**: It scripts a response-created event followed later by cancellation, sends two text items and one audio chunk, and checks the sideband only receives user text items and audio append, not extra response requests.
 
-**Call relations**: This test mirrors the active-response case but covers the cancellation branch to prevent regressions in response-lifecycle bookkeeping.
+**Call relations**: This regression test mirrors the active-response test but covers cancellation. It uses the same harness and v2 text assertion helper.
 
 *Call graph*: calls 5 internal fn (new, assert_v2_session_update, assert_v2_user_text_item, no_main_loop_responses, realtime_sideband); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1752,11 +1760,11 @@ async fn webrtc_v2_text_input_is_append_only_when_response_is_cancelled() -> Res
 async fn webrtc_v2_background_agent_tool_call_delegates_and_returns_function_output() -> Result<()>
 ```
 
-**Purpose**: Verifies a v2 `background_agent` function call launches a delegated Responses turn with cleaned transcript context, sends progress to realtime, and then returns final function-call output.
+**Purpose**: Tests the core v2 background-agent handoff path from realtime function call to delegated turn and final function-call output.
 
-**Data flow**: Creates a v2 harness whose sideband emits multiple completed transcriptions, a hidden collaboration-update message, an assistant transcript delta, and finally a background-agent tool call, while the delegated Responses turn returns `delegated from v2`. After startup it waits for `turn/started` and `turn/completed`, fetches the mocked Responses request and asserts it contains a `<realtime_delegation>` envelope with the expected transcript history but excludes the hidden collaboration-update text, then inspects sideband request 1 as a progress update and request 2 as a `function_call_output` carrying `V2_HANDOFF_COMPLETE_ACKNOWLEDGEMENT`.
+**Data flow**: It scripts transcript events, a hidden collaboration update, and a background-agent function call. After realtime starts, it waits for the delegated turn, inspects the Responses request for the correct transcript envelope and absence of hidden control text, then checks progress and final function-call output messages to realtime.
 
-**Call relations**: This is a core v2 delegation regression test linking sideband function calls to delegated background-agent execution and final tool output.
+**Call relations**: This test combines `v2_background_agent_tool_call`, `response_request_contains_text`, and v2 sideband assertion helpers to validate the main handoff contract.
 
 *Call graph*: calls 5 internal fn (new, assert_v2_function_call_output, assert_v2_progress_update, main_loop_responses, realtime_sideband); 4 external calls (assert!, assert_eq!, skip_if_no_network!, vec!).
 
@@ -1767,11 +1775,11 @@ async fn webrtc_v2_background_agent_tool_call_delegates_and_returns_function_out
 async fn webrtc_v2_background_agent_steering_ack_requests_response_create() -> Result<()>
 ```
 
-**Purpose**: Checks that a second v2 background-agent tool call arriving while one is active is treated as steering: it is acknowledged immediately and later included in a follow-up delegated Responses request.
+**Purpose**: Tests that a second background-agent call during an active delegated task is treated as steering, acknowledged, and then spoken by realtime.
 
-**Data flow**: Starts a custom mock Responses server whose first delegated SSE response is gated, then builds a v2 harness whose sideband emits two background-agent tool calls back to back. After startup and `turn/started`, it asserts sideband request 1 is a `function_call_output` for the steering call containing `V2_STEERING_ACKNOWLEDGEMENT`, and request 2 is `response.create`. It then releases the gated delegated turn, waits for `turn/completed`, fetches the two mocked Responses requests, and asserts the second request contains the steering prompt text.
+**Data flow**: It uses a gated Responses stream to keep the first task active, sends two v2 tool calls, verifies the second call gets a steering acknowledgement and `response.create`, then releases the gate and checks the follow-up Responses request includes the steering text.
 
-**Call relations**: This multi-threaded regression test exercises active-handoff steering behavior and proves the acknowledgement path does not drop the steering instruction.
+**Call relations**: This concurrency test uses `GatedSseResponse`, a custom mock server, the harness custom-server constructor, and v2 function-output and response-create assertions.
 
 *Call graph*: calls 7 internal fn (new_with_main_loop_responses_server, assert_v2_function_call_output, assert_v2_response_create, assert_v2_session_update, realtime_sideband, sse, start_mock_server); 9 external calls (given, new, assert!, assert_eq!, channel, skip_if_no_network!, vec!, method, path_regex).
 
@@ -1782,11 +1790,11 @@ async fn webrtc_v2_background_agent_steering_ack_requests_response_create() -> R
 async fn webrtc_v2_background_agent_progress_is_sent_before_function_output() -> Result<()>
 ```
 
-**Purpose**: Ensures v2 sends delegated progress into realtime before the final function-call output item.
+**Purpose**: Tests ordering for v2 delegated output: progress context should be sent before the final function-call output.
 
-**Data flow**: Creates a v2 harness whose sideband emits one background-agent tool call and whose delegated Responses turn returns `progress before final`, starts WebRTC realtime, waits for `turn/completed`, then inspects sideband request 1 as a progress update and request 2 as the final `function_call_output` with `V2_HANDOFF_COMPLETE_ACKNOWLEDGEMENT`.
+**Data flow**: It scripts a background-agent call and final assistant response, waits for turn completion, then checks the first sideband update is progress and the next is the completion function output.
 
-**Call relations**: This test isolates ordering guarantees in the v2 handoff-completion path.
+**Call relations**: This test uses the harness and v2 assertion helpers to protect message ordering that realtime depends on.
 
 *Call graph*: calls 5 internal fn (new, assert_v2_function_call_output, assert_v2_progress_update, main_loop_responses, realtime_sideband); 3 external calls (assert_eq!, skip_if_no_network!, vec!).
 
@@ -1797,11 +1805,11 @@ async fn webrtc_v2_background_agent_progress_is_sent_before_function_output() ->
 async fn webrtc_v2_tool_call_delegated_turn_can_execute_shell_tool() -> Result<()>
 ```
 
-**Purpose**: Verifies a delegated background-agent turn triggered from realtime can execute a shell tool and feed its output back through Responses and then realtime.
+**Purpose**: Tests that a realtime v2 background-agent handoff can run a delegated shell command when the sandbox allows it.
 
-**Data flow**: Builds a v2 harness in `DangerFullAccess` sandbox with a delegated Responses script that first requests a shell command and then returns `shell tool finished`, while the sideband emits a background-agent tool call. After startup, it waits for `item/started` and `item/completed` notifications whose `ThreadItem` is `CommandExecution`, asserting the shell call id, status transitions, and aggregated output `realtime-tool-ok`. It then waits for `turn/completed`, fetches the mocked Responses requests to confirm the shell output appears in the follow-up request, and inspects sideband requests for progress update and final function-call output.
+**Data flow**: It starts the harness with dangerous full access, scripts a shell-tool request followed by a final answer, waits for command-started and command-completed item notifications, checks the command output, inspects Responses requests, and verifies progress plus final function-call output to realtime.
 
-**Call relations**: This harness-backed test ties together realtime delegation, delegated shell-tool execution, thread item notifications, and final realtime handoff completion.
+**Call relations**: This test uses `new_with_sandbox`, `realtime_tool_ok_command`, command-wait helpers, and v2 sideband assertions to cover tool execution inside delegated realtime work.
 
 *Call graph*: calls 7 internal fn (new_with_sandbox, assert_v2_function_call_output, assert_v2_progress_update, main_loop_responses, realtime_sideband, wait_for_completed_command_execution, wait_for_started_command_execution); 5 external calls (assert!, assert_eq!, skip_if_no_network!, unreachable!, vec!).
 
@@ -1812,11 +1820,11 @@ async fn webrtc_v2_tool_call_delegated_turn_can_execute_shell_tool() -> Result<(
 async fn webrtc_v2_tool_call_does_not_block_sideband_audio() -> Result<()>
 ```
 
-**Purpose**: Ensures sideband audio events continue to flow to the client while a delegated background-agent turn is blocked waiting on Responses.
+**Purpose**: Tests that a slow delegated background-agent turn does not block realtime audio events from reaching the client.
 
-**Data flow**: Starts a custom gated Responses server and a v2 harness whose sideband emits a background-agent tool call followed immediately by output-audio delta. After startup and `turn/started`, it reads `thread/realtime/outputAudio/delta` and asserts the audio chunk arrived before the delegated turn completed. It then releases the gate, waits for `turn/completed`, and inspects sideband requests for the later progress update and final function-call output.
+**Data flow**: It gates the delegated Responses stream, scripts a tool call plus an audio delta, starts realtime, waits for the delegated turn to begin, confirms the audio notification arrives before releasing the gate, then verifies final progress and function output after completion.
 
-**Call relations**: This multi-threaded regression test covers nonblocking behavior between delegated-turn execution and independent sideband event fan-out.
+**Call relations**: This uses `GatedSseResponse`, the custom harness constructor, and v2 assertions to prove sideband reading stays responsive during background work.
 
 *Call graph*: calls 6 internal fn (new_with_main_loop_responses_server, assert_v2_function_call_output, assert_v2_progress_update, realtime_sideband, sse, start_mock_server); 8 external calls (given, new, assert_eq!, channel, skip_if_no_network!, vec!, method, path_regex).
 
@@ -1827,11 +1835,11 @@ async fn webrtc_v2_tool_call_does_not_block_sideband_audio() -> Result<()>
 async fn realtime_webrtc_start_surfaces_backend_error() -> Result<()>
 ```
 
-**Purpose**: Verifies a failing WebRTC call-create backend request is surfaced to the client as a realtime error notification rather than a failed start RPC.
+**Purpose**: Tests that a failed backend WebRTC call-creation request becomes a typed realtime error notification for the client.
 
-**Data flow**: Starts a mock Responses server whose `POST /v1/realtime/calls` returns 500 `boom`, plus a dummy realtime WebSocket server, writes realtime-enabled config, starts and logs into the app server, creates a thread, sends realtime start with WebRTC transport, decodes the nominal `ThreadRealtimeStartResponse`, then reads `ThreadRealtimeErrorNotification` and asserts its message mentions high demand.
+**Data flow**: It makes the mock call endpoint return a 500 error, starts app server and thread, requests WebRTC realtime, then reads `thread/realtime/error` and checks the message is user-friendly.
 
-**Call relations**: This test covers asynchronous error delivery for WebRTC startup failures after the JSON-RPC start request itself has already returned.
+**Call relations**: This direct setup test uses `create_config_toml`, `login_with_api_key`, and `read_notification` to validate error reporting after the start request itself returns.
 
 *Call graph*: calls 4 internal fn (new, create_config_toml, login_with_api_key, start_websocket_server); 15 external calls (given, new, new, new, Integer, default, Override, create_mock_responses_server_sequence_unchecked, to_response, assert! (+5 more)).
 
@@ -1842,11 +1850,11 @@ async fn realtime_webrtc_start_surfaces_backend_error() -> Result<()>
 async fn realtime_conversation_requires_feature_flag() -> Result<()>
 ```
 
-**Purpose**: Ensures realtime conversation RPCs are rejected when the realtime feature flag is disabled in config.
+**Purpose**: Tests that realtime conversation cannot start when the feature flag is disabled.
 
-**Data flow**: Starts mock Responses and realtime servers, writes config with realtime disabled, starts the app server, creates a thread, sends realtime start, reads the error response, and passes it to `assert_invalid_request` with a message naming the thread id and stating it does not support realtime conversation.
+**Data flow**: It writes config with realtime disabled, starts a thread, sends a realtime start request, reads the JSON-RPC error, and checks it is an invalid-request error with the expected message.
 
-**Call relations**: This top-level test covers feature gating before any realtime transport setup occurs.
+**Call relations**: This test uses `create_config_toml` and `assert_invalid_request`. It protects the feature-gating behavior before any realtime transport is opened.
 
 *Call graph*: calls 4 internal fn (new, assert_invalid_request, create_config_toml, start_websocket_server); 10 external calls (new, new, Integer, default, create_mock_responses_server_sequence_unchecked, to_response, format!, skip_if_no_network!, timeout, vec!).
 
@@ -1860,11 +1868,11 @@ async fn read_notification(
 ) -> Result<T>
 ```
 
-**Purpose**: Reads a notification by method name under the standard timeout and deserializes its params into a typed payload.
+**Purpose**: Waits for one app-server notification by method name and converts its JSON payload into a typed Rust value.
 
-**Data flow**: Waits for `read_stream_until_notification_message(method)` under `DEFAULT_TIMEOUT`, extracts `params` with context if absent, deserializes them with `serde_json::from_value`, and returns the typed value.
+**Data flow**: It takes a mutable test app server and method string, waits up to the default timeout for that notification, extracts its params, deserializes them, and returns the typed result.
 
-**Call relations**: Both the harness method and many direct tests use this helper to consume typed notifications from the app server stream.
+**Call relations**: Direct tests and the harness wrapper call this whenever they need to observe client-visible events such as realtime started, transcript delta, turn completed, or item completed.
 
 *Call graph*: calls 1 internal fn (read_stream_until_notification_message); called by 1 (read_notification); 2 external calls (from_value, timeout).
 
@@ -1875,11 +1883,11 @@ async fn read_notification(
 async fn login_with_api_key(mcp: &mut TestAppServer, api_key: &str) -> Result<()>
 ```
 
-**Purpose**: Logs into the app server with an API key and asserts the typed login response is `ApiKey`.
+**Purpose**: Logs the test app server in with a fake API key and verifies the login response.
 
-**Data flow**: Sends `send_login_account_api_key_request(api_key)`, waits for the matching response under `DEFAULT_TIMEOUT`, converts it with `to_response`, asserts it equals `LoginAccountResponse::ApiKey {}`, and returns success.
+**Data flow**: It sends a login request, waits for the matching JSON-RPC response, converts it into `LoginAccountResponse`, checks that it is the API-key variant, and returns success.
 
-**Call relations**: Harness setup and several direct realtime tests call this helper before starting threads or realtime sessions.
+**Call relations**: Harness setup and direct realtime startup tests call this before starting realtime, because realtime paths require an authenticated account.
 
 *Call graph*: calls 2 internal fn (read_stream_until_response_message, send_login_account_api_key_request); called by 7 (new_with_main_loop_responses_server_and_sandbox, realtime_conversation_stop_emits_closed_notification, realtime_conversation_streams_v2_notifications, realtime_start_can_skip_startup_context, realtime_text_output_modality_requests_text_output_and_final_transcript, realtime_webrtc_start_emits_sdp_notification, realtime_webrtc_start_surfaces_backend_error); 4 external calls (Integer, to_response, assert_eq!, timeout).
 
@@ -1892,11 +1900,11 @@ async fn wait_for_started_command_execution(
 ) -> Result<ItemStartedNotification>
 ```
 
-**Purpose**: Consumes notifications until it finds an `item/started` notification whose item is a command execution.
+**Purpose**: Waits until the app server reports that a command-execution item has started.
 
-**Data flow**: Loops calling `read_notification::<ItemStartedNotification>(..., "item/started")` until `started.item` matches `ThreadItem::CommandExecution`, then returns that notification.
+**Data flow**: It repeatedly reads `item/started` notifications, ignores non-command items, and returns the first notification whose thread item is command execution.
 
-**Call relations**: The delegated shell-tool test uses this helper to ignore unrelated item-started notifications and focus on the shell command execution item.
+**Call relations**: The delegated shell-tool test calls this to observe the shell command launched by the background-agent turn.
 
 *Call graph*: called by 1 (webrtc_v2_tool_call_delegated_turn_can_execute_shell_tool).
 
@@ -1909,11 +1917,11 @@ async fn wait_for_completed_command_execution(
 ) -> Result<ItemCompletedNotification>
 ```
 
-**Purpose**: Consumes notifications until it finds an `item/completed` notification whose item is a command execution.
+**Purpose**: Waits until the app server reports that a command-execution item has completed.
 
-**Data flow**: Loops calling `read_notification::<ItemCompletedNotification>(..., "item/completed")` until `completed.item` matches `ThreadItem::CommandExecution`, then returns that notification.
+**Data flow**: It repeatedly reads `item/completed` notifications, ignores non-command items, and returns the first command-execution completion.
 
-**Call relations**: Used alongside `wait_for_started_command_execution` in the delegated shell-tool test to observe command completion.
+**Call relations**: The delegated shell-tool test calls this after command start to verify the command finished and produced the expected output.
 
 *Call graph*: called by 1 (webrtc_v2_tool_call_delegated_turn_can_execute_shell_tool).
 
@@ -1924,11 +1932,11 @@ async fn wait_for_completed_command_execution(
 async fn responses_requests(server: &MockServer) -> Result<Vec<Value>>
 ```
 
-**Purpose**: Collects and parses all recorded mock Responses API request bodies from a wiremock server.
+**Purpose**: Collects the JSON bodies of requests sent to the mocked Responses endpoint.
 
-**Data flow**: Fetches `received_requests()` from the server with context on failure, filters requests whose path ends with `/responses`, parses each body as JSON `Value`, and returns the collected vector.
+**Data flow**: It asks the mock server for received requests, filters to URLs ending in `/responses`, parses each body as JSON, and returns the resulting list.
 
-**Call relations**: Harness methods and delegation tests use this helper to inspect the exact prompts/context sent to the ordinary Responses API.
+**Call relations**: `RealtimeE2eHarness::main_loop_responses_requests` calls this. Delegation tests then search these bodies for prompts, transcript envelopes, steering text, or shell output.
 
 *Call graph*: called by 1 (main_loop_responses_requests); 1 external calls (received_requests).
 
@@ -1939,11 +1947,11 @@ async fn responses_requests(server: &MockServer) -> Result<Vec<Value>>
 fn response_request_contains_text(request: &Value, text: &str) -> bool
 ```
 
-**Purpose**: Recursively searches an arbitrary JSON value for a substring in any nested string field.
+**Purpose**: Searches a JSON value recursively for a piece of text. Tests use it to check that important prompt content appears somewhere in a nested Responses request.
 
-**Data flow**: Matches on `serde_json::Value`: for strings it checks `contains(text)`, for arrays and objects it recurses into elements/values, and for null/bool/number it returns `false`.
+**Data flow**: It takes a JSON value and target text. If the value is a string, it checks for the text; if it is an array or object, it searches children; other JSON types return false.
 
-**Call relations**: Delegation tests use this helper when asserting that mocked Responses requests contain specific transcript envelopes, steering prompts, or shell output somewhere in their nested JSON structure.
+**Call relations**: Delegation and shell-tool tests call this after collecting Responses requests to avoid depending on the exact nesting of the request schema.
 
 
 ##### `realtime_tool_ok_command`  (lines 2645–2660)
@@ -1952,11 +1960,11 @@ fn response_request_contains_text(request: &Value, text: &str) -> bool
 fn realtime_tool_ok_command() -> Vec<String>
 ```
 
-**Purpose**: Returns a platform-specific shell command vector that prints `realtime-tool-ok`.
+**Purpose**: Returns a tiny cross-platform shell command that prints `realtime-tool-ok`.
 
-**Data flow**: On Windows it returns a PowerShell command writing to console; on non-Windows it returns `printf realtime-tool-ok`.
+**Data flow**: It checks the operating system at compile time. On Windows it returns a PowerShell command; elsewhere it returns `printf realtime-tool-ok`.
 
-**Call relations**: The delegated shell-tool test passes this command into `create_shell_command_sse_response` so the delegated turn executes a deterministic command.
+**Call relations**: The delegated shell-tool test uses this as the command that the mocked Responses stream asks the background agent to run.
 
 *Call graph*: 1 external calls (vec!).
 
@@ -1967,11 +1975,11 @@ fn realtime_tool_ok_command() -> Vec<String>
 fn assert_v2_function_call_output(request: &Value, call_id: &str, expected_output: &str)
 ```
 
-**Purpose**: Asserts a sideband request is exactly the expected v2 `function_call_output` item.
+**Purpose**: Checks that a sideband request is exactly the v2 function-call output message expected for a given call id and output string.
 
-**Data flow**: Compares the provided JSON value against a constructed object with `type = conversation.item.create`, `item.type = function_call_output`, the supplied `call_id`, and the supplied `output` string.
+**Data flow**: It takes the JSON request, call id, and expected output, builds the expected JSON shape, and asserts exact equality.
 
-**Call relations**: Many v2 delegation tests use this helper to verify final tool-call completion or steering acknowledgements sent upstream.
+**Call relations**: V2 handoff, steering, progress-order, shell-tool, and nonblocking tests use this to verify final or acknowledgement messages sent back to realtime.
 
 *Call graph*: called by 6 (realtime_automatic_handoff_output_is_item_and_append_speaks, webrtc_v2_background_agent_progress_is_sent_before_function_output, webrtc_v2_background_agent_steering_ack_requests_response_create, webrtc_v2_background_agent_tool_call_delegates_and_returns_function_output, webrtc_v2_tool_call_delegated_turn_can_execute_shell_tool, webrtc_v2_tool_call_does_not_block_sideband_audio); 1 external calls (assert_eq!).
 
@@ -1982,11 +1990,11 @@ fn assert_v2_function_call_output(request: &Value, call_id: &str, expected_outpu
 fn assert_v2_progress_update(request: &Value, expected_text: &str)
 ```
 
-**Purpose**: Asserts a sideband request is the expected v2 user-message progress update carrying `[BACKEND] ...` text.
+**Purpose**: Checks that a v2 progress update was sent as a user message marked with a `[BACKEND]` prefix.
 
-**Data flow**: Compares the provided JSON value against a constructed `conversation.item.create` message with role `user` and one `input_text` content item containing `[BACKEND] <expected_text>`.
+**Data flow**: It takes a JSON request and expected text, builds the exact expected `conversation.item.create` message, and compares it with the request.
 
-**Call relations**: Used by v2 tests that expect delegated progress or manual speech updates to be surfaced upstream before or alongside response creation.
+**Call relations**: Tests use this after automatic or delegated background output when realtime should be prompted to speak or react to progress.
 
 *Call graph*: called by 6 (realtime_automatic_handoff_output_is_item_and_append_speaks, realtime_automatic_standalone_output_is_item_and_append_speaks, webrtc_v2_background_agent_progress_is_sent_before_function_output, webrtc_v2_background_agent_tool_call_delegates_and_returns_function_output, webrtc_v2_tool_call_delegated_turn_can_execute_shell_tool, webrtc_v2_tool_call_does_not_block_sideband_audio); 1 external calls (assert_eq!).
 
@@ -1997,11 +2005,11 @@ fn assert_v2_progress_update(request: &Value, expected_text: &str)
 fn assert_v2_backend_item_update(request: &Value, expected_text: &str)
 ```
 
-**Purpose**: Asserts a sideband request is a backend context item update prefixed with `[BACKEND]` and wrapped under `RESPONSE_ITEM_PREFIX`.
+**Purpose**: Checks that backend output was inserted into v2 realtime context as a developer item.
 
-**Data flow**: Formats `[BACKEND] <expected_text>` and forwards to `assert_v2_items_update`.
+**Data flow**: It prefixes the expected text with `[BACKEND]` and passes the result to `assert_v2_items_update`.
 
-**Call relations**: Tests that mirror backend output into realtime context use this helper instead of spelling out the full developer-message JSON each time.
+**Call relations**: Automatic-output tests and the standalone assistant-output test call this when output should inform realtime silently rather than trigger speech.
 
 *Call graph*: calls 1 internal fn (assert_v2_items_update); called by 3 (realtime_automatic_handoff_output_is_item_and_append_speaks, realtime_automatic_standalone_output_is_item_and_append_speaks, webrtc_v2_assistant_output_without_handoff_reaches_realtime_context); 1 external calls (format!).
 
@@ -2012,11 +2020,11 @@ fn assert_v2_backend_item_update(request: &Value, expected_text: &str)
 fn assert_v2_items_update(request: &Value, expected_text: &str)
 ```
 
-**Purpose**: Asserts a sideband request is a developer message item carrying the standard response-item prefix plus supplied text.
+**Purpose**: Checks the exact v2 developer-message shape used to add backend context to realtime.
 
-**Data flow**: Compares the provided JSON value against a `conversation.item.create` developer message whose single `input_text` content is `RESPONSE_ITEM_PREFIX + "\n\n" + expected_text`.
+**Data flow**: It takes a JSON request and expected text, prepends the standard response-item instruction prefix, builds the expected `conversation.item.create` JSON, and asserts equality.
 
-**Call relations**: This is the underlying assertion used by `assert_v2_backend_item_update` and by tests that check direct context injection into realtime.
+**Call relations**: `assert_v2_backend_item_update` calls this so multiple tests share one definition of the backend-context item format.
 
 *Call graph*: called by 1 (assert_v2_backend_item_update); 1 external calls (assert_eq!).
 
@@ -2027,11 +2035,11 @@ fn assert_v2_items_update(request: &Value, expected_text: &str)
 fn assert_v2_user_text_item(request: &Value, expected_text: &str)
 ```
 
-**Purpose**: Asserts a sideband request is a v2 user text item with the `[USER]` prefix.
+**Purpose**: Checks that v2 user text was forwarded as a user conversation item with the `[USER]` prefix.
 
-**Data flow**: Compares the provided JSON value against a `conversation.item.create` user message whose single `input_text` content is `[USER] <expected_text>`.
+**Data flow**: It takes a JSON request and expected text, builds the exact expected sideband JSON, and compares them.
 
-**Call relations**: Append-only text regression tests use this helper to verify that text input is forwarded upstream without extra response-creation side effects.
+**Call relations**: The append-only text regression tests use this after each text append to prove no extra response request was sent in place of the user item.
 
 *Call graph*: called by 2 (webrtc_v2_text_input_is_append_only_when_response_is_cancelled, webrtc_v2_text_input_is_append_only_while_response_is_active); 1 external calls (assert_eq!).
 
@@ -2042,11 +2050,11 @@ fn assert_v2_user_text_item(request: &Value, expected_text: &str)
 fn assert_v2_response_create(request: &Value)
 ```
 
-**Purpose**: Asserts a sideband request is exactly `{ "type": "response.create" }`.
+**Purpose**: Checks that the app server asked realtime to create a new response.
 
-**Data flow**: Performs an equality assertion against the fixed JSON object.
+**Data flow**: It takes a JSON request and asserts it is exactly `{ "type": "response.create" }`.
 
-**Call relations**: Used in tests where app-server should explicitly ask realtime to speak or react after a manual update or steering acknowledgement.
+**Call relations**: Tests call this after manual speech updates or steering acknowledgements, when realtime should actively respond to newly inserted content.
 
 *Call graph*: called by 3 (realtime_automatic_handoff_output_is_item_and_append_speaks, realtime_automatic_standalone_output_is_item_and_append_speaks, webrtc_v2_background_agent_steering_ack_requests_response_create); 1 external calls (assert_eq!).
 
@@ -2057,11 +2065,11 @@ fn assert_v2_response_create(request: &Value)
 fn assert_v1_session_update(request: &Value) -> Result<()>
 ```
 
-**Purpose**: Validates the shape of a v1 `session.update` request sent upstream.
+**Purpose**: Checks the important fields of a v1 realtime session update.
 
-**Data flow**: Checks `type = session.update`, `session.type = quicksilver`, verifies instructions contain `startup context`, asserts output voice `cove`, and asserts `session.tools` is `null`.
+**Data flow**: It reads fields from a JSON request and asserts the message type, v1 session type, startup context, default voice, and absence of tools.
 
-**Call relations**: V1 startup and handoff tests call this helper to distinguish v1 session semantics from v2.
+**Call relations**: V1 WebRTC tests call this after startup to make sure the app server configured the v1 sideband session correctly.
 
 *Call graph*: called by 3 (webrtc_v1_default_automatic_output_uses_handoff_append, webrtc_v1_handoff_request_delegates_context_and_manual_append_speaks, webrtc_v1_start_posts_offer_returns_sdp_and_joins_sideband); 2 external calls (assert!, assert_eq!).
 
@@ -2072,11 +2080,11 @@ fn assert_v1_session_update(request: &Value) -> Result<()>
 fn assert_v2_session_update(request: &Value) -> Result<()>
 ```
 
-**Purpose**: Validates the shape of a v2 `session.update` request sent upstream.
+**Purpose**: Checks the important fields of a v2 realtime session update.
 
-**Data flow**: Checks `type = session.update`, `session.type = realtime`, verifies instructions contain `startup context`, asserts the first two tools are `background_agent` and `remain_silent`, and checks the audio transcription model is `gpt-4o-mini-transcribe`.
+**Data flow**: It reads fields from a JSON request and asserts the message type, realtime session type, startup context, expected tools, and transcription model.
 
-**Call relations**: V2 startup and append-only regression tests use this helper to confirm the initial upstream session configuration.
+**Call relations**: V2 forwarding, append-only, and steering tests call this after startup before checking later sideband messages.
 
 *Call graph*: called by 4 (webrtc_v2_background_agent_steering_ack_requests_response_create, webrtc_v2_forwards_audio_and_text_between_client_and_sideband, webrtc_v2_text_input_is_append_only_when_response_is_cancelled, webrtc_v2_text_input_is_append_only_while_response_is_active); 2 external calls (assert!, assert_eq!).
 
@@ -2091,11 +2099,11 @@ fn assert_call_create_multipart(
 ) -> Result<()>
 ```
 
-**Purpose**: Asserts a captured WebRTC call-create HTTP request has the expected path, content type, SDP part, and normalized JSON session part.
+**Purpose**: Checks the exact multipart HTTP request used to create a WebRTC realtime call.
 
-**Data flow**: Checks the request path and absence of query string, verifies the multipart boundary content type, decodes the body as UTF-8, normalizes the expected session JSON with `normalized_json_string`, and compares the full multipart body string including boundaries and headers.
+**Data flow**: It receives a captured HTTP request, expected offer SDP, and expected session JSON. It checks URL, content type, converts the body to text, normalizes the session JSON, and compares the full multipart body.
 
-**Call relations**: Harness-backed WebRTC tests use this helper to validate the exact HTTP payload sent to `/v1/realtime/calls`.
+**Call relations**: V1 WebRTC tests call this with `v1_session_create_json`. The lower-level v2 WebRTC test performs a similar direct check.
 
 *Call graph*: calls 1 internal fn (normalized_json_string); called by 2 (webrtc_v1_handoff_request_delegates_context_and_manual_append_speaks, webrtc_v1_start_posts_offer_returns_sdp_and_joins_sideband); 2 external calls (from_utf8, assert_eq!).
 
@@ -2106,11 +2114,11 @@ fn assert_call_create_multipart(
 fn v1_session_create_json() -> &'static str
 ```
 
-**Purpose**: Returns the canonical compact JSON string expected in v1 WebRTC call-create requests.
+**Purpose**: Provides the expected v1 session JSON used in WebRTC call creation.
 
-**Data flow**: Returns a static string containing v1 audio input/output settings, `type = quicksilver`, model `gpt-realtime-1.5`, and instructions `backend prompt\n\nstartup context`.
+**Data flow**: It takes no input and returns a static JSON string containing the v1 quicksilver session settings, model, voice, audio format, and instructions.
 
-**Call relations**: V1 WebRTC tests pass this string into `assert_call_create_multipart` when checking the captured call-create request.
+**Call relations**: V1 WebRTC tests pass this to `assert_call_create_multipart` when checking the captured call-create request.
 
 *Call graph*: called by 2 (webrtc_v1_handoff_request_delegates_context_and_manual_append_speaks, webrtc_v1_start_posts_offer_returns_sdp_and_joins_sideband).
 
@@ -2127,11 +2135,11 @@ fn create_config_toml(
 ) -> std::io::Re
 ```
 
-**Purpose**: Writes a realtime test config using default v2 version and read-only sandbox.
+**Purpose**: Writes a temporary app-server config file for tests using the default v2 realtime version and read-only sandbox.
 
-**Data flow**: Forwards the provided codex-home path, responses server URI, realtime server URI, feature-flag boolean, and startup-context mode to `create_config_toml_with_realtime_version` with `RealtimeTestVersion::V2` and `RealtimeTestSandbox::ReadOnly`.
+**Data flow**: It receives the temporary Codex home path, mock server URLs, feature flag value, and startup-context setting, then delegates to the fuller config writer with default version and sandbox.
 
-**Call relations**: Direct realtime tests call this helper to generate the minimal config needed for startup without specifying version/sandbox explicitly.
+**Call relations**: Direct tests use this setup helper before starting `TestAppServer`. Harness setup uses the fuller version-aware helper directly.
 
 *Call graph*: calls 1 internal fn (create_config_toml_with_realtime_version); called by 8 (realtime_conversation_requires_feature_flag, realtime_conversation_stop_emits_closed_notification, realtime_conversation_streams_v2_notifications, realtime_list_voices_returns_supported_names, realtime_start_can_skip_startup_context, realtime_text_output_modality_requests_text_output_and_final_transcript, realtime_webrtc_start_emits_sdp_notification, realtime_webrtc_start_surfaces_backend_error).
 
@@ -2147,11 +2155,11 @@ fn create_config_toml_with_realtime_version(
     startup_context: StartupContextConfig
 ```
 
-**Purpose**: Generates the full `config.toml` used by realtime tests, including feature flag, realtime version/type, startup context override, model provider, and sandbox mode.
+**Purpose**: Writes the full temporary `config.toml` needed by realtime tests.
 
-**Data flow**: Looks up the feature key for `Feature::RealtimeConversation` from `FEATURES`, converts the version and sandbox enums to strings, optionally formats `experimental_realtime_ws_startup_context`, then writes a TOML file containing model/provider settings, realtime backend URLs and prompt, `[realtime]` section, `[features]` section, and mock provider configuration under `[model_providers.mock_provider]`.
+**Data flow**: It receives paths, mock URLs, feature flag, startup context, realtime version, and sandbox. It looks up the realtime feature key, converts enum choices to config strings, optionally writes startup context override text, and writes a TOML config file under the temporary Codex home.
 
-**Call relations**: Both direct tests and harness setup funnel through this helper to ensure all realtime scenarios use consistent config structure.
+**Call relations**: All direct config setup and the harness core setup use this. It is the bridge between test choices and the app server's normal configuration loader.
 
 *Call graph*: calls 2 internal fn (config_value, config_value); called by 2 (new_with_main_loop_responses_server_and_sandbox, create_config_toml); 4 external calls (join, new, format!, write).
 
@@ -2162,10 +2170,10 @@ fn create_config_toml_with_realtime_version(
 fn assert_invalid_request(error: JSONRPCError, message: String)
 ```
 
-**Purpose**: Asserts a `JSONRPCError` is an invalid-request error with the exact supplied message and no data payload.
+**Purpose**: Checks that a JSON-RPC error is the expected invalid-request error with no extra data.
 
-**Data flow**: Checks `error.error.code == -32600`, `error.error.message == message`, and `error.error.data == None`.
+**Data flow**: It takes the error object and expected message, then asserts the standard invalid-request code, exact message, and absent data field.
 
-**Call relations**: The feature-flag test uses this helper to keep the expected invalid-request assertion concise and explicit.
+**Call relations**: The feature-flag test calls this after a realtime start request is rejected because realtime support is disabled.
 
 *Call graph*: called by 1 (realtime_conversation_requires_feature_flag); 1 external calls (assert_eq!).
