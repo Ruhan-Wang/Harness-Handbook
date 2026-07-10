@@ -14,9 +14,9 @@
 
   const META = {
     en: {
-      title: "Harness Handbook — Making Evolving Agent Harnesses Readable, Navigable & Editable",
+      title: "Harness Handbook — Making Agent Harnesses Understandable, Auditable & Editable",
       description:
-        "A behavior-first map of an agent-harness codebase. Harness Handbook lets developers and coding agents locate a behavior, read the code evidence, and edit with confidence.",
+        "A behavior-level manual for complex agent harnesses, helping developers and coding agents understand, audit, and modify behavior through grounded code evidence.",
     },
     zh: {
       title: "Harness Handbook — 让 Agent Harness 可理解、可审核、可修改",
@@ -28,16 +28,22 @@
   const ZH = {
     /* ---- chrome ---- */
     "brand.text": "Harness Handbook",
-    "nav.method": "方法",
-    "nav.results": "结果",
-    "nav.handbook": "查看 Handbook",
-    "nav.paper": "Studio 演示",
+    "nav.paperLink": "论文",
+    "nav.codeLink": "GitHub",
+    "nav.comingSoon": "即将发布",
+    "nav.handbook": "查看Handbook",
+    "nav.handbook.terminus": "Terminus",
+    "nav.handbook.codex": "Codex",
+    "nav.paper": "Handbook Studio 演示",
     "theme.toggle": "切换深色模式",
+    "theme.toggleTitle": "切换主题",
+    "lang.label": "语言",
     "lang.en": "EN",
     "lang.zh": "中文",
 
     /* ---- TOC ---- */
     "toc.title": "目录",
+    "toc.aria": "目录",
     "toc.1": "为什么 Agent Harness 需要一本说明书？",
     "toc.2": "一个行为，多个实现位置",
     "toc.3": "Harness Handbook：一张可导航的行为地图",
@@ -67,38 +73,45 @@
     /* ---- TL;DR ---- */
     "tldr.kicker": "一分钟速览",
     "tldr.1":
-      "<b>Harness Handbook 解决的问题。</b>Harness 是决定 Agent 行为如何展开的关键层，连接模型、提示、工具、状态、权限和执行环境；但这些机制通常抽象、隐含，并分散在复杂代码中。Harness Handbook 将这些运行机制组织成可导航的行为地图，让读者从系统行为出发理解 Harness，而不是先陷入零散源码。",
+      "<b>Harness Handbook 解决的问题。</b>Harness 决定 Agent 的行为如何展开，但这些行为往往隐含并分散在复杂代码中。Harness Handbook 将其组织成可导航、可核验的行为地图。",
     "tldr.2":
-      "<b>读懂一个 Harness。</b>如果目标是理解一个开源 Harness，仅看文件树通常不够。Handbook 通过 L1 系统概览建立整体执行流程，通过 L2 行为单元概览说明阶段职责、状态流转和行为依赖，再通过 L3 连接触发条件、执行路径与源码证据，让读者先理解“系统行为如何发生”，再进入具体实现。",
+      "<b>读懂一个 Harness。</b>Handbook 从系统行为出发解释 Harness 如何运行，并连接回代码证据，让读者不必从文件树和零散源码开始理解。",
     "tldr.3":
-      "<b>让 coding agent 更可靠、低成本地修改 Harness。</b>coding agent 修改 Harness 时，关键是编辑前能否找准行为落点。Handbook 通过 <b>Behavior-Guided Progressive Disclosure</b>（BGPD）将自然语言修改请求映射到相关行为单元和实现证据，帮助 planner 生成更聚焦的编辑计划，减少无关搜索、遗漏风险和 planner 阶段的 token 开销。",
+      "<b>让 coding agent 更可靠、高效地修改 Harness。</b>Handbook 将自然语言修改请求定位到相关行为单元和实现位置，帮助 agent 减少无关搜索与遗漏，形成更聚焦的修改计划。",
     "tldr.4":
-      "<b>基于现有 Harness 构建自己的 Agent。</b>如果用户希望基于 Codex 等系统构建个性化 Agent，Handbook 可以作为进入现有 Harness 的行为入口，帮助理解工具、权限、状态、记忆、执行策略和沙箱边界如何塑造 Agent 行为，并连接回可验证代码证据。用户不必深入阅读复杂源码，就能通过与 Handbook 交互提出修改意图、核对依据并确认代码更新，使 human-in-the-loop 贯穿理解、审核与修改全过程。",
+      "<b>基于现有 Harness 构建自己的 Agent。</b>Handbook 以自然语言呈现 Harness 的行为与能力，使用户无需直接面对底层代码，也能理解和调整系统，构建符合自身需求的 Agent。",
 
     /* ---- §01 ---- */
     "s01.num": "第 01 节",
     "s01.title": "为什么 Agent Harness 需要一本说明书？",
     "s01.p1":
-      "谈到 AI Agent，人们通常首先想到模型。但在真实系统中，Agent 并不只是模型本身。提示如何构建、工具如何暴露、状态如何在多轮交互中延续、权限如何检查，以及模型输出如何被转化为下一步动作，都由 <span class=\"u-h\">Harness</span> 负责组织。换句话说，Harness 是模型周围的运行时系统，也是 Agent 行为真正展开的地方。",
+      "谈到 AI Agent，人们往往首先关注模型。但在真正运行的 Agent 系统中，模型并不会独立行动。<span class=\"u-h\">Harness</span> 将提示、工具、状态、权限和执行环境连接起来，决定模型输出如何转化为实际行动。",
     "s01.p2":
-      "然而，Harness 的行为往往只隐含在代码结构中。即使一个 Harness 完全开源，读者首先看到的仍然只是文件、函数、配置和控制流。文件树能告诉你代码放在哪里，却不会直接说明系统行为如何发生：哪些条件会触发工具调用，哪些路径需要用户确认，哪些状态会影响后续动作，以及异常或失败时系统会如何继续执行。",
+      "Codex 是一个开源 coding agent。支撑其运行的 Harness 负责协调模型、工具、状态、权限与执行环境，将用户请求转化为实际操作。Codex 代码库包含 2,267 个文件、3.4 万余个函数和近 16 万条代码连接，仅凭文件目录难以看清系统如何运行，也难以定位具体行为的实现。",
+    "s01.scale.raw": "Codex · 代码库规模",
+    "s01.scale.files": "代码文件",
+    "s01.scale.functions": "函数",
+    "s01.scale.edges": "代码之间的连接",
+    "s01.scale.stages": "可导航的行为阶段",
+    "s01.scale.map": "按系统行为重新组织，并连接回相关源码。",
+    "s01.scale.figcap":
+      "<b>从庞杂代码到行为地图。</b>Codex 包含数万个函数和近 16 万条代码连接，仅靠文件目录很难看清系统如何运行。Harness Handbook 将这些分散的实现整理为 140 个可导航的行为阶段，并将每个阶段连接回相关源码。",
     "s01.note.label": "什么是 Harness？",
     "s01.note.p":
-      "Harness 可以理解为模型周围的运行时层：它负责组装上下文、暴露工具、维护状态、执行权限与沙箱策略，并将模型输出转化为真实动作。AutoGen、OpenHands 等框架，以及 Claude Code、Codex 等生产系统，都表明 Harness 设计已经成为影响 Agent 可靠性、可控性和可扩展性的关键因素。",
+      "Harness 可以理解为模型周围的运行系统：它负责准备上下文、提供工具、维护状态、执行权限与沙箱规则，并将模型的决定落实为实际行动。AutoGen、OpenHands、Claude Code 和 Codex 等系统都表明，Harness 的设计会直接影响 Agent 的可靠性、可控性和可扩展性。",
     "s01.bridge":
-      "这也是为什么读懂一个 Agent Harness，往往不只是“打开仓库看看代码”。不同读者会带着不同目的进入同一个代码库：",
+      "因此，读懂一个 Harness，不能只靠打开仓库、逐个翻看文件。无论目标是理解、审核还是改造系统，读者都需要将看得见的系统行为连接到产生这些行为的代码。",
     "s01.need1.label": "理解",
-    "s01.need1.value": "这个 Harness 如何组织 Agent 行为？",
-    "s01.need1.note": "模型接收哪些上下文？工具在什么条件下可用？状态如何在步骤之间传递？异常或失败时系统如何继续执行？先建立系统级运行图景，而不是直接进入单个文件。",
+    "s01.need1.value": "这个 Harness 如何运行？",
+    "s01.need1.note": "模型会获得哪些信息？什么时候可以使用工具？状态如何在系统中流转？出现异常或失败时，系统又会如何处理？",
     "s01.need2.label": "审核",
-    "s01.need2.value": "这个公开 Harness 是否符合预期？",
-    "s01.need2.note": "是否存在隐藏权限、自动批准路径、沙箱绕过、异常数据流，或与文档不一致的真实行为？审核的重点，是将潜在风险连接回可验证的实现证据。",
+    "s01.need2.value": "它是否按预期运行？",
+    "s01.need2.note": "权限、批准路径、沙箱规则和数据流是否与文档描述一致？系统的真实行为可能在哪里偏离预期？",
     "s01.need3.label": "改造",
-    "s01.need3.value": "如何基于它构建自己的 Agent 系统？",
-    "s01.need3.note": "如果要调整工具、记忆、确认逻辑、执行策略或沙箱边界，需要先定位这些行为分别由哪些代码位置支撑。",
+    "s01.need3.value": "如何基于它构建自己的 Agent？",
+    "s01.need3.note": "如果要调整工具、记忆、批准逻辑、执行策略或沙箱边界，具体应该修改哪些代码？",
     "s01.p3":
-      "这三类问题看起来不同，但它们共享同一个前提：读者必须先把<span class=\"u-b\">“系统做什么”</span>连接到<span class=\"u-i\">“代码在哪里实现”</span>。Harness Handbook 的目标，就是将复杂 Harness 转化为一份可导航、可复核的行为级说明书。",
-    "s01.q": "目标行为到底在哪里实现？",
+      "理解、审核和改造看似是不同目标，却都依赖同一座桥：从<span class=\"u-b\">“系统做什么”</span>找到<span class=\"u-i\">“代码在哪里实现”</span>。Harness Handbook 将复杂代码库整理成一张可导航、可复核的行为地图，帮助读者先看懂系统，再进入源码。",
 
     /* ---- §02 ---- */
     "s02.num": "第 02 节",
@@ -143,7 +156,7 @@
     /* ---- unit card ---- */
     "unit.badge": "行为单元 · 工具执行阶段",
     "unit.title": "删除文件前确认",
-    "unit.summary": "当 Agent 发起删除文件请求时，Harness 不会立即执行该操作，而是先检查权限策略与用户确认状态，再根据确认结果决定继续执行、拒绝请求或返回错误。",
+      "unit.summary": "当 Agent 发起删除文件请求时，Harness 不会立即执行该操作，而是先检查权限策略与用户确认状态，再根据确认结果决定继续执行、拒绝请求或返回错误。",
     "unit.f1.k": "触发条件",
     "unit.f1.v": "Planner 生成删除文件调用，例如 <code>delete_file(path)</code>。",
     "unit.f2.k": "权限规则",
@@ -218,6 +231,9 @@
     "s06.spec3.label": "评审设置",
     "s06.spec3.value": "三个独立评审模型",
     "s06.spec3.note": "评估关注 planner 是否找对行为落点并形成合理修改计划，而非最终代码是否一次通过。每组 pairwise comparison 由 GPT-5.5、Opus 4.8 和 DeepSeek-V4-Pro 分别评审。",
+    "s06.spec4.label": "评审指标",
+    "s06.spec4.value": "Win rate 与 token cost",
+    "s06.spec4.note": "win rate 表示成对评审中被判为更优的比例；token cost 表示 planner 阶段每个案例消耗的 token。两者合起来，读的是定位质量与搜索成本。",
     "s06.reqtypes":
       "修改请求分为三类：<b>Q（Query）</b> 表示对已有行为的局部调整，例如改变触发条件、执行时机或控制流；<b>CF（Cross-file）</b> 表示跨文件的端到端能力扩展，需要同时贯通 schema、流水线逻辑、运行时行为和外部接口；<b>SH（Search-hostile）</b> 表示对搜索不友好的改动，通常分散在镜像实现、回退路径或冷门执行路径中，容易被关键词搜索遗漏。",
 
@@ -235,7 +251,6 @@
       "<b>偏好率提升，搜索成本下降。</b>在两个 Harness 上，评审模型都更偏好使用 Handbook 的 planner；同时，每个案例的 planner token 成本也有所下降。",
     "chart.judges.title": "三位评审模型，两个 Harness",
     "chart.judges.sub": "各评审给出的偏好率：不用 → 使用 Handbook",
-    "chart.judges.axis": "偏好率 %",
     "s06.judges.figcap":
       "<b>增益并非来自单一评审偏差。</b>三位评审模型在两个 Harness 上都更偏好使用 Handbook 的 planner，说明结果并不依赖某一个评审模型。",
 
@@ -278,8 +293,7 @@
     "s06.r3.figcap":
       "<b>稳定泛化。</b>在两个 Harness 上，使用 Handbook 的 planner 在不同请求类型和不同定位难度下都获得更高偏好率，说明增益并不局限于某一类修改模式或某一档难度。",
 
-    /* ---- §07 ---- */
-    "s07.num": "第 07 节",
+    /* ---- §06 · what we learned（原 §07，已并入结果节） ---- */
     "s07.title": "结果解读：Handbook 如何改善行为定位？",
     "s07.i1.title": "行为地图比文件树更适合理解 Harness",
     "s07.i1.p":
@@ -291,11 +305,9 @@
     "s07.i3.p":
       "理解需要系统级行为视图，审核需要可验证的实现证据，修改需要定位相关代码位置。Harness Handbook 将这三类需求连接到同一条从行为问题到代码证据的路径上，因此既服务人类读者，也能支持 planner 生成更可靠的编辑计划。",
 
-    /* ---- §07 · Studio ---- */
+    /* ---- §07 · Handbook Studio ---- */
     "sui.num": "第 07 节",
     "sui.title": "Handbook Studio：面向人类用户的 Harness 控制台",
-    "sui.cta": "打开 Handbook Studio 交互演示",
-    "sui.cta.note": "在浏览器中直接运行——完整的 Codex 与 Terminus Handbook、Handbook 与代码的对应，以及一个已保存的 Co-Edit 示例。",
     "sui.p1":
       "Harness Handbook 最有价值的形态，不是一份静态文档，而是一个可以被使用的交互入口。Handbook Studio 将它变成面向人类用户的工作台：接入一个 Harness 仓库后，系统生成三层 Handbook；此后，用户可以通过这份 Handbook 阅读系统行为，从任意行为描述跳转到对应的代码证据，并在同一张行为地图上发起可审查的修改。Handbook 负责组织理解与操作路径，仓库始终是事实来源。",
     "sui.tab1.label": "阅读",
@@ -317,26 +329,84 @@
     "sui.flow.2": "② 定位行为单元",
     "sui.flow.3": "③ 对照代码证据",
     "sui.flow.4": "④ 发起修改意图",
-    "sui.flow.5": "⑤ 审阅并同步",
-    "sui.figcap":
-      "<b>一个行为级需求，多个实现落点。</b>用户只提出“让这条命令带上自己的环境变量，且不影响后续命令”的需求；在行为地图上，这只是一个字段级 diff。确认后，该改动会展开到参数 schema、两份工具描述、shell 与 unified-exec 两条执行链路、spawn 环境合并点，以及断言工具规格的测试镜像——最终同步为 <b>10 个文件里的 14 处代码更新</b>。",
+    "sui.flow.5": "⑤ Handbook 审阅与代码同步",
     "sui.g1":
       "<b>从行为问题开始。</b>用户不需要先理解仓库结构，而是直接提出想理解、审核或修改的行为。系统会将这个问题放回执行流程中，定位相关阶段与行为单元。",
     "sui.g2":
       "<b>用代码证据验证。</b>Handbook 负责解释行为如何发生，源码证据负责验证这些解释是否成立。用户可以在同一界面中完成行为阅读、源码核对和证据追踪。",
     "sui.g3":
       "<b>在行为地图上修改。</b>当行为不符合预期时，用户可以在对应行为单元上提出修改意图。系统会生成可审查的修改计划和代码 diff，并在用户确认后写入仓库、同步更新 Handbook。",
+    "sui.figcap":
+      "<b>一个行为级需求，多个实现落点。</b>用户只提出“让这条命令带上自己的环境变量，且不影响后续命令”的需求；在行为地图上，这只是一个字段级 diff。确认后，该改动会展开到参数 schema、两份工具描述、shell 与 unified-exec 两条执行链路、spawn 环境合并点，以及断言工具规格的测试镜像——最终同步为 <b>10 个文件里的 14 处代码更新</b>。",
+    "sui.fig.aria": "用户对 Handbook 说一句话，确认后 10 个文件中的 14 处代码同步完成修改",
+    "sui.fig.olA": "用户",
+    "sui.fig.olB": "HANDBOOK STUDIO",
+    "sui.fig.olC": "源代码",
+    "sui.fig.olD": "源码 DIFF",
+    "sui.fig.cpHint": "定位到行为单元后——",
+    "sui.fig.cpHint2": "它的 14 处源码位点会在这里列出",
+    "sui.fig.dzHint": "点击左侧任意位点——",
+    "sui.fig.dzHint2": "该处的源码 diff 会在这里展开",
+    "sui.fig.q1": "「能不能给这条回测命令",
+    "sui.fig.q2": "单独带上数据源 token",
+    "sui.fig.q3": "和日期区间这些变量，",
+    "sui.fig.q4": "还不影响后面的命令？」",
+    "sui.fig.olE": "HANDBOOK DIFF",
+    "sui.fig.dfHint": "④ 发起修改意图后——",
+    "sui.fig.dfHint2": "Handbook diff 会在这里展开",
+    "sui.fig.hbName": "Codex Handbook",
+    "sui.fig.hbTitle": "命令执行与环境变量",
+    "sui.fig.path": "L1 工具执行与守护 → L2 执行后端与沙箱",
+    "sui.fig.l3": "单元详解",
+    "sui.fig.l.fields": "命令字段",
+    "sui.fig.pl1": "Agent 每执行一条命令，都会先准备好一份运行环境：",
+    "sui.fig.pl2": "里面装着这条命令运行所需要的变量（密钥、路径等）。",
+    "sui.fig.pl3": "这份环境按全局策略统一生成，对每一条命令都完全一样；",
+    "sui.fig.pl4": "命令跑完立即回收，里面的变量不会带进下一条命令。",
+    "sui.fig.pl5": "此外，命令执行前仍要经过审批与沙箱策略的检查——",
+    "sui.fig.pl6": "环境里的变量并不能绕过这些安全关卡。",
+    "sui.fig.p3": "命令不能指定一份只属于它自己的环境变量。",
+    "sui.fig.dfTitle": "stage-14.2 · 命令执行与环境变量",
+    "sui.fig.dfc1": "Agent 每执行一条命令，都会先准备好",
+    "sui.fig.dfc2": "一份运行环境：里面装着这条命令运行",
+    "sui.fig.dfc3": "所需要的变量（密钥、路径等）。",
+    "sui.fig.dfc4": "这份环境按全局策略统一生成，对每一",
+    "sui.fig.dfc5": "条命令都完全一样；命令跑完立即回收，",
+    "sui.fig.dfc6": "里面的变量不会带进下一条命令。",
+    "sui.fig.dfc7": "此外，命令执行前仍要经过审批与沙箱",
+    "sui.fig.dfc8": "策略的检查——环境里的变量并不能绕",
+    "sui.fig.dfc9": "过这些安全关卡。",
+    "sui.fig.del1": "− 命令不能指定一份只属于它自己的环境变量。",
+    "sui.fig.add1": "+ 命令可以带自己的 env 变量表",
+    "sui.fig.add2": "+ （比如数据源 token、日期区间）",
+    "sui.fig.add3": "+ 只对这一条生效，不影响后续",
+    "sui.fig.add4": "+ 新增字段：env（键值对，可选）",
+    "sui.fig.dfFoot": "审阅确认后写入 → 14 处代码同步",
+    "sui.fig.confirm": "审阅并确认",
+    "sui.fig.apply": "确认后写入",
+    "sui.fig.ev": "证据",
+    "sui.fig.evVal": "10 个文件 · 14 个实现位置",
+    "sui.fig.sites": "10 个文件 · 14 个实现位置",
+    "sui.fig.clickHint": "点击任意位点查看源码与 diff",
+    "sui.fig.close": "点击关闭",
+    "sui.fig.synced": "已同步 14 处 ✓",
+    "sui.fig.simple": "行为意图 → 字段级 diff",
+    "sui.fig.isol": "hard code 区 · 由 agent 自动同步，用户不直接接触",
+    "sui.fig.complex": "14 处代码更新同步完成",
+    "sui.cta": "打开 Handbook Studio 演示",
 
     /* ---- §08 ---- */
     "s08.num": "第 08 节",
     "s08.title": "要点总结",
     "s08.1": "代码公开不等于行为清楚。复杂 Agent Harness 需要一份按系统行为组织、并能回到代码证据的行为级说明书。",
+    "s08.k2": "理解者",
+    "s08.k3": "审核者",
+    "s08.k4": "改造者 · coding agent",
+    "s08.k5": "HANDBOOK STUDIO",
     "s08.2": "通过系统概览与行为单元地图，建立 Harness 的执行流程、状态流转和行为结构。",
     "s08.3": "将权限规则、确认逻辑、回退路径、数据流和冷门分支连接到可验证的实现证据。",
     "s08.4": "将目标行为映射到相关文件、函数和执行路径，使修改前的定位更准确，并减少全仓库搜索。",
     "s08.5": "Harness Handbook 不再只是静态文档，而是人类用户进入 Harness 的交互入口：从行为问题出发，完成阅读、验证，并在同一张行为地图上发起可审查的修改。",
-    "s08.closing":
-      "同一张行为地图同时服务人和 coding agent：读者可以从行为问题进入系统，planner 可以在修改前完成定位，每个判断都能回到代码证据。Harness Handbook 的核心价值不是替代代码，而是让理解、审核和修改都以可验证的代码证据为依据。",
 
     /* ================= figures (script.js) ================= */
     /* hero */
@@ -379,38 +449,27 @@
     "fig.levels.input.label": "Harness 仓库",
     "fig.levels.input.text": "代码事实被组织为三层 Handbook",
     "fig.levels.l1.level": "L1",
-    "fig.levels.l1tab": "L1 · 系统概览",
+    "fig.levels.l1tab": "系统概览",
     "fig.levels.l1task": "建立整体系统理解",
     "fig.levels.l1q1": "问题：这个 Harness 整体如何运行？",
     "fig.levels.l1q2": "关注架构、执行流程、主要阶段和状态流。",
     "fig.levels.l1out1": "输出",
     "fig.levels.l1out2": "系统级行为框架",
-    "fig.levels.st1": "输入",
-    "fig.levels.st2": "规划",
-    "fig.levels.st3": "执行",
-    "fig.levels.st4": "观察",
-    "fig.levels.st5": "收尾",
     "fig.levels.l2.level": "L2",
-    "fig.levels.l2tab": "L2 · 行为单元概览",
+    "fig.levels.l2tab": "行为单元概览",
     "fig.levels.l2task": "理解系统由哪些行为单元组成",
     "fig.levels.l2q1": "问题：有哪些行为单元，彼此如何衔接？",
     "fig.levels.l2q2": "关注职责、输入输出、前后关系和关键状态。",
     "fig.levels.l2out1": "输出",
     "fig.levels.l2out2": "行为单元地图",
-    "fig.levels.c1": "工具调用",
-    "fig.levels.c1s": "校验、分发并包装每次工具调用",
-    "fig.levels.c2": "沙箱执行",
-    "fig.levels.c2s": "隔离副作用",
-    "fig.levels.c3": "结果路由",
-    "fig.levels.c3s": "把输出转发给状态与遥测",
     "fig.levels.l3.level": "L3",
-    "fig.levels.l3tab": "L3 · 行为单元详解",
-    "fig.levels.l3title": "删除文件前确认",
+    "fig.levels.l3tab": "行为单元详解",
     "fig.levels.l3task": "深入单个行为单元内部",
     "fig.levels.l3q1": "问题：这个行为单元如何具体执行？",
     "fig.levels.l3q2": "关注触发条件、状态变化、异常路径和代码证据。",
     "fig.levels.l3out1": "输出",
     "fig.levels.l3out2": "可验证实现证据",
+    "fig.levels.hint": "点击任意层级卡片可聚焦该层，再次点击还原。",
 
     /* pipeline */
     "fig.pipe.aria": "Handbook 构建流程：提取事实、按行为组织、合成手册",
@@ -448,20 +507,28 @@
     "fig.bgpd.u2": "权限规则",
     "fig.bgpd.u3": "状态记录",
     "fig.bgpd.u4": "回退路径",
+    "fig.bgpd.pform": "带证据引用的修改计划",
+    "fig.bgpd.pA1": "目标",
+    "fig.bgpd.pA2": "删除文件前先确认",
+    "fig.bgpd.f3": "回退路径",
+    "fig.bgpd.d1": "在拦截处加确认检查",
+    "fig.bgpd.d2": "把删除标为高风险操作",
+    "fig.bgpd.d3": "封住绕过确认的入口",
+    "fig.bgpd.d4": "每一步 ← 引用 L3 证据",
+    "fig.bgpd.coarse": "粗 — 系统上下文",
+    "fig.bgpd.fine": "细 — 代码证据",
+    "fig.bgpd.note": "按需展开信息；证据可用于理解、审核，也可继续支持修改计划。",
+    "fig.bgpd.fn": "函数",
+    "fig.bgpd.l1form": "一段话 + 生命周期图",
+    "fig.bgpd.l2form": "单元地图 · 职责与函数数",
     "fig.bgpd.l3form": "行为单元 · 触发/状态/证据",
+    "fig.bgpd.l2reg": "寄存器 · 每个状态的读写点",
     "fig.bgpd.l3title": "删除文件前确认",
     "fig.bgpd.l3r1": "触发：delete_file(path)",
     "fig.bgpd.l3r2": "权限：高风险操作",
     "fig.bgpd.l3r3": "状态：记录用户确认",
     "fig.bgpd.l3r4": "路径：批准 / 拒绝",
     "fig.bgpd.l3r5": "证据：5 处实现",
-    "fig.bgpd.d1": "确认检查",
-    "fig.bgpd.d2": "权限规则",
-    "fig.bgpd.d3": "绕过直删",
-    "fig.bgpd.d4": "证据支持计划",
-    "fig.bgpd.coarse": "粗 — 系统上下文",
-    "fig.bgpd.fine": "细 — 代码证据",
-    "fig.bgpd.note": "按需展开信息；证据可用于理解、审核，也可继续支持修改计划。",
   };
 
   /* ===================== runtime ===================== */
