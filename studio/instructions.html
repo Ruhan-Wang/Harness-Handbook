@@ -14,6 +14,25 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
+    <script>
+      (() => {
+        const applyTheme = () => {
+          const saved = localStorage.getItem('hh-theme') || localStorage.getItem('hs-theme');
+          const theme =
+            saved === 'light' || saved === 'dark'
+              ? saved
+              : window.matchMedia('(prefers-color-scheme: light)').matches
+                ? 'light'
+                : 'dark';
+          document.documentElement.dataset.theme = theme;
+        };
+        applyTheme();
+        window.addEventListener('pageshow', applyTheme);
+        window.addEventListener('storage', (event) => {
+          if (event.key === 'hs-theme' || event.key === 'hh-theme') applyTheme();
+        });
+      })();
+    </script>
     <style>
       :root {
         color-scheme: dark;
@@ -31,6 +50,20 @@
       }
       * { box-sizing: border-box; }
       html { scroll-behavior: smooth; }
+      :root[data-theme="light"] {
+        color-scheme: light;
+        --bg: #fbfafc;
+        --surface: #ffffff;
+        --surface-2: #f7f4fb;
+        --line: #e4deeb;
+        --text: #24202c;
+        --soft: #5e566a;
+        --muted: #83798f;
+        --accent: #6d4cc7;
+        --accent-strong: #7c3aed;
+        --accent-wash: rgba(124, 58, 237, 0.08);
+        --code: #f3eff8;
+      }
       body {
         margin: 0;
         background: var(--bg);
@@ -65,6 +98,9 @@
         text-decoration: none;
       }
       .brand img { width: 30px; height: 30px; object-fit: cover; }
+      .brand .logo--light { display: none; }
+      :root[data-theme="light"] .brand .logo--dark { display: none; }
+      :root[data-theme="light"] .brand .logo--light { display: block; }
       .back {
         display: inline-flex;
         align-items: center;
@@ -220,22 +256,6 @@
         color: var(--muted);
         font-size: 12px;
       }
-      @media (prefers-color-scheme: light) {
-        :root {
-          color-scheme: light;
-          --bg: #fbfafc;
-          --surface: #ffffff;
-          --surface-2: #f7f4fb;
-          --line: #e4deeb;
-          --text: #24202c;
-          --soft: #5e566a;
-          --muted: #83798f;
-          --accent: #6d4cc7;
-          --accent-strong: #7c3aed;
-          --accent-wash: rgba(124, 58, 237, 0.08);
-          --code: #f3eff8;
-        }
-      }
       @media (max-width: 640px) {
         main { padding-top: 48px; }
         .topbar__inner { width: min(100% - 24px, 960px); }
@@ -251,7 +271,8 @@
     <header class="topbar">
       <div class="topbar__inner">
         <a class="brand" href="./">
-          <img src="./light_logo.png" alt="" />
+          <img class="logo--dark" src="./dark_logo.png" alt="" />
+          <img class="logo--light" src="./light_logo.png" alt="" />
           <span>Handbook Studio</span>
         </a>
         <div class="topbar__actions">
