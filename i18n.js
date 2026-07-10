@@ -54,7 +54,7 @@
     "hero.subtitle":
       "想读懂一个 Agent Harness，审核一个公开 Harness，或者基于它构建自己的 Agent 系统？真正困难的往往不是代码是否可见，而是行为是否可理解：系统在不同阶段会做什么、状态如何传递、又由哪些实现位置支撑。Harness Handbook 将复杂 Harness 整理成一份<b>行为级说明书</b>，按“系统做什么”组织执行流程与关键行为，并把每条路径连接回可验证的代码证据。<br><br>在此基础上，它也可以成为用户与繁琐 hard code 之间的<b>交互中间层</b>：用户从行为出发提出理解、审核或修改需求，Handbook 将这些需求映射到行为单元、代码证据和操作路径。这样，复杂 Harness 在持续演化时仍然保留一层人类可理解、可审阅、可介入的行为级说明层，使 human-in-the-loop 不只发生在最终确认时，也贯穿理解、审核与修改的全过程。",
     "hero.authors":
-      "Ruhan Wang<sup>1,2,*</sup> · Yucheng Shi<sup>1,†</sup> · Zongxia Li<sup>1,3</sup> · Zhongzhi Li<sup>1,4</sup> · Yue Yu<sup>2</sup> · Junyao Yang<sup>1,5</sup> · Kishan Panaganti<sup>1</sup> · Haitao Mi<sup>1</sup> · Dongruo Zhou<sup>2</sup> · Leoweiliang<sup>1</sup>",
+      "Ruhan Wang<sup>1,2,*</sup> · Yucheng Shi<sup>1,†</sup> · Zongxia Li<sup>1,3</sup> · Zhongzhi Li<sup>1,4</sup> · Junyao Yang<sup>1,5</sup> · Kishan Panaganti<sup>1</sup> · Haitao Mi<sup>1</sup> · Dongruo Zhou<sup>2</sup> · Leoweiliang<sup>1</sup>",
     "hero.affils":
       "<sup>1</sup> Tencent HY LLM Frontier &nbsp;·&nbsp; <sup>2</sup> Indiana University &nbsp;·&nbsp; <sup>3</sup> University of Maryland &nbsp;·&nbsp; <sup>4</sup> University of Georgia &nbsp;·&nbsp; <sup>5</sup> National University of Singapore",
     "hero.corresponding":
@@ -337,12 +337,6 @@
     "s08.5": "Harness Handbook 不再只是静态文档，而是人类用户进入 Harness 的交互入口：从行为问题出发，完成阅读、验证，并在同一张行为地图上发起可审查的修改。",
     "s08.closing":
       "同一张行为地图同时服务人和 coding agent：读者可以从行为问题进入系统，planner 可以在修改前完成定位，每个判断都能回到代码证据。Harness Handbook 的核心价值不是替代代码，而是让理解、审核和修改都以可验证的代码证据为依据。",
-
-    /* ---- footer ---- */
-    "footer.cite.title": "引用本工作",
-    "bib.copy": "复制",
-    "bib.copied": "已复制 ✓",
-    "bib.failed": "复制失败",
 
     /* ================= figures (script.js) ================= */
     /* hero */

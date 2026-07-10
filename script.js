@@ -791,16 +791,7 @@
     })
   );
 
-  /* ===================== 6. COPY BIBTEX + LANGUAGE ===================== */
-  $("#copy-bib")?.addEventListener("click", async () => {
-    const btn = $("#copy-bib");
-    try {
-      await navigator.clipboard.writeText($("#bibtex-block").textContent);
-      btn.textContent = tr("bib.copied", "Copied ✓");
-      setTimeout(() => (btn.textContent = tr("bib.copy", "Copy")), 1600);
-    } catch { btn.textContent = tr("bib.failed", "Copy failed"); }
-  });
-
+  /* ===================== 6. LANGUAGE ===================== */
   document.addEventListener("hh-langchange", () => {
     renderIllustrations();
     if ($("#chart-winrate svg")) renderResult1();

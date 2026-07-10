@@ -574,22 +574,6 @@ figcaption b { color: var(--ink-soft); font-weight: 600; }
 .insight h3 { font-size: 19px; margin: 0 0 6px; }
 .insight p { color: var(--ink-soft); margin: 0; font-size: 15.5px; line-height: 1.65; }
 
-.footer { border-top: 1px solid var(--line); margin-top: 70px; padding-top: 40px; }
-.footer h3 { font-size: 19px; margin: 0 0 14px; }
-.bibtex { position: relative; }
-.bibtex pre {
-  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6; color: var(--ink-soft);
-  background: var(--code-bg); border: 1px solid var(--line); border-radius: var(--radius);
-  padding: 18px 20px; overflow-x: auto; margin: 0;
-}
-.bibtex__copy {
-  position: absolute; top: 11px; right: 11px;
-  font-family: var(--font-sans); font-size: 12.5px; font-weight: 600; color: var(--accent-ink);
-  background: var(--surface); border: 1px solid var(--line); border-radius: 7px;
-  padding: 4px 11px; cursor: pointer;
-}
-.bibtex__copy:hover { background: var(--accent-wash); }
-
 /* Clickable SVG rows use the site border as their focus indicator; suppress
    the browser's default orange outline, which looks harsh in the storyboard. */
 .illustration .site-row {
