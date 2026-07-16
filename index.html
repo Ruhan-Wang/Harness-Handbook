@@ -1015,14 +1015,16 @@ html[lang="zh-CN"] .tk__label, html[lang="zh-CN"] .tk-studio__label { letter-spa
     width: 100%;
     display: grid;
     grid-template-columns: 1fr 1fr;
-    grid-template-rows: auto auto;
+    grid-template-rows: auto auto auto;
     gap: 8px;
     align-items: center;
   }
-  .handbook-menu { grid-column: 1; grid-row: 1; min-width: 0; width: 100%; }
-  .topbar__nav > a.topbar__link--cta { grid-column: 2; grid-row: 1; min-width: 0; }
-  .seg--lang { grid-column: 1; grid-row: 2; justify-self: start; }
-  #theme-toggle { grid-column: 2; grid-row: 2; justify-self: end; }
+  .topbar__nav > a.topbar__link--paper { grid-column: 1; grid-row: 1; min-width: 0; }
+  .topbar__nav > a.topbar__link--github { grid-column: 2; grid-row: 1; min-width: 0; }
+  .handbook-menu { grid-column: 1; grid-row: 2; min-width: 0; width: 100%; }
+  .topbar__nav > a.topbar__link--studio { grid-column: 2; grid-row: 2; min-width: 0; }
+  .seg--lang { grid-column: 1; grid-row: 3; justify-self: start; }
+  #theme-toggle { grid-column: 2; grid-row: 3; justify-self: end; }
   .handbook-menu__button,
   .topbar__nav > a.topbar__link--cta {
     width: 100%;
@@ -1088,14 +1090,8 @@ html[lang="zh-CN"] .tk__label, html[lang="zh-CN"] .tk-studio__label { letter-spa
         <span class="brand-text" data-i18n-text="brand.text">Harness&nbsp;Handbook</span>
       </a>
       <nav class="topbar__nav">
-        <span class="topbar__coming" aria-disabled="true">
-          <span data-i18n-text="nav.paperLink">Paper</span>
-          <span class="topbar__coming-tag" data-i18n-text="nav.comingSoon">Coming soon</span>
-        </span>
-        <span class="topbar__coming" aria-disabled="true">
-          <span data-i18n-text="nav.codeLink">GitHub</span>
-          <span class="topbar__coming-tag" data-i18n-text="nav.comingSoon">Coming soon</span>
-        </span>
+        <a class="topbar__link topbar__link--cta topbar__link--paper" href="https://arxiv.org/abs/2607.13285" target="_blank" rel="noopener noreferrer" data-i18n-text="nav.paperLink">Paper</a>
+        <a class="topbar__link topbar__link--cta topbar__link--github" href="https://github.com/Ruhan-Wang/Harness_Handbook" target="_blank" rel="noopener noreferrer" data-i18n-text="nav.codeLink">GitHub</a>
         <div class="handbook-menu" id="handbook-menu">
           <button class="topbar__link topbar__link--cta handbook-menu__button" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="handbook-menu-panel" data-i18n-text="nav.handbook">View Handbook</button>
           <div class="handbook-menu__panel" id="handbook-menu-panel" role="menu" hidden>
@@ -1103,7 +1099,7 @@ html[lang="zh-CN"] .tk__label, html[lang="zh-CN"] .tk-studio__label { letter-spa
             <a class="handbook-menu__item" role="menuitem" href="codex-handbook/index.html" target="_blank" rel="noopener noreferrer" data-i18n-text="nav.handbook.codex">Codex</a>
           </div>
         </div>
-        <a href="studio/index.html" target="_blank" rel="noopener noreferrer" class="topbar__link topbar__link--cta" data-i18n-text="nav.paper">Handbook Studio Demo</a>
+        <a href="studio/index.html" target="_blank" rel="noopener noreferrer" class="topbar__link topbar__link--cta topbar__link--studio" data-i18n-text="nav.paper">Handbook Studio Demo</a>
         <div class="seg seg--lang" id="lang-switch" role="tablist" aria-label="Language" data-i18n-aria="lang.label">
           <button class="seg__btn is-active" data-lang="en" data-i18n-text="lang.en">EN</button>
           <button class="seg__btn" data-lang="zh" data-i18n-text="lang.zh">中文</button>
