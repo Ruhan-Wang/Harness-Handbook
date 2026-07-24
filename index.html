@@ -2313,6 +2313,11 @@ html[lang="zh-CN"] .tk__label, html[lang="zh-CN"] .tk-studio__label { letter-spa
     try {
       localStorage.setItem(LS_KEY, lang);
     } catch (_) { /* private mode */ }
+    try {
+      const url = new URL(location.href);
+      url.searchParams.set("lang", lang);
+      history.replaceState(null, "", url);
+    } catch (_) { /* no History/URL support */ }
     applyLang(lang);
   }
 
